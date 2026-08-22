@@ -56,6 +56,61 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
                 .expect("str-replace-editor TypeScript defaults"),
         )?;
     }
+    dsh_goal::GoalService::install(ctx, dsh_goal::Config::resolve(None).expect("goal defaults"))?;
+    dsh_goal_round_driver::install(ctx)?;
+    if ctx.has_service("commands") {
+        let _ = dsh_command_goal::install(ctx);
+    }
+    if ctx.has_service("tools") {
+        dsh_tool_goal::install(
+            ctx,
+            dsh_tool_goal::Config::resolve(None).expect("tool-goal defaults"),
+        )?;
+        dsh_web::WebRuntime::install(ctx, dsh_web::WebRuntimeConfig::default())?;
+        dsh_web_search_deepseek::install(
+            ctx,
+            dsh_web_search_deepseek::Config::resolve(Some(&serde_json::json!({
+                "replay": {
+                    "content": "fixture answer",
+                    "sources": [{
+                        "url": "https://example.test",
+                        "title": "Example",
+                        "snippet": "hello"
+                    }],
+                    "truncated": false
+                }
+            })))
+            .expect("web-search replay"),
+        )?;
+        dsh_tool_web::install(
+            ctx,
+            dsh_tool_web::Config {
+                search: true,
+                fetch: false,
+                search_max_results: 8,
+                search_max_queries: 4,
+            },
+        )?;
+        dsh_subagent::SubagentRuntime::install(ctx)?;
+        dsh_subagent_inprocess::install(ctx, "spawn", false)?;
+        dsh_tool_subagent::install(
+            ctx,
+            dsh_tool_subagent::Config {
+                provider: "spawn".into(),
+                tool_name: "subagent".into(),
+                background_mode: "one-shot".into(),
+            },
+        )?;
+        dsh_workflow_local::install(ctx, "in-process")?;
+        dsh_tool_workflow::install(
+            ctx,
+            dsh_tool_workflow::Config::resolve(None).expect("workflow defaults"),
+        )?;
+        dsh_repeat_tool_reminder::install(
+            ctx,
+            dsh_repeat_tool_reminder::Config::resolve(None).expect("reminder defaults"),
+        )?;
+    }
     Ok(())
 }
 
@@ -110,6 +165,13 @@ mod tests {
         assert!(names.contains(&"glob".into()));
         assert!(names.contains(&"grep".into()));
         assert!(names.contains(&"str_replace_editor".into()));
+        assert!(names.contains(&"create_goal".into()));
+        assert!(names.contains(&"web_search".into()));
+        assert!(names.contains(&"subagent".into()));
+        assert!(names.contains(&"workflow".into()));
+        assert!(ctx.has_service("goals"));
+        assert!(ctx.has_service("subagents"));
+        assert!(ctx.has_service("web"));
         assert!(ctx.has_service("sandbox"));
         assert!(ctx.has_service("fs"));
         assert!(ctx.has_service("shell"));

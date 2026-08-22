@@ -287,6 +287,11 @@ impl AgentRegistry {
         self.live.lock().expect("live").get(id.as_str()).cloned()
     }
 
+    /// Live agents in arbitrary map order.
+    pub fn live(&self) -> Vec<Arc<dyn Agent>> {
+        self.live.lock().expect("live").values().cloned().collect()
+    }
+
     /// Resume a persisted session under a new live agent.
     pub fn resume(&self, session: Arc<Session>) -> Result<AgentHandle, AgentError> {
         self.create(session)

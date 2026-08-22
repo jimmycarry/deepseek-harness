@@ -322,6 +322,327 @@ async fn str_replace_editor_turn_snapshot() {
 }
 
 #[tokio::test]
+async fn goal_turn_snapshot() {
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "create_goal".into(),
+                    arguments: r#"{"objective":"ship the rust port","max_goal_rounds":2}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c2".into(),
+                    name: "get_goal".into(),
+                    arguments: "{}".into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "created".into(),
+                tool: None,
+                finish: None,
+            },
+            ReplayTurn {
+                text: "continuing".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("track this"))
+        .await
+        .unwrap();
+    let types = event_types(handle.agent.session().as_ref());
+    assert!(types.contains(&"goal/change".into()), "{types:?}");
+    let results: Vec<_> = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .filter_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    let create = match &results[0].content[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("text"),
+    };
+    assert!(create.contains("\"activation\":\"armed\""), "{create}");
+    assert!(create.contains("ship the rust port"), "{create}");
+    let has_goal_round = handle.agent.session().events().iter().any(|event| {
+        matches!(
+            &event.data,
+            SessionEventData::UserMessage(message)
+                if matches!(message.source, dsh_llm::MessageSource::Goal { .. })
+        )
+    });
+    assert!(has_goal_round, "expected admitted goal_round");
+}
+
+#[tokio::test]
+async fn web_search_turn_snapshot() {
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "web_search".into(),
+                    arguments: r#"{"queries":["rust"]}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "cited".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("search"))
+        .await
+        .unwrap();
+    let result = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("tool result");
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("text"),
+    };
+    assert!(text.contains("[Example](https://example.test)"), "{text}");
+    assert!(text.contains("Cite the relevant URLs"), "{text}");
+}
+
+#[tokio::test]
+async fn workflow_turn_snapshot() {
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "workflow".into(),
+                    arguments: r#"{"script":"return {\"ok\":true}","meta":{"name":"snapshot-flow","description":"test"}}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "done".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("run workflow"))
+        .await
+        .unwrap();
+    let types = event_types(handle.agent.session().as_ref());
+    assert!(types.contains(&"tool-workflow/run-start".into()), "{types:?}");
+    assert!(types.contains(&"tool-workflow/run-end".into()), "{types:?}");
+    let result = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("tool result");
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("text"),
+    };
+    assert!(
+        text.contains("workflow \"snapshot-flow\" completed (0 agents)."),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn subagent_turn_snapshot() {
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "subagent".into(),
+                    arguments: r#"{"description":"child","prompt":"ping","run_in_background":false}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "child-done".into(),
+                tool: None,
+                finish: None,
+            },
+            ReplayTurn {
+                text: "parent-done".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("delegate"))
+        .await
+        .unwrap();
+    let result = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("tool result");
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("text"),
+    };
+    assert_eq!(text, "child-done");
+    let store = ctx.service::<SessionStore>().unwrap();
+    let child_has_descriptor = store.live().iter().any(|session| {
+        session.events().iter().any(|event| {
+            dsh_session::event_type_name(&event.data) == "subagent/descriptor"
+        })
+    });
+    assert!(child_has_descriptor, "child session missing descriptor");
+}
+
+#[tokio::test]
+async fn repeat_tool_reminder_snapshot() {
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"echo hi"}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c2".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"echo hi"}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c3".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"echo hi"}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "stopped".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("loop"))
+        .await
+        .unwrap();
+    let notice = handle.agent.session().events().iter().find_map(|event| {
+        match &event.data {
+            SessionEventData::UserMessage(message) => match &message.source {
+                dsh_llm::MessageSource::Plugin {
+                    plugin,
+                    form,
+                    summary,
+                    ..
+                } if plugin == "repeat-tool-reminder" => {
+                    Some((form.clone(), summary.clone(), message.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    });
+    let (form, summary, message) = notice.expect("repeat-tool-reminder notice");
+    assert_eq!(form.as_deref(), Some("notice"));
+    assert_eq!(summary.as_deref(), Some("bash × 3"));
+    let text = match &message.content[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("text"),
+    };
+    assert_eq!(text, dsh_repeat_tool_reminder::GENTLE_REMINDER);
+}
+
+#[tokio::test]
 async fn with_key_e2e_self_skips_without_secret() {
     if std::env::var("DEEPSEEK_API_KEY").is_err() {
         return;

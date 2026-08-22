@@ -7,4 +7,10 @@ rust-version.workspace = true
 description = "Subagent registry (ctx.subagents)."
 
 [dependencies]
+async-trait.workspace = true
 dsh-cordis.workspace = true
+dsh-session.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

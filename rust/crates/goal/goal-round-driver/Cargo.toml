@@ -1,21 +1,15 @@
 [package]
-name = "dsh-subagent-inprocess"
+name = "dsh-goal-round-driver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "In-process spawn/fork subagent providers."
+description = "Same-session goal continuation driver."
 
 [dependencies]
-async-trait.workspace = true
 dsh-agent.workspace = true
-dsh-agent-loop.workspace = true
 dsh-cordis.workspace = true
+dsh-goal.workspace = true
 dsh-llm.workspace = true
 dsh-session.workspace = true
-dsh-subagent.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-dsh-llm-replay.workspace = true
-tokio.workspace = true

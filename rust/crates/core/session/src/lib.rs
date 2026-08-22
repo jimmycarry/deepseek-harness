@@ -350,6 +350,7 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "compaction/end",
     "compaction/start",
     "compaction/summary",
+    "goal/change",
     "permission/preset",
     "request/context",
     "request/header",
@@ -357,11 +358,17 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "session/title",
     "step/end",
     "step/start",
+    "subagent/descriptor",
+    "tool-workflow/agent-end",
+    "tool-workflow/agent-start",
+    "tool-workflow/run-end",
+    "tool-workflow/run-start",
     "tool/call",
     "tool/result",
     "turn/end",
     "turn/start",
     "user/message",
+    "web/deepseek-search-llm-request",
 ];
 
 /// Whether `type_name` is in [`KNOWN_SESSION_EVENT_TYPES`].
@@ -658,6 +665,16 @@ impl SessionStore {
     /// Remove a session from the store.
     pub fn remove(&self, id: &SessionId) {
         self.sessions.lock().expect("sessions").remove(id.as_str());
+    }
+
+    /// Live sessions in arbitrary map order.
+    pub fn live(&self) -> Vec<Arc<Session>> {
+        self.sessions
+            .lock()
+            .expect("sessions")
+            .values()
+            .cloned()
+            .collect()
     }
 }
 

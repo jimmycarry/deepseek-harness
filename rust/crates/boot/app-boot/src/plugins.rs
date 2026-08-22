@@ -71,6 +71,23 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         }
         "@deepseek-ai/dsh-llm-deepseek" => apply_llm_deepseek(ctx),
         "@deepseek-ai/dsh-llm-replay" => apply_llm_replay(ctx, config),
+        "@deepseek-ai/dsh-goal" => apply_goal(ctx, config),
+        "@deepseek-ai/dsh-goal-round-driver" => dsh_goal_round_driver::install(ctx),
+        "@deepseek-ai/dsh-command-goal" => dsh_command_goal::install(ctx),
+        "@deepseek-ai/dsh-tool-goal" => apply_tool_goal(ctx, config),
+        "@deepseek-ai/dsh-subagent" => {
+            dsh_subagent::SubagentRuntime::install(ctx)?;
+            Ok(())
+        }
+        "@deepseek-ai/dsh-subagent-spawn-in-process" => apply_subagent_provider(ctx, config, false),
+        "@deepseek-ai/dsh-subagent-fork-in-process" => apply_subagent_provider(ctx, config, true),
+        "@deepseek-ai/dsh-tool-subagent" => apply_tool_subagent(ctx, config),
+        "@deepseek-ai/dsh-workflow-worker-thread" => apply_workflow(ctx, config),
+        "@deepseek-ai/dsh-tool-workflow" => apply_tool_workflow(ctx, config),
+        "@deepseek-ai/dsh-repeat-tool-reminder" => apply_repeat_tool_reminder(ctx, config),
+        "@deepseek-ai/dsh-web" => apply_web(ctx, config),
+        "@deepseek-ai/dsh-web-search-deepseek" => apply_web_search_deepseek(ctx, config),
+        "@deepseek-ai/dsh-tool-web" => apply_tool_web(ctx, config),
         "@deepseek-ai/dsh-code-runtime-worker-thread" => provide_marker::<CodeRuntime>(ctx),
         "@deepseek-ai/dsh-headless/startup" => dsh_bundle_headless::apply_startup(ctx, config),
         "@deepseek-ai/dsh-headless" => dsh_bundle_headless::apply_runner(ctx, config),
@@ -409,6 +426,96 @@ fn apply_system_prompt(ctx: &Context, config: Option<Value>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn apply_goal(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let resolved = dsh_goal::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_goal::GoalService::install(ctx, resolved)?;
+    Ok(())
+}
+
+fn apply_tool_goal(ctx: &Context, config: Option<Value>) -> Result<()> {
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    let resolved = dsh_tool_goal::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_goal::install(ctx, resolved)
+}
+
+fn apply_subagent_provider(ctx: &Context, config: Option<Value>, inherits: bool) -> Result<()> {
+    if !ctx.has_service(dsh_subagent::SubagentRuntime::KEY) {
+        dsh_subagent::SubagentRuntime::install(ctx)?;
+    }
+    let name = config
+        .as_ref()
+        .and_then(|value| value.get("providerName"))
+        .and_then(Value::as_str)
+        .unwrap_or(if inherits { "fork" } else { "spawn" });
+    dsh_subagent_inprocess::install(ctx, name, inherits)
+}
+
+fn apply_tool_subagent(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if !ctx.has_service(dsh_subagent::SubagentRuntime::KEY) {
+        dsh_subagent::SubagentRuntime::install(ctx)?;
+    }
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    let resolved =
+        dsh_tool_subagent::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_subagent::install(ctx, resolved)
+}
+
+fn apply_workflow(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let isolation = config
+        .as_ref()
+        .and_then(|value| value.get("provider"))
+        .and_then(Value::as_str)
+        .unwrap_or("spawn");
+    dsh_workflow_local::install(ctx, isolation)?;
+    Ok(())
+}
+
+fn apply_tool_workflow(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if !ctx.has_service("workflowEngine") {
+        dsh_workflow_local::install(ctx, "in-process")?;
+    }
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    let resolved =
+        dsh_tool_workflow::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_workflow::install(ctx, resolved)
+}
+
+fn apply_repeat_tool_reminder(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let resolved = dsh_repeat_tool_reminder::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
+    dsh_repeat_tool_reminder::install(ctx, resolved)
+}
+
+fn apply_web(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if ctx.has_service(dsh_web::WebRuntime::KEY) {
+        return Ok(());
+    }
+    dsh_web::WebRuntime::install(ctx, dsh_web::WebRuntimeConfig::resolve(config.as_ref()))?;
+    Ok(())
+}
+
+fn apply_web_search_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if !ctx.has_service(dsh_web::WebRuntime::KEY) {
+        apply_web(ctx, None)?;
+    }
+    let resolved =
+        dsh_web_search_deepseek::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_web_search_deepseek::install(ctx, resolved)
+}
+
+fn apply_tool_web(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if !ctx.has_service(dsh_web::WebRuntime::KEY) {
+        apply_web(ctx, None)?;
+    }
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    let resolved = dsh_tool_web::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_web::install(ctx, resolved)
 }
 
 fn apply_llm_deepseek(ctx: &Context) -> Result<()> {

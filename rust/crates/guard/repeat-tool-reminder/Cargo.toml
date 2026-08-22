@@ -1,19 +1,16 @@
 [package]
-name = "dsh-tool-web"
+name = "dsh-repeat-tool-reminder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Model-facing web tools."
+description = "Consecutive-repeat reminders on the tool chain."
 
 [dependencies]
-async-trait.workspace = true
 dsh-cordis.workspace = true
-dsh-system-prompt.workspace = true
-dsh-tools.workspace = true
-dsh-web.workspace = true
+dsh-llm.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-dsh-llm.workspace = true
+dsh-tools.workspace = true
 tokio.workspace = true

@@ -115,6 +115,7 @@ impl LoopAgent {
             let decision = self.ctx.waterfall(
                 "agent/pre-step",
                 serde_json::json!({
+                    "agentId": self.session.id().as_str(),
                     "messages": claimed.iter().map(|message| serde_json::to_value(message).unwrap_or_default()).collect::<Vec<_>>(),
                     "turn": turn,
                 }),
@@ -350,10 +351,16 @@ impl LoopAgent {
                     (name, args)
                 })
                 .collect();
-            let outcomes = tools.execute_many(&self.ctx, scheduled).await;
+            let outcomes = tools
+                .execute_many_for(&self.ctx, scheduled, Some(self.session.id().as_str()))
+                .await;
+            let mut extra = Vec::new();
             for (call, outcome) in calls.into_iter().zip(outcomes) {
-                let outcome = outcome
-                    .unwrap_or_else(|error| dsh_tools::ToolOutcome::error(error.to_string()));
+                let (outcome, contexts) = match outcome {
+                    Ok(result) => (result.outcome, result.additional_contexts),
+                    Err(error) => (dsh_tools::ToolOutcome::error(error.to_string()), Vec::new()),
+                };
+                extra.extend(contexts);
                 let tool_message = ToolResultMessage {
                     tool_call_id: call_id(call.id.as_str()),
                     content: outcome.content,
@@ -369,6 +376,13 @@ impl LoopAgent {
                         Some(SurfaceOp::append()),
                     )
                     .ok();
+            }
+            for message in extra {
+                self.inbox.push(InboxEntry {
+                    message,
+                    target: InboxTarget::NextStep,
+                    wakeup: true,
+                });
             }
         }
         return None;

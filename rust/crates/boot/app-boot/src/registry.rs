@@ -72,6 +72,18 @@ mod tests {
         assert!(names.contains(&"grep".into()));
         assert!(names.contains(&"str_replace_editor".into()));
         assert!(names.contains(&"bash".into()));
+        assert!(names.contains(&"create_goal".into()));
+        assert!(names.contains(&"get_goal".into()));
+        assert!(names.contains(&"update_goal".into()));
+        assert!(names.contains(&"web_search".into()));
+        assert!(!names.contains(&"web_fetch".into()));
+        assert!(names.contains(&"subagent".into()));
+        assert!(names.contains(&"subagent_fork".into()));
+        assert!(names.contains(&"workflow".into()));
+        assert!(ctx.has_service("goals"));
+        assert!(ctx.has_service("subagents"));
+        assert!(ctx.has_service("web"));
+        assert!(ctx.has_service("workflowEngine"));
     }
 
     #[test]

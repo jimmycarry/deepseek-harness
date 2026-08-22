@@ -48,6 +48,7 @@ members = [
   "crates/skill/tool-skill",
   "crates/web/web",
   "crates/web/web-fetch-http",
+  "crates/web/web-search-deepseek",
   "crates/web/tool-web",
   "crates/jobs/jobs",
   "crates/jobs/jobs-local",
@@ -55,6 +56,8 @@ members = [
   "crates/todo/tool-todo",
   "crates/plan/plan-mode",
   "crates/goal/goal",
+  "crates/goal/goal-round-driver",
+  "crates/goal/command-goal",
   "crates/goal/tool-goal",
   "crates/subagent/subagent",
   "crates/subagent/subagent-inprocess",
@@ -63,6 +66,7 @@ members = [
   "crates/workflow/workflow-local",
   "crates/workflow/tool-workflow",
   "crates/guard/timeout-policy",
+  "crates/guard/repeat-tool-reminder",
   "crates/session/session-persistence",
   "crates/session/session-persistence-jsonl",
   "crates/session/session-persistence-sqlite",
@@ -151,6 +155,7 @@ dsh-skill-filesystem = { path = "crates/skill/skill-filesystem" }
 dsh-tool-skill = { path = "crates/skill/tool-skill" }
 dsh-web = { path = "crates/web/web" }
 dsh-web-fetch-http = { path = "crates/web/web-fetch-http" }
+dsh-web-search-deepseek = { path = "crates/web/web-search-deepseek" }
 dsh-tool-web = { path = "crates/web/tool-web" }
 dsh-jobs = { path = "crates/jobs/jobs" }
 dsh-jobs-local = { path = "crates/jobs/jobs-local" }
@@ -158,6 +163,8 @@ dsh-tool-jobs = { path = "crates/jobs/tool-jobs" }
 dsh-tool-todo = { path = "crates/todo/tool-todo" }
 dsh-plan-mode = { path = "crates/plan/plan-mode" }
 dsh-goal = { path = "crates/goal/goal" }
+dsh-goal-round-driver = { path = "crates/goal/goal-round-driver" }
+dsh-command-goal = { path = "crates/goal/command-goal" }
 dsh-tool-goal = { path = "crates/goal/tool-goal" }
 dsh-subagent = { path = "crates/subagent/subagent" }
 dsh-subagent-inprocess = { path = "crates/subagent/subagent-inprocess" }
@@ -166,6 +173,7 @@ dsh-workflow = { path = "crates/workflow/workflow" }
 dsh-workflow-local = { path = "crates/workflow/workflow-local" }
 dsh-tool-workflow = { path = "crates/workflow/tool-workflow" }
 dsh-timeout-policy = { path = "crates/guard/timeout-policy" }
+dsh-repeat-tool-reminder = { path = "crates/guard/repeat-tool-reminder" }
 dsh-session-persistence = { path = "crates/session/session-persistence" }
 dsh-session-persistence-jsonl = { path = "crates/session/session-persistence-jsonl" }
 dsh-session-persistence-sqlite = { path = "crates/session/session-persistence-sqlite" }

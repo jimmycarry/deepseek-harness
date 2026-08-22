@@ -124,9 +124,23 @@ pub enum MessageSource {
         /// Semantic form (`snapshot`, `notice`, …) when the producer declared one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         form: Option<String>,
+        /// One-line notice label when `form` is `notice`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
         /// Snapshot contributions, required when `form` is `snapshot`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sections: Vec<SnapshotSection>,
+    },
+    /// Same-session goal-round continuation.
+    #[serde(rename = "goal")]
+    Goal {
+        /// Durable goal id (`goal-{uuid}`).
+        #[serde(rename = "goalId")]
+        goal_id: String,
+        /// CAS revision the round was admitted against.
+        revision: u64,
+        /// Positive admitted round number.
+        round: u32,
     },
     /// Assistant output from a routed model.
     #[serde(rename = "model")]
@@ -156,6 +170,7 @@ impl MessageSource {
         Self::Plugin {
             plugin: plugin.into(),
             form: None,
+            summary: None,
             sections: Vec::new(),
         }
     }
@@ -165,7 +180,27 @@ impl MessageSource {
         Self::Plugin {
             plugin: plugin.into(),
             form: Some("snapshot".into()),
+            summary: None,
             sections,
+        }
+    }
+
+    /// Plugin notice source with a one-line summary.
+    pub fn notice(plugin: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self::Plugin {
+            plugin: plugin.into(),
+            form: Some("notice".into()),
+            summary: Some(summary.into()),
+            sections: Vec::new(),
+        }
+    }
+
+    /// Goal-round source for an admitted continuation.
+    pub fn goal(goal_id: impl Into<String>, revision: u64, round: u32) -> Self {
+        Self::Goal {
+            goal_id: goal_id.into(),
+            revision,
+            round,
         }
     }
 }
@@ -185,6 +220,31 @@ impl UserMessage {
         Self {
             content: vec![ContentBlock::text(text)],
             source: MessageSource::User,
+        }
+    }
+
+    /// Plugin notice injected onto the next model step.
+    pub fn notice(
+        plugin: impl Into<String>,
+        text: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: vec![ContentBlock::text(text)],
+            source: MessageSource::notice(plugin, summary),
+        }
+    }
+
+    /// Goal-round continuation prompt.
+    pub fn goal_round(
+        text: impl Into<String>,
+        goal_id: impl Into<String>,
+        revision: u64,
+        round: u32,
+    ) -> Self {
+        Self {
+            content: vec![ContentBlock::text(text)],
+            source: MessageSource::goal(goal_id, revision, round),
         }
     }
 }

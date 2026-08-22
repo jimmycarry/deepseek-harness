@@ -291,6 +291,178 @@ async fn str_replace_editor_turn_profile_rereads_file() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+fn replay_turns_and_search(turns: Value, replay: Value) -> Vec<EntryPatch> {
+    let mut patches = replay_turns_overlay(turns);
+    let mut search = EntryPatch::replace("web-search-deepseek");
+    search.config = Some(serde_json::json!({
+        "apiKeyEnv": "DEEPSEEK_API_KEY",
+        "replay": replay
+    }));
+    patches.push(search);
+    patches
+}
+
+#[tokio::test]
+async fn goal_turn_profile_writes_goal_change() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "create_goal",
+                "arguments": "{\"objective\":\"ship the rust port\",\"max_goal_rounds\":2}"
+            }
+        },
+        {
+            "text": "",
+            "tool": {
+                "id": "c2",
+                "name": "get_goal",
+                "arguments": "{}"
+            }
+        },
+        { "text": "created" },
+        { "text": "continuing" }
+    ]);
+    let events = run_profile("track this", replay_turns_overlay(turns)).await;
+    let types = types_of(&events);
+    assert!(types.contains(&"goal/change".into()), "{types:?}");
+    let create = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = create["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(text.contains("\"activation\":\"armed\""), "{text}");
+    let has_goal_round = events.iter().any(|event| {
+        event["type"] == "user/message" && event["data"]["source"]["kind"] == "goal"
+    });
+    assert!(has_goal_round, "expected goal_round user/message");
+}
+
+#[tokio::test]
+async fn web_search_turn_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "web_search",
+                "arguments": "{\"queries\":[\"rust\"]}"
+            }
+        },
+        { "text": "cited" }
+    ]);
+    let events = run_profile(
+        "search",
+        replay_turns_and_search(
+            turns,
+            serde_json::json!({
+                "content": "fixture answer",
+                "sources": [{
+                    "url": "https://example.test",
+                    "title": "Example",
+                    "snippet": "hello"
+                }],
+                "truncated": false
+            }),
+        ),
+    )
+    .await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(text.contains("[Example](https://example.test)"), "{text}");
+    assert!(text.contains("Cite the relevant URLs"), "{text}");
+}
+
+#[tokio::test]
+async fn workflow_turn_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "workflow",
+                "arguments": "{\"script\":\"return {\\\"ok\\\":true}\",\"meta\":{\"name\":\"snapshot-flow\",\"description\":\"test\"}}"
+            }
+        },
+        { "text": "done" }
+    ]);
+    let events = run_profile("run workflow", replay_turns_overlay(turns)).await;
+    let types = types_of(&events);
+    assert!(types.contains(&"tool-workflow/run-start".into()), "{types:?}");
+    assert!(types.contains(&"tool-workflow/run-end".into()), "{types:?}");
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("workflow \"snapshot-flow\" completed (0 agents)."),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn subagent_turn_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "subagent",
+                "arguments": "{\"description\":\"child\",\"prompt\":\"ping\",\"run_in_background\":false}"
+            }
+        },
+        { "text": "child-done" },
+        { "text": "parent-done" }
+    ]);
+    let events = run_profile("delegate", replay_turns_overlay(turns)).await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(text, "child-done");
+}
+
+#[tokio::test]
+async fn repeat_tool_reminder_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": { "id": "c1", "name": "bash", "arguments": "{\"command\":\"echo hi\"}" }
+        },
+        {
+            "text": "",
+            "tool": { "id": "c2", "name": "bash", "arguments": "{\"command\":\"echo hi\"}" }
+        },
+        {
+            "text": "",
+            "tool": { "id": "c3", "name": "bash", "arguments": "{\"command\":\"echo hi\"}" }
+        },
+        { "text": "stopped" }
+    ]);
+    let events = run_profile("loop", replay_turns_overlay(turns)).await;
+    let notice = events.iter().find(|event| {
+        event["type"] == "user/message"
+            && event["data"]["source"]["plugin"] == "repeat-tool-reminder"
+    });
+    let notice = notice.expect("repeat-tool-reminder notice");
+    assert_eq!(notice["data"]["source"]["form"], "notice");
+    assert_eq!(notice["data"]["source"]["summary"], "bash × 3");
+}
+
 #[test]
 fn typescript_headless_profile_types_are_known() {
     let path = concat!(

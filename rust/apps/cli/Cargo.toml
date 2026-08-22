@@ -26,5 +26,6 @@ dsh-commands.workspace = true
 dsh-fs.workspace = true
 dsh-llm.workspace = true
 dsh-llm-replay.workspace = true
+dsh-repeat-tool-reminder.workspace = true
 dsh-session.workspace = true
 dsh-tools.workspace = true

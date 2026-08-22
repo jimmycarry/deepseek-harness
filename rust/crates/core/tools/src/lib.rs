@@ -2,11 +2,31 @@
 
 use async_trait::async_trait;
 use dsh_cordis::{Context, Service};
-use dsh_llm::{ContentBlock, ToolSchema};
+use dsh_llm::{ContentBlock, ToolSchema, UserMessage};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+
+/// One scheduled tool call, including the live agent when the loop invoked it.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    /// Advertised tool name.
+    pub name: String,
+    /// Parsed arguments.
+    pub args: Value,
+    /// Calling agent's session id, when the agent loop invoked the tool.
+    pub agent_id: Option<String>,
+}
+
+/// Outcome of one pipeline run, including post-execute contexts.
+#[derive(Debug, Clone)]
+pub struct ToolExecutionResult {
+    /// Tool body or pipeline failure rendered as a result.
+    pub outcome: ToolOutcome,
+    /// Model-visible notices prepended by `tools/post-execute` listeners.
+    pub additional_contexts: Vec<UserMessage>,
+}
 
 /// A model-facing tool.
 #[async_trait]
@@ -19,6 +39,11 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
     /// Execute with parsed arguments.
     async fn execute(&self, args: Value) -> Result<ToolOutcome, ToolError>;
+
+    /// Execute with the calling agent when the loop supplied one.
+    async fn execute_call(&self, call: &ToolCall) -> Result<ToolOutcome, ToolError> {
+        self.execute(call.args.clone()).await
+    }
 }
 
 /// Successful or failed tool body.
@@ -154,24 +179,65 @@ impl ToolRuntime {
         name: &str,
         args: Value,
     ) -> Result<ToolOutcome, ToolError> {
+        let result = self.execute_for(ctx, name, args, None).await?;
+        if result.outcome.is_error {
+            let text = outcome_text(&result.outcome);
+            if text.contains("denied by pre-execute") {
+                return Err(ToolError::Denied(name.into()));
+            }
+            if text.starts_with("unknown tool") {
+                return Err(ToolError::Unknown(name.into()));
+            }
+        }
+        Ok(result.outcome)
+    }
+
+    /// Run the pipeline for one call and return post-execute contexts.
+    ///
+    /// Denied and unknown names still run `tools/post-execute` so a repeat
+    /// detector can count a hammered denial. The body outcome is then an
+    /// error; contexts still ride to the next step.
+    pub async fn execute_for(
+        &self,
+        ctx: &Context,
+        name: &str,
+        args: Value,
+        agent_id: Option<&str>,
+    ) -> Result<ToolExecutionResult, ToolError> {
         let pre = ctx.waterfall(
             "tools/pre-execute",
             serde_json::json!({ "name": name, "args": args }),
             |payload| payload,
         );
-        if let Ok(value) = pre {
-            if value.get("deny").and_then(Value::as_bool) == Some(true) {
-                return Err(ToolError::Denied(name.into()));
-            }
-        }
-        let tool = self.get(name).ok_or_else(|| ToolError::Unknown(name.into()))?;
-        let outcome = tool.execute(args).await?;
-        let _ = ctx.waterfall(
-            "tools/post-execute",
-            serde_json::json!({ "name": name }),
-            |payload| payload,
+        let denied = matches!(
+            pre,
+            Ok(ref value) if value.get("deny").and_then(Value::as_bool) == Some(true)
         );
-        Ok(outcome)
+        if denied {
+            let additional_contexts = post_execute(ctx, name, &args, agent_id);
+            return Ok(ToolExecutionResult {
+                outcome: ToolOutcome::error(ToolError::Denied(name.into()).to_string()),
+                additional_contexts,
+            });
+        }
+        let Some(tool) = self.get(name) else {
+            let additional_contexts = post_execute(ctx, name, &args, agent_id);
+            return Ok(ToolExecutionResult {
+                outcome: ToolOutcome::error(ToolError::Unknown(name.into()).to_string()),
+                additional_contexts,
+            });
+        };
+        let call = ToolCall {
+            name: name.to_string(),
+            args: args.clone(),
+            agent_id: agent_id.map(str::to_string),
+        };
+        let outcome = tool.execute_call(&call).await?;
+        let additional_contexts = post_execute(ctx, name, &args, agent_id);
+        Ok(ToolExecutionResult {
+            outcome,
+            additional_contexts,
+        })
     }
 
     /// Run many calls: pre-execute stays model-ordered, bodies overlap up to
@@ -181,9 +247,40 @@ impl ToolRuntime {
         ctx: &Context,
         calls: Vec<(String, Value)>,
     ) -> Vec<Result<ToolOutcome, ToolError>> {
+        self.execute_many_for(ctx, calls, None)
+            .await
+            .into_iter()
+            .map(|result| match result {
+                Ok(exec) if !exec.outcome.is_error => Ok(exec.outcome),
+                Ok(exec) => {
+                    let text = outcome_text(&exec.outcome);
+                    if text.contains("denied by pre-execute") {
+                        Err(ToolError::Denied(
+                            exec.outcome
+                                .content
+                                .first()
+                                .and_then(|_| Some(String::new()))
+                                .unwrap_or_default(),
+                        ))
+                    } else {
+                        Ok(exec.outcome)
+                    }
+                }
+                Err(error) => Err(error),
+            })
+            .collect()
+    }
+
+    /// Run many calls and keep post-execute contexts for the next step.
+    pub async fn execute_many_for(
+        &self,
+        ctx: &Context,
+        calls: Vec<(String, Value)>,
+        agent_id: Option<&str>,
+    ) -> Vec<Result<ToolExecutionResult, ToolError>> {
         enum Prepared {
-            Denied(String),
-            Unknown(String),
+            Denied { name: String, args: Value },
+            Unknown { name: String, args: Value },
             Ready {
                 name: String,
                 tool: Arc<dyn Tool>,
@@ -200,13 +297,13 @@ impl ToolRuntime {
             );
             if let Ok(value) = pre {
                 if value.get("deny").and_then(Value::as_bool) == Some(true) {
-                    prepared.push(Prepared::Denied(name));
+                    prepared.push(Prepared::Denied { name, args });
                     continue;
                 }
             }
             match self.get(&name) {
                 Some(tool) => prepared.push(Prepared::Ready { name, tool, args }),
-                None => prepared.push(Prepared::Unknown(name)),
+                None => prepared.push(Prepared::Unknown { name, args }),
             }
         }
 
@@ -214,11 +311,15 @@ impl ToolRuntime {
             (0..prepared.len()).map(|_| None).collect();
         for (index, item) in prepared.iter().enumerate() {
             match item {
-                Prepared::Denied(name) => {
-                    outcomes[index] = Some(Err(ToolError::Denied(name.clone())));
+                Prepared::Denied { name, .. } => {
+                    outcomes[index] = Some(Ok(ToolOutcome::error(
+                        ToolError::Denied(name.clone()).to_string(),
+                    )));
                 }
-                Prepared::Unknown(name) => {
-                    outcomes[index] = Some(Err(ToolError::Unknown(name.clone())));
+                Prepared::Unknown { name, .. } => {
+                    outcomes[index] = Some(Ok(ToolOutcome::error(
+                        ToolError::Unknown(name.clone()).to_string(),
+                    )));
                 }
                 Prepared::Ready { .. } => {}
             }
@@ -227,13 +328,17 @@ impl ToolRuntime {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_parallel()));
         let mut set = tokio::task::JoinSet::new();
         for (index, item) in prepared.iter().enumerate() {
-            if let Prepared::Ready { tool, args, .. } = item {
+            if let Prepared::Ready { name, tool, args } = item {
                 let tool = Arc::clone(tool);
-                let args = args.clone();
+                let call = ToolCall {
+                    name: name.clone(),
+                    args: args.clone(),
+                    agent_id: agent_id.map(str::to_string),
+                };
                 let semaphore = Arc::clone(&semaphore);
                 set.spawn(async move {
                     let _permit = semaphore.acquire().await.expect("tools semaphore");
-                    (index, tool.execute(args).await)
+                    (index, tool.execute_call(&call).await)
                 });
             }
         }
@@ -244,23 +349,51 @@ impl ToolRuntime {
 
         let mut results = Vec::with_capacity(outcomes.len());
         for (index, outcome) in outcomes.into_iter().enumerate() {
-            let result = outcome.expect("every call is filled");
-            if matches!(&prepared[index], Prepared::Ready { .. }) {
-                let name = match &prepared[index] {
-                    Prepared::Ready { name, .. }
-                    | Prepared::Denied(name)
-                    | Prepared::Unknown(name) => name.as_str(),
-                };
-                let _ = ctx.waterfall(
-                    "tools/post-execute",
-                    serde_json::json!({ "name": name }),
-                    |payload| payload,
-                );
-            }
-            results.push(result);
+            let outcome = outcome.expect("every call is filled");
+            let (name, args) = match &prepared[index] {
+                Prepared::Ready { name, args, .. }
+                | Prepared::Denied { name, args }
+                | Prepared::Unknown { name, args } => (name.as_str(), args),
+            };
+            let additional_contexts = post_execute(ctx, name, args, agent_id);
+            results.push(outcome.map(|outcome| ToolExecutionResult {
+                outcome,
+                additional_contexts,
+            }));
         }
         results
     }
+}
+
+fn post_execute(
+    ctx: &Context,
+    name: &str,
+    args: &Value,
+    agent_id: Option<&str>,
+) -> Vec<UserMessage> {
+    let payload = serde_json::json!({
+        "name": name,
+        "args": args,
+        "agentId": agent_id,
+        "additionalContexts": []
+    });
+    ctx.waterfall("tools/post-execute", payload, |payload| payload)
+        .ok()
+        .and_then(|value| value.get("additionalContexts").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn outcome_text(outcome: &ToolOutcome) -> String {
+    outcome
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 impl Service for ToolRuntime {
