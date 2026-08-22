@@ -22,6 +22,7 @@ dsh-llm-replay.workspace = true
 dsh-repeat-tool-reminder.workspace = true
 dsh-sandbox-local.workspace = true
 dsh-session.workspace = true
+dsh-session-title.workspace = true
 dsh-spill-local.workspace = true
 dsh-spill-policy.workspace = true
 dsh-shell.workspace = true

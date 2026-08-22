@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use dsh_atomic_write::{write_file_atomic, AtomicWriteError, WriteFileAtomicOptions};
 use dsh_cordis::Context;
 use dsh_session::{
-    refuse_unknown, session_event_from_value, Session, SessionEvent, SessionEventData, SessionId,
-    TurnEndReason, SESSION_FORMAT_VERSION,
+    now_ms, refuse_unknown, session_event_from_value, Session, SessionEvent, SessionEventData,
+    SessionHeader, SessionId, TurnEndReason, SESSION_FORMAT_VERSION,
 };
 use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
 use serde_json::Value;
@@ -37,9 +37,7 @@ impl SessionStoreBackend for JsonlBackend {
     }
 
     async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
-        let session = Session::new(id.clone());
-        read_jsonl(self.path_for(id), &session).await?;
-        Ok(session)
+        read_jsonl(self.path_for(id), id).await
     }
 
     async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
@@ -74,12 +72,14 @@ pub fn install(
     Ok(runtime)
 }
 
-/// Write the format header plus one JSON object per event line.
+/// Write the session header line plus one JSON object per event line.
 pub async fn write_jsonl(
     path: impl AsRef<Path>,
     session: &Session,
 ) -> Result<(), PersistenceError> {
-    let mut body = format!("{{\"sessionFormatVersion\":{SESSION_FORMAT_VERSION}}}\n");
+    let mut body = serde_json::to_string(&header_line(session.header()))
+        .map_err(|error| PersistenceError::Format(error.to_string()))?;
+    body.push('\n');
     for event in session.events() {
         body.push_str(&serde_json::to_string(&event).map_err(|error| {
             PersistenceError::Format(error.to_string())
@@ -98,27 +98,58 @@ pub async fn write_jsonl(
     .map_err(atomic_error)
 }
 
+/// Project one session header as its persisted first line (`type` first).
+fn header_line(header: &SessionHeader) -> Value {
+    let mut line = serde_json::Map::new();
+    line.insert("type".into(), Value::String("session".into()));
+    if let Ok(Value::Object(fields)) = serde_json::to_value(header) {
+        line.extend(fields);
+    }
+    Value::Object(line)
+}
+
+/// Parse and validate one persisted header line against the requested id.
+fn parse_header_line(line: &str, id: &SessionId) -> Result<SessionHeader, PersistenceError> {
+    let mut value: Value = serde_json::from_str(line)
+        .map_err(|error| PersistenceError::Format(error.to_string()))?;
+    if value.get("type").and_then(Value::as_str) != Some("session") {
+        return Err(PersistenceError::Format(
+            "header line is not a session record".into(),
+        ));
+    }
+    let version = value.get("version").and_then(Value::as_u64);
+    if version != Some(u64::from(SESSION_FORMAT_VERSION)) {
+        return Err(PersistenceError::Format(format!(
+            "session format version {version:?} is not {SESSION_FORMAT_VERSION}"
+        )));
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("type");
+    }
+    let header: SessionHeader = serde_json::from_value(value)
+        .map_err(|error| PersistenceError::Format(error.to_string()))?;
+    if header.id.as_str() != id.as_str() {
+        return Err(PersistenceError::Format(format!(
+            "header id {} does not match requested session {}",
+            header.id.as_str(),
+            id.as_str()
+        )));
+    }
+    Ok(header)
+}
+
 /// Load a log, refusing unknown required-on-read types and repairing a trailing open turn.
 pub async fn read_jsonl(
     path: impl AsRef<Path>,
-    session: &Session,
-) -> Result<(), PersistenceError> {
+    id: &SessionId,
+) -> Result<Session, PersistenceError> {
     let body = fs::read_to_string(path).await?;
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    let header = lines
+    let header_text = lines
         .next()
-        .ok_or_else(|| PersistenceError::Format("missing sessionFormatVersion header".into()))?;
-    let header: Value = serde_json::from_str(header)
-        .map_err(|error| PersistenceError::Format(error.to_string()))?;
-    let version = header
-        .get("sessionFormatVersion")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| PersistenceError::Format("header is missing sessionFormatVersion".into()))?;
-    if version != u64::from(SESSION_FORMAT_VERSION) {
-        return Err(PersistenceError::Format(format!(
-            "sessionFormatVersion {version} is not {SESSION_FORMAT_VERSION}"
-        )));
-    }
+        .ok_or_else(|| PersistenceError::Format("missing session header line".into()))?;
+    let header = parse_header_line(header_text, id)?;
+    let session = Session::with_header(header);
     let mut events: Vec<SessionEvent> = Vec::new();
     for line in lines {
         let value: Value = serde_json::from_str(line)
@@ -135,7 +166,7 @@ pub async fn read_jsonl(
     for event in events {
         session.append_logged(event)?;
     }
-    Ok(())
+    Ok(session)
 }
 
 /// Close a dangling `turn/start` with `interrupted`.
@@ -152,10 +183,12 @@ pub fn repair_open_turn(events: &mut Vec<SessionEvent>) {
         let seq = events.len() as u64;
         events.push(SessionEvent {
             seq,
+            time: now_ms(),
             data: SessionEventData::TurnEnd {
                 turn,
                 reason: TurnEndReason::Interrupted,
             },
+            source_event_seqs: None,
             surface_op: None,
             ignorable: false,
         });
@@ -188,7 +221,9 @@ mod tests {
     fn crash_repair_closes_open_turn() {
         let mut events = vec![SessionEvent {
             seq: 0,
+            time: 0,
             data: SessionEventData::TurnStart { turn: 1 },
+            source_event_seqs: None,
             surface_op: None,
             ignorable: false,
         }];
@@ -230,20 +265,30 @@ mod tests {
             .unwrap();
         write_jsonl(&path, &session).await.unwrap();
         let body = fs::read_to_string(&path).await.unwrap();
-        assert!(body.starts_with("{\"sessionFormatVersion\":0}\n"));
-        let loaded = Session::new(session_id("s"));
-        read_jsonl(&path, &loaded).await.unwrap();
+        let first_line = body.lines().next().unwrap();
+        assert!(first_line.starts_with("{\"type\":\"session\",\"version\":0,\"id\":\"s\","));
+        assert!(first_line.contains("\"createdAt\":"));
+        assert!(first_line.ends_with("\"delegationDepth\":0}"));
+        let loaded = read_jsonl(&path, &session_id("s")).await.unwrap();
         assert_eq!(loaded.events().len(), 2);
+        assert_eq!(loaded.header().version, SESSION_FORMAT_VERSION);
 
-        fs::write(
-            &path,
-            "{\"sessionFormatVersion\":0}\n{\"seq\":0,\"type\":\"future/event\"}\n",
-        )
-        .await
-        .unwrap();
-        let rejected = Session::new(session_id("s"));
-        let err = read_jsonl(&path, &rejected).await.unwrap_err();
+        let header = first_line.to_string();
+        fs::write(&path, format!("{header}\n{{\"seq\":0,\"type\":\"future/event\"}}\n"))
+            .await
+            .unwrap();
+        let err = match read_jsonl(&path, &session_id("s")).await {
+            Ok(_) => panic!("unknown required event must be refused"),
+            Err(error) => error,
+        };
         assert!(matches!(err, PersistenceError::Session(_)));
+
+        fs::write(&path, "{\"sessionFormatVersion\":0}\n").await.unwrap();
+        let err = match read_jsonl(&path, &session_id("s")).await {
+            Ok(_) => panic!("legacy header must be refused"),
+            Err(error) => error,
+        };
+        assert!(matches!(err, PersistenceError::Format(_)));
         let _ = fs::remove_dir_all(&dir).await;
     }
 

@@ -43,6 +43,10 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
             dsh_credentials_local::install(ctx)?;
             Ok(())
         }
+        "@deepseek-ai/dsh-session-title" => apply_session_title(ctx, config),
+        "@deepseek-ai/dsh-session-title-first-prompt-llm" => {
+            apply_session_title_llm(ctx, config)
+        }
         "@deepseek-ai/dsh-session-persistence-jsonl" => apply_persistence(ctx, config),
         "@deepseek-ai/dsh-session-persistence-sqlite" => apply_persistence_sqlite(ctx, config),
         "@deepseek-ai/dsh-attachment-local" => apply_attachment(ctx, config),
@@ -246,6 +250,55 @@ fn apply_spill_policy(ctx: &Context, config: Option<Value>) -> Result<()> {
     let resolved =
         dsh_spill_policy::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     dsh_spill_policy::install(ctx, resolved)
+}
+
+fn apply_session_title(ctx: &Context, config: Option<Value>) -> Result<()> {
+    fn positive(config: Option<&Value>, key: &str) -> Result<usize> {
+        config
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .map(|value| value as usize)
+            .ok_or_else(|| {
+                CordisError::Validation(format!("session-title requires positive {key}"))
+            })
+    }
+    let resolved = dsh_session_title::SessionTitleConfig {
+        fallback_max_words: positive(config.as_ref(), "fallbackMaxWords")?,
+        fallback_max_bytes: positive(config.as_ref(), "fallbackMaxBytes")?,
+        max_title_bytes: positive(config.as_ref(), "maxTitleBytes")?,
+    };
+    dsh_session_title::SessionTitleService::install(ctx, resolved)?;
+    Ok(())
+}
+
+fn apply_session_title_llm(ctx: &Context, config: Option<Value>) -> Result<()> {
+    fn positive(config: Option<&Value>, key: &str) -> Result<u64> {
+        config
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                CordisError::Validation(format!("session-title-llm requires positive {key}"))
+            })
+    }
+    let optional = |key: &str| {
+        config
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let resolved = dsh_session_title_first_prompt_llm::SessionTitleLlmConfig {
+        target_words: positive(config.as_ref(), "targetWords")? as u32,
+        target_cjk_characters: positive(config.as_ref(), "targetCjkCharacters")? as u32,
+        max_input_bytes: positive(config.as_ref(), "maxInputBytes")? as usize,
+        max_output_tokens: positive(config.as_ref(), "maxOutputTokens")? as u32,
+        timeout_ms: positive(config.as_ref(), "timeoutMs")?,
+        provider: optional("provider"),
+        model: optional("model"),
+    };
+    dsh_session_title_first_prompt_llm::install(ctx, resolved)
 }
 
 fn apply_persistence(ctx: &Context, config: Option<Value>) -> Result<()> {

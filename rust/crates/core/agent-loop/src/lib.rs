@@ -7,12 +7,13 @@ use dsh_agent::{
 };
 use dsh_cordis::{Context, Service};
 use dsh_llm::{
-    call_id, BlockAssembler, LlmCallConfig, LlmRequest, LlmRuntime,
+    call_id, AssistantMessage, BlockAssembler, LlmCallConfig, LlmRequest, LlmRuntime,
     MessageSource, ToolResultMessage, UserMessage,
 };
 use dsh_session::{
     Session, SessionEventData, SessionId, SurfaceOp, TurnEndReason,
 };
+use dsh_session_title::SessionTitleService;
 use dsh_system_prompt::{render_prompt, SystemPrompt};
 use dsh_tools::ToolRuntime;
 use futures::StreamExt;
@@ -56,7 +57,6 @@ struct LoopAgent {
     cancel_reason: Mutex<Option<String>>,
     idle: Notify,
     max_tokens: AtomicBool,
-    titled: AtomicBool,
     last_context: Mutex<Option<String>>,
     last_header: Mutex<Option<serde_json::Value>>,
     last_request_context: Mutex<Option<(String, String)>>,
@@ -73,7 +73,6 @@ impl LoopAgent {
             cancel_reason: Mutex::new(None),
             idle: Notify::new(),
             max_tokens: AtomicBool::new(false),
-            titled: AtomicBool::new(false),
             last_context: Mutex::new(None),
             last_header: Mutex::new(None),
             last_request_context: Mutex::new(None),
@@ -156,27 +155,13 @@ impl LoopAgent {
                         Some(SurfaceOp::append()),
                     )
                     .ok();
-                if title_from.is_none()
-                    && matches!(message.source, MessageSource::User)
-                    && !self.titled.load(Ordering::SeqCst)
-                {
+                if title_from.is_none() && matches!(message.source, MessageSource::User) {
                     title_from = event.map(|event| (event.seq, user_text(message)));
                 }
             }
             if let Some((seq, text)) = title_from {
-                let title = fallback_title(&text);
-                if !title.is_empty() {
-                    self.session
-                        .append(
-                            SessionEventData::SessionTitle {
-                                title,
-                                message_seqs: vec![seq],
-                                source: serde_json::json!({ "kind": "fallback" }),
-                            },
-                            None,
-                        )
-                        .ok();
-                    self.titled.store(true, Ordering::SeqCst);
+                if let Ok(titles) = self.ctx.service::<SessionTitleService>() {
+                    titles.ensure_fallback(&self.session, seq, &text);
                 }
             }
             let step_end = self.step(turn, step).await;
@@ -235,10 +220,13 @@ impl LoopAgent {
             .map(|model| LlmCallConfig {
                 provider: model.provider.clone(),
                 model: model.model.clone(),
+                reasoning_effort: None,
+                max_tokens: None,
             })
             .unwrap_or_default();
         let request = LlmRequest {
             config,
+            adapter_defaults: None,
             system: if system.is_empty() { None } else { Some(system) },
             messages: self.session.derive_messages(),
             tools: assembly.tools,
@@ -254,6 +242,16 @@ impl LoopAgent {
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or(request);
         self.log_request(&request);
+        if let Ok(titles) = self.ctx.service::<SessionTitleService>() {
+            titles
+                .on_request_logged(
+                    &self.ctx,
+                    &self.session,
+                    &request.config.provider,
+                    &request.config.model,
+                )
+                .await;
+        }
 
         let Some(llm) = self.ctx.get::<LlmRuntime>() else {
             return Some(TurnEndReason::Error {
@@ -261,6 +259,10 @@ impl LoopAgent {
                 code: "UNKNOWN".into(),
             });
         };
+        let route = (
+            request.config.provider.clone(),
+            request.config.model.clone(),
+        );
         let stream = match llm.stream(request).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -286,6 +288,7 @@ impl LoopAgent {
             }
         };
         let mut assembler = BlockAssembler::default();
+        let mut chunk_seqs = Vec::new();
         futures::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
             if let dsh_llm::StreamChunk::Finish {
@@ -295,29 +298,30 @@ impl LoopAgent {
             {
                 self.max_tokens.store(true, Ordering::SeqCst);
             }
-            self.session
-                .append(
-                    SessionEventData::AssistantChunk {
-                        turn,
-                        step,
-                        chunk: chunk.clone(),
-                    },
-                    None,
-                )
-                .ok();
+            if let Ok(event) = self.session.append(
+                SessionEventData::AssistantChunk {
+                    turn,
+                    step,
+                    chunk: chunk.clone(),
+                },
+                None,
+            ) {
+                chunk_seqs.push(event.seq);
+            }
             assembler.push(&chunk);
         }
         let usage = assembler.take_usage();
-        let message = assembler.finish();
+        let message = AssistantMessage::model(assembler.finish(), route.0, route.1);
         self.session
-            .append(
+            .append_cited(
                 SessionEventData::AssistantMessage {
                     turn,
                     step,
                     message: message.clone(),
                     usage,
                 },
-                Some(SurfaceOp::append()),
+                SurfaceOp::append(),
+                chunk_seqs,
             )
             .ok();
         let calls = message.tool_calls();
@@ -328,8 +332,10 @@ impl LoopAgent {
             return Some(TurnEndReason::Completed);
         }
         if let Some(tools) = self.ctx.get::<ToolRuntime>() {
+            let mut call_seqs = Vec::new();
             for call in &calls {
-                self.session
+                let event = self
+                    .session
                     .append(
                         SessionEventData::ToolCall {
                             turn,
@@ -341,6 +347,7 @@ impl LoopAgent {
                         None,
                     )
                     .ok();
+                call_seqs.push(event.map(|event| event.seq));
             }
             let scheduled: Vec<(String, serde_json::Value)> = calls
                 .iter()
@@ -355,25 +362,28 @@ impl LoopAgent {
                 .execute_many_for(&self.ctx, scheduled, Some(self.session.id().as_str()))
                 .await;
             let mut extra = Vec::new();
-            for (call, outcome) in calls.into_iter().zip(outcomes) {
+            for ((call, outcome), call_seq) in
+                calls.into_iter().zip(outcomes).zip(call_seqs)
+            {
                 let (outcome, contexts) = match outcome {
                     Ok(result) => (result.outcome, result.additional_contexts),
                     Err(error) => (dsh_tools::ToolOutcome::error(error.to_string()), Vec::new()),
                 };
                 extra.extend(contexts);
-                let tool_message = ToolResultMessage {
-                    tool_call_id: call_id(call.id.as_str()),
-                    content: outcome.content,
-                    is_error: Some(outcome.is_error).filter(|flag| *flag),
-                };
+                let tool_message = ToolResultMessage::new(
+                    call_id(call.id.as_str()),
+                    outcome.content,
+                    outcome.is_error,
+                );
                 self.session
-                    .append(
+                    .append_cited(
                         SessionEventData::ToolResult {
                             turn,
                             step,
                             message: tool_message,
                         },
-                        Some(SurfaceOp::append()),
+                        SurfaceOp::append(),
+                        call_seq.map(|seq| vec![seq]).unwrap_or_default(),
                     )
                     .ok();
             }
@@ -401,18 +411,34 @@ impl LoopAgent {
             return None;
         }
         *last = Some(text.clone());
-        Some(UserMessage {
-            content: vec![dsh_llm::ContentBlock::text(text)],
-            source: MessageSource::snapshot("@deepseek-ai/dsh-system-prompt", sections),
-        })
+        Some(UserMessage::from_parts(
+            vec![dsh_llm::ContentBlock::text(text)],
+            MessageSource::snapshot("@deepseek-ai/dsh-system-prompt", sections),
+        ))
     }
 
     fn log_request(&self, request: &LlmRequest) {
-        let header = serde_json::json!({
-            "config": request.config,
-            "system": request.system,
-            "tools": request.tools,
-        });
+        // Canonical header field order and omission rules mirror the TypeScript
+        // `canonicalHeader()`: config, then adapterDefaults / system / tools only
+        // when populated.
+        let mut header_map = serde_json::Map::new();
+        header_map.insert(
+            "config".into(),
+            serde_json::to_value(&request.config).unwrap_or_default(),
+        );
+        if let Some(defaults) = &request.adapter_defaults {
+            header_map.insert("adapterDefaults".into(), defaults.clone());
+        }
+        if let Some(system) = request.system.as_deref().filter(|text| !text.is_empty()) {
+            header_map.insert("system".into(), serde_json::Value::String(system.into()));
+        }
+        if !request.tools.is_empty() {
+            header_map.insert(
+                "tools".into(),
+                serde_json::to_value(&request.tools).unwrap_or_default(),
+            );
+        }
+        let header = serde_json::Value::Object(header_map);
         let reason = {
             let mut last = self.last_header.lock().expect("header");
             if last.is_none() {
@@ -464,10 +490,6 @@ fn user_text(message: &UserMessage) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
-}
-
-fn fallback_title(text: &str) -> String {
-    text.split_whitespace().take(5).collect::<Vec<_>>().join(" ")
 }
 
 #[async_trait]
@@ -725,10 +747,10 @@ mod tests {
                 .get::<AgentRegistry>()
                 .and_then(|agents| agents.get(&id))
             {
-                agent.steer(UserMessage {
-                    content: vec![ContentBlock::text("more")],
-                    source: MessageSource::plugin("steer"),
-                });
+                agent.steer(UserMessage::from_parts(
+                    vec![ContentBlock::text("more")],
+                    MessageSource::plugin("steer"),
+                ));
             }
             None
         })
@@ -817,10 +839,10 @@ mod tests {
         ctx.on_waterfall("agent/request", move |payload, next| {
             let original: LlmRequest = serde_json::from_value(payload.clone()).unwrap();
             let mut modified = original.clone();
-            modified.messages.push(dsh_llm::Message::User(UserMessage {
-                content: vec![ContentBlock::text("plugin")],
-                source: MessageSource::plugin("plugin"),
-            }));
+            modified.messages.push(dsh_llm::Message::User(UserMessage::from_parts(
+                vec![ContentBlock::text("plugin")],
+                MessageSource::plugin("plugin"),
+            )));
             *recorded.lock().expect("seen") =
                 Some((original.messages.clone(), modified.messages.clone()));
             next.call(serde_json::to_value(modified).unwrap())

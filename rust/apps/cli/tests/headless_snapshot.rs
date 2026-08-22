@@ -144,7 +144,7 @@ async fn bash_turn_snapshot() {
             _ => None,
         })
         .expect("tool result");
-    let text = match &result.content[0] {
+    let text = match &result.result_blocks()[0] {
         ContentBlock::Text { text } => text,
         _ => panic!("expected text"),
     };
@@ -259,7 +259,7 @@ async fn glob_turn_snapshot() {
             _ => None,
         })
         .expect("tool result");
-    let text = match &result.content[0] {
+    let text = match &result.result_blocks()[0] {
         ContentBlock::Text { text } => text,
         _ => panic!("expected text"),
     };
@@ -380,7 +380,7 @@ async fn goal_turn_snapshot() {
             _ => None,
         })
         .collect();
-    let create = match &results[0].content[0] {
+    let create = match &results[0].result_blocks()[0] {
         ContentBlock::Text { text } => text,
         _ => panic!("text"),
     };
@@ -439,7 +439,7 @@ async fn web_search_turn_snapshot() {
             _ => None,
         })
         .expect("tool result");
-    let text = match &result.content[0] {
+    let text = match &result.result_blocks()[0] {
         ContentBlock::Text { text } => text,
         _ => panic!("text"),
     };
@@ -493,7 +493,7 @@ async fn workflow_turn_snapshot() {
             _ => None,
         })
         .expect("tool result");
-    let text = match &result.content[0] {
+    let text = match &result.result_blocks()[0] {
         ContentBlock::Text { text } => text,
         _ => panic!("text"),
     };
@@ -551,7 +551,7 @@ async fn subagent_turn_snapshot() {
             _ => None,
         })
         .expect("tool result");
-    let text = match &result.content[0] {
+    let text = match &result.result_blocks()[0] {
         ContentBlock::Text { text } => text,
         _ => panic!("text"),
     };
@@ -685,7 +685,7 @@ async fn spill_policy_turn_snapshot() {
             _ => None,
         })
         .expect("tool result");
-    let text = match &result.content[0] {
+    let text = match &result.result_blocks()[0] {
         ContentBlock::Text { text } => text,
         _ => panic!("text"),
     };

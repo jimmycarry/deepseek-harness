@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dsh_brand::Branded;
 use dsh_cordis::Service;
 use futures::stream::BoxStream;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
@@ -90,6 +90,17 @@ pub enum ContentBlock {
         name: String,
         /// Raw JSON arguments.
         arguments: String,
+    },
+    /// Completed tool output carried inside a user-role tool-result message.
+    ToolResult {
+        /// Matching tool-call id.
+        #[serde(rename = "toolCallId")]
+        tool_call_id: CallId,
+        /// Tool output blocks.
+        content: Vec<ContentBlock>,
+        /// Whether the tool reported a failure.
+        #[serde(rename = "isError")]
+        is_error: bool,
     },
 }
 
@@ -205,22 +216,49 @@ impl MessageSource {
     }
 }
 
+/// Fresh message identity: a UUID v4 assigned at construction.
+pub fn new_message_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn user_role() -> String {
+    "user".into()
+}
+
+fn assistant_role() -> String {
+    "assistant".into()
+}
+
 /// User-role message on the model-visible surface.
+/// Field order matches the TypeScript wire: `content`, `source`, `role`, `id`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserMessage {
     /// Message content blocks.
     pub content: Vec<ContentBlock>,
     /// Distinguishes a human prompt from inject/steer sources.
     pub source: MessageSource,
+    /// Constant `user` wire role.
+    #[serde(default = "user_role")]
+    pub role: String,
+    /// Message identity, a UUID assigned at construction.
+    #[serde(default = "new_message_id")]
+    pub id: String,
 }
 
 impl UserMessage {
+    /// Build from explicit content and source with a fresh identity.
+    pub fn from_parts(content: Vec<ContentBlock>, source: MessageSource) -> Self {
+        Self {
+            content,
+            source,
+            role: user_role(),
+            id: new_message_id(),
+        }
+    }
+
     /// Human text prompt.
     pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            content: vec![ContentBlock::text(text)],
-            source: MessageSource::User,
-        }
+        Self::from_parts(vec![ContentBlock::text(text)], MessageSource::User)
     }
 
     /// Plugin notice injected onto the next model step.
@@ -229,10 +267,10 @@ impl UserMessage {
         text: impl Into<String>,
         summary: impl Into<String>,
     ) -> Self {
-        Self {
-            content: vec![ContentBlock::text(text)],
-            source: MessageSource::notice(plugin, summary),
-        }
+        Self::from_parts(
+            vec![ContentBlock::text(text)],
+            MessageSource::notice(plugin, summary),
+        )
     }
 
     /// Goal-round continuation prompt.
@@ -242,21 +280,47 @@ impl UserMessage {
         revision: u64,
         round: u32,
     ) -> Self {
-        Self {
-            content: vec![ContentBlock::text(text)],
-            source: MessageSource::goal(goal_id, revision, round),
-        }
+        Self::from_parts(
+            vec![ContentBlock::text(text)],
+            MessageSource::goal(goal_id, revision, round),
+        )
     }
 }
 
 /// Assembled assistant message for one step.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+/// Field order matches the TypeScript wire: `role`, `content`, `source`, `id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AssistantMessage {
+    /// Constant `assistant` wire role.
+    #[serde(default = "assistant_role")]
+    pub role: String,
     /// Message content blocks.
     pub content: Vec<ContentBlock>,
+    /// Producing route (`{kind:"model", provider, model}` for adapter output).
+    pub source: MessageSource,
+    /// Message identity, a UUID assigned at construction.
+    #[serde(default = "new_message_id")]
+    pub id: String,
 }
 
 impl AssistantMessage {
+    /// Build a model-sourced assistant message with a fresh identity.
+    pub fn model(
+        content: Vec<ContentBlock>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: assistant_role(),
+            content,
+            source: MessageSource::Model {
+                provider: provider.into(),
+                model: model.into(),
+            },
+            id: new_message_id(),
+        }
+    }
+
     /// Visible text concatenated from text blocks.
     pub fn text(&self) -> String {
         self.content
@@ -289,21 +353,71 @@ impl AssistantMessage {
     }
 }
 
-/// Tool-result message projected onto the surface.
+/// Tool-result message projected onto the surface: a user-role message whose
+/// content is one `tool-result` block and whose source is `{kind:"tool", callId}`.
+/// Field order matches the TypeScript wire: `source`, `content`, `role`, `id`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResultMessage {
-    /// Matching tool-call id.
-    pub tool_call_id: CallId,
-    /// Result content.
+    /// Tool provenance carrying the matching call id.
+    pub source: MessageSource,
+    /// One `tool-result` content block wrapping the tool output.
     pub content: Vec<ContentBlock>,
-    /// Whether the tool reported a failure.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_error: Option<bool>,
+    /// Constant `user` wire role.
+    #[serde(default = "user_role")]
+    pub role: String,
+    /// Message identity, a UUID assigned at construction.
+    #[serde(default = "new_message_id")]
+    pub id: String,
 }
 
-/// Role-tagged message used in `derive_messages` and adapter requests.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "role", rename_all = "lowercase")]
+impl ToolResultMessage {
+    /// Wrap one tool outcome as the surface message for `call_id`.
+    pub fn new(call_id: CallId, content: Vec<ContentBlock>, is_error: bool) -> Self {
+        Self {
+            source: MessageSource::Tool {
+                call_id: call_id.as_str().to_string(),
+            },
+            content: vec![ContentBlock::ToolResult {
+                tool_call_id: call_id,
+                content,
+                is_error,
+            }],
+            role: user_role(),
+            id: new_message_id(),
+        }
+    }
+
+    /// Matching tool-call id from the `tool` source.
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match &self.source {
+            MessageSource::Tool { call_id } => Some(call_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Tool output blocks inside the first `tool-result` content block.
+    pub fn result_blocks(&self) -> &[ContentBlock] {
+        self.content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(&[])
+    }
+
+    /// Whether the wrapped tool outcome reported a failure.
+    pub fn is_error(&self) -> bool {
+        self.content.iter().any(|block| {
+            matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+        })
+    }
+}
+
+/// Message union used in `derive_messages` and adapter requests. Each member
+/// carries its own wire `role`; a tool result is a user-role message with a
+/// `tool` source, so deserialization discriminates on `role` then `source.kind`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// User or injected context.
     User(UserMessage),
@@ -311,6 +425,40 @@ pub enum Message {
     Assistant(AssistantMessage),
     /// Tool result.
     Tool(ToolResultMessage),
+}
+
+impl Serialize for Message {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::User(message) => message.serialize(serializer),
+            Self::Assistant(message) => message.serialize(serializer),
+            Self::Tool(message) => message.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let role = value.get("role").and_then(Value::as_str).unwrap_or("user");
+        if role == "assistant" {
+            return serde_json::from_value(value)
+                .map(Self::Assistant)
+                .map_err(serde::de::Error::custom);
+        }
+        let source_kind = value
+            .get("source")
+            .and_then(|source| source.get("kind"))
+            .and_then(Value::as_str);
+        if source_kind == Some("tool") {
+            return serde_json::from_value(value)
+                .map(Self::Tool)
+                .map_err(serde::de::Error::custom);
+        }
+        serde_json::from_value(value)
+            .map(Self::User)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// One streamed fragment from an adapter. Wire tag is `type`, matching TypeScript `StreamChunk`.
@@ -512,6 +660,16 @@ pub struct LlmCallConfig {
     pub provider: String,
     /// Model id.
     pub model: String,
+    /// Requested reasoning effort when the deployment configures one.
+    #[serde(
+        rename = "reasoningEffort",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_effort: Option<String>,
+    /// Output-token cap when the deployment configures one.
+    #[serde(rename = "maxTokens", default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 impl Default for LlmCallConfig {
@@ -519,6 +677,8 @@ impl Default for LlmCallConfig {
         Self {
             provider: "replay".into(),
             model: "script".into(),
+            reasoning_effort: None,
+            max_tokens: None,
         }
     }
 }
@@ -528,6 +688,13 @@ impl Default for LlmCallConfig {
 pub struct LlmRequest {
     /// Route and sampling.
     pub config: LlmCallConfig,
+    /// Adapter-declared config defaults echoed into `request/header` when present.
+    #[serde(
+        rename = "adapterDefaults",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub adapter_defaults: Option<Value>,
     /// Rendered system prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -693,8 +860,8 @@ impl BlockAssembler {
         self.usage.take()
     }
 
-    /// Finish the assembled message.
-    pub fn finish(self) -> AssistantMessage {
+    /// Finish the assembled content blocks in first-seen stream order.
+    pub fn finish(self) -> Vec<ContentBlock> {
         let mut content = Vec::new();
         for index in self.order {
             let Some(block) = self.blocks.get(&index) else {
@@ -720,7 +887,7 @@ impl BlockAssembler {
                 _ => {}
             }
         }
-        AssistantMessage { content }
+        content
     }
 }
 
@@ -730,7 +897,7 @@ mod tests {
 
     #[test]
     fn empty_assistant_text_is_empty() {
-        assert_eq!(AssistantMessage::default().text(), "");
+        assert_eq!(AssistantMessage::model(vec![], "p", "m").text(), "");
     }
 
     #[test]
@@ -749,9 +916,42 @@ mod tests {
             reason: FinishReason::Stop,
             replay_state: None,
         });
-        let message = assembler.finish();
+        let message = AssistantMessage::model(assembler.finish(), "p", "m");
         assert_eq!(message.text(), "hi");
         assert_eq!(message.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn message_wire_matches_typescript_roles_and_sources() {
+        let user = serde_json::to_value(Message::User(UserMessage::text("hi"))).unwrap();
+        assert_eq!(user["role"], "user");
+        assert_eq!(user["source"]["kind"], "user");
+        assert!(user["id"].as_str().is_some());
+        let tool = ToolResultMessage::new(call_id("c1"), vec![ContentBlock::text("ok")], false);
+        let wire = serde_json::to_value(Message::Tool(tool.clone())).unwrap();
+        assert_eq!(wire["role"], "user");
+        assert_eq!(wire["source"], serde_json::json!({"kind":"tool","callId":"c1"}));
+        assert_eq!(wire["content"][0]["type"], "tool-result");
+        assert_eq!(wire["content"][0]["toolCallId"], "c1");
+        assert_eq!(wire["content"][0]["isError"], false);
+        assert_eq!(tool.tool_call_id(), Some("c1"));
+        assert_eq!(tool.result_blocks(), &[ContentBlock::text("ok")]);
+        assert!(!tool.is_error());
+        let round_trip: Message = serde_json::from_value(wire).unwrap();
+        assert!(matches!(round_trip, Message::Tool(_)));
+        let assistant = serde_json::to_value(Message::Assistant(AssistantMessage::model(
+            vec![ContentBlock::text("pong")],
+            "deepseek",
+            "chat",
+        )))
+        .unwrap();
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(
+            assistant["source"],
+            serde_json::json!({"kind":"model","provider":"deepseek","model":"chat"})
+        );
+        let round_trip: Message = serde_json::from_value(assistant).unwrap();
+        assert!(matches!(round_trip, Message::Assistant(_)));
     }
 
     #[test]

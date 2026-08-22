@@ -88,6 +88,7 @@ const TEXT_TURN_TYPES: &[&str] = &[
     "session/title",
     "request/header",
     "request/context",
+    "session/title-llm-request",
     "assistant/chunk",
     "assistant/chunk",
     "assistant/chunk",
@@ -110,6 +111,7 @@ const BASH_TURN_TYPES: &[&str] = &[
     "session/title",
     "request/header",
     "request/context",
+    "session/title-llm-request",
     "assistant/chunk",
     "assistant/chunk",
     "assistant/chunk",
@@ -149,7 +151,67 @@ async fn text_turn_profile_types_and_payloads() {
     );
     assert_eq!(events[9]["data"]["source"]["kind"], "fallback");
     assert_eq!(events[9]["data"]["title"], "ping the product path");
+    assert_eq!(
+        events[9]["data"]["messageSeqs"],
+        serde_json::json!([events[7]["seq"]])
+    );
     assert_eq!(events[10]["data"]["reason"], "initial");
+    for event in &events {
+        assert!(event["seq"].is_u64(), "envelope seq: {event}");
+        assert!(event["time"].is_u64(), "envelope time: {event}");
+    }
+    let title_request = events
+        .iter()
+        .find(|event| event["type"] == "session/title-llm-request")
+        .expect("title llm request");
+    assert_eq!(
+        title_request["data"]["titleProvider"],
+        "session-title-first-prompt-llm"
+    );
+    assert_eq!(
+        title_request["data"]["messageSeqs"],
+        serde_json::json!([events[7]["seq"]])
+    );
+    assert_eq!(
+        title_request["data"]["route"],
+        serde_json::json!({
+            "provider": events[10]["data"]["header"]["config"]["provider"],
+            "model": events[10]["data"]["header"]["config"]["model"],
+        })
+    );
+    let title_system = title_request["data"]["system"].as_str().unwrap_or("");
+    assert!(
+        title_system.starts_with(
+            "Create a concise title for an AI coding-assistant session from the supplied human messages."
+        ),
+        "{title_system}"
+    );
+    assert!(
+        title_system.ends_with("Aim for about 5 words in non-CJK languages or 10 CJK characters."),
+        "{title_system}"
+    );
+    assert_eq!(title_request["data"]["maxTokens"], 64);
+    let title_message = &title_request["data"]["messages"][0];
+    assert_eq!(title_message["role"], "user");
+    assert_eq!(title_message["source"]["kind"], "plugin");
+    assert_eq!(title_message["source"]["plugin"], "dsh-session-title-llm");
+    assert!(
+        title_message["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("Generate the session title from this JSON array of human messages:"),
+        "{title_message}"
+    );
+    let chunk_seqs: Vec<Value> = events
+        .iter()
+        .filter(|event| event["type"] == "assistant/chunk")
+        .map(|event| event["seq"].clone())
+        .collect();
+    let message = events
+        .iter()
+        .find(|event| event["type"] == "assistant/message")
+        .expect("assistant message");
+    assert_eq!(message["sourceEventSeqs"], Value::Array(chunk_seqs));
     let chunks: Vec<&str> = events
         .iter()
         .filter(|event| event["type"] == "assistant/chunk")
@@ -200,10 +262,18 @@ async fn bash_turn_profile_types_and_payloads() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = result["data"]["message"]["content"][0]["text"]
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert_eq!(text.trim(), "hello");
+    let call = events
+        .iter()
+        .find(|event| event["type"] == "tool/call")
+        .expect("tool call");
+    assert_eq!(
+        result["sourceEventSeqs"],
+        serde_json::json!([call["seq"]])
+    );
 }
 
 #[tokio::test]
@@ -239,7 +309,7 @@ async fn glob_turn_profile_rereads_workspace() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = result["data"]["message"]["content"][0]["text"]
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert!(text.contains("found.txt"), "glob result: {text}");
@@ -280,7 +350,7 @@ async fn str_replace_editor_turn_profile_rereads_file() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = result["data"]["message"]["content"][0]["text"]
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert!(
@@ -331,7 +401,7 @@ async fn goal_turn_profile_writes_goal_change() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = create["data"]["message"]["content"][0]["text"]
+    let text = create["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert!(text.contains("\"activation\":\"armed\""), "{text}");
@@ -374,7 +444,7 @@ async fn web_search_turn_profile() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = result["data"]["message"]["content"][0]["text"]
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert!(text.contains("[Example](https://example.test)"), "{text}");
@@ -402,7 +472,7 @@ async fn workflow_turn_profile() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = result["data"]["message"]["content"][0]["text"]
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert!(
@@ -430,7 +500,7 @@ async fn subagent_turn_profile() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = result["data"]["message"]["content"][0]["text"]
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert_eq!(text, "child-done");
@@ -454,7 +524,7 @@ async fn spill_policy_turn_profile() {
         .iter()
         .find(|event| event["type"] == "tool/result")
         .expect("tool result");
-    let text = result["data"]["message"]["content"][0]["text"]
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert!(
@@ -506,7 +576,7 @@ fn typescript_headless_profile_types_are_known() {
         "/../../../examples/headless-agent/tests/snapshots/headless-profile/session.expected.jsonl"
     );
     let body = std::fs::read_to_string(path).expect("typescript fixture");
-    let deferred = ["session", "session/title-llm-request"];
+    let deferred = ["session"];
     for line in body.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line).unwrap();
         let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");

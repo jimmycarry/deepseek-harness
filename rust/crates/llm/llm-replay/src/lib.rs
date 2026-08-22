@@ -33,10 +33,13 @@ pub struct ReplayToolCall {
     pub arguments: String,
 }
 
-/// Plays recorded turns in order, then repeats the last one.
+/// Plays recorded turns in order, then repeats the last one. Auxiliary
+/// requests (a non-empty `purpose`) never consume the scripted turn queue:
+/// they are served from the optional per-purpose script or rejected.
 pub struct ReplayAdapter {
     turns: Vec<ReplayTurn>,
     cursor: std::sync::atomic::AtomicUsize,
+    auxiliary: std::collections::HashMap<String, String>,
 }
 
 impl ReplayAdapter {
@@ -45,6 +48,7 @@ impl ReplayAdapter {
         Self {
             turns,
             cursor: std::sync::atomic::AtomicUsize::new(0),
+            auxiliary: std::collections::HashMap::new(),
         }
     }
 
@@ -56,11 +60,32 @@ impl ReplayAdapter {
             finish: None,
         }])
     }
+
+    /// Serve auxiliary requests carrying `purpose` with one fixed text reply.
+    pub fn with_auxiliary(mut self, purpose: impl Into<String>, text: impl Into<String>) -> Self {
+        self.auxiliary.insert(purpose.into(), text.into());
+        self
+    }
 }
 
 #[async_trait]
 impl LlmAdapter for ReplayAdapter {
-    async fn stream(&self, _request: LlmRequest) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
+    async fn stream(&self, request: LlmRequest) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
+        if let Some(purpose) = request.purpose.as_deref() {
+            let Some(text) = self.auxiliary.get(purpose) else {
+                return Err(LlmError::Failure(dsh_llm::LlmFailure {
+                    message: format!("replay adapter has no auxiliary script for purpose {purpose}"),
+                    code: "REPLAY_NO_AUXILIARY".into(),
+                    status: None,
+                }));
+            };
+            let mut chunks = text_block(0, text.clone());
+            chunks.push(StreamChunk::Finish {
+                reason: FinishReason::Stop,
+                replay_state: None,
+            });
+            return Ok(Box::pin(stream::iter(chunks)));
+        }
         let index = self
             .cursor
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -116,6 +141,7 @@ mod tests {
         let stream = adapter
             .stream(LlmRequest {
                 config: dsh_llm::LlmCallConfig::default(),
+                adapter_defaults: None,
                 system: None,
                 messages: vec![],
                 tools: vec![],

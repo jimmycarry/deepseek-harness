@@ -23,6 +23,62 @@ pub fn session_id(value: impl Into<String>) -> SessionId {
 /// On-disk session format version. Unreleased: pinned at 0, no compatibility.
 pub const SESSION_FORMAT_VERSION: u32 = 0;
 
+/// Immutable session creation metadata, written once as the persisted header
+/// line. Field order matches the TypeScript `HeaderLine`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionHeader {
+    /// On-disk format version, [`SESSION_FORMAT_VERSION`] at write time.
+    pub version: u32,
+    /// Session identity; must equal the owning session's id.
+    pub id: SessionId,
+    /// Unix epoch milliseconds at creation.
+    #[serde(rename = "createdAt")]
+    pub created_at: u64,
+    /// Working directory recorded at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Parent session for a subagent child.
+    #[serde(
+        rename = "parentSession",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parent_session: Option<SessionId>,
+    /// Number of seeded events copied from a resume, fork, or replay source.
+    #[serde(rename = "seedLength", default, skip_serializing_if = "Option::is_none")]
+    pub seed_length: Option<u64>,
+    /// `subagent` when a delegation created this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Delegation depth: 0 for a top-level session, parent depth + 1 for a child.
+    #[serde(rename = "delegationDepth", default)]
+    pub delegation_depth: u32,
+}
+
+impl SessionHeader {
+    /// Header for a fresh top-level session created now.
+    pub fn new(id: SessionId, cwd: Option<String>) -> Self {
+        Self {
+            version: SESSION_FORMAT_VERSION,
+            id,
+            created_at: now_ms(),
+            cwd,
+            parent_session: None,
+            seed_length: None,
+            origin: None,
+            delegation_depth: 0,
+        }
+    }
+}
+
+/// Current Unix epoch milliseconds; the envelope `time` and header `createdAt` source.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Why a turn ended.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -251,6 +307,25 @@ pub enum SessionEventData {
         /// Title source (`fallback`, `user`, or `provider`).
         source: Value,
     },
+    /// Log-only pre-dispatch record of one session-title model request.
+    #[serde(rename = "session/title-llm-request")]
+    SessionTitleLlmRequest {
+        /// Registered title-provider identity responsible for the request.
+        #[serde(rename = "titleProvider")]
+        title_provider: String,
+        /// Exact human `user/message` seqs represented in `messages`.
+        #[serde(rename = "messageSeqs")]
+        message_seqs: Vec<u64>,
+        /// Exact auxiliary LLM route (`{provider, model}`).
+        route: Value,
+        /// Exact auxiliary system prompt.
+        system: String,
+        /// Exact auxiliary message list.
+        messages: Vec<Message>,
+        /// Exact auxiliary output-token cap.
+        #[serde(rename = "maxTokens")]
+        max_tokens: u32,
+    },
     /// Compaction lock start.
     #[serde(rename = "compaction/start")]
     CompactionStart {
@@ -285,24 +360,97 @@ pub enum SessionEventData {
     },
 }
 
-/// Envelope stored in the log. `seq` is assigned by [`Session::append`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Envelope stored in the log. `seq` and `time` are assigned by [`Session::append`].
+/// Wire order matches TypeScript: `type`, `seq`, `time`, payload keys,
+/// `sourceEventSeqs`, `surfaceOp`, `ignorable`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionEvent {
     /// Contiguous sequence number, 0-based.
     pub seq: u64,
+    /// Unix epoch milliseconds at append.
+    pub time: u64,
     /// Event body.
-    #[serde(flatten)]
     pub data: SessionEventData,
+    /// Seqs of earlier events this surface event cites as sources.
+    pub source_event_seqs: Option<Vec<u64>>,
     /// Surface membership, required for surface types.
-    #[serde(rename = "surfaceOp", skip_serializing_if = "Option::is_none")]
     pub surface_op: Option<SurfaceOp>,
     /// Unknown required-on-read events may set this to keep older readers alive.
-    #[serde(default, skip_serializing_if = "is_false")]
     pub ignorable: bool,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+impl Serialize for SessionEvent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let body = serde_json::to_value(&self.data).map_err(serde::ser::Error::custom)?;
+        let Value::Object(body) = body else {
+            return Err(serde::ser::Error::custom("event body must be an object"));
+        };
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(type_name) = body.get("type") {
+            map.serialize_entry("type", type_name)?;
+        }
+        map.serialize_entry("seq", &self.seq)?;
+        map.serialize_entry("time", &self.time)?;
+        for (key, value) in &body {
+            if key != "type" {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        if let Some(seqs) = &self.source_event_seqs {
+            map.serialize_entry("sourceEventSeqs", seqs)?;
+        }
+        if let Some(op) = &self.surface_op {
+            map.serialize_entry("surfaceOp", op)?;
+        }
+        if self.ignorable {
+            map.serialize_entry("ignorable", &true)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionEvent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object_mut() else {
+            return Err(serde::de::Error::custom("event must be an object"));
+        };
+        let seq = object
+            .remove("seq")
+            .and_then(|seq| seq.as_u64())
+            .unwrap_or(0);
+        let time = object
+            .remove("time")
+            .and_then(|time| time.as_u64())
+            .unwrap_or(0);
+        let source_event_seqs = match object.remove("sourceEventSeqs") {
+            Some(seqs) => Some(
+                serde_json::from_value::<Vec<u64>>(seqs).map_err(serde::de::Error::custom)?,
+            ),
+            None => None,
+        };
+        let surface_op = match object.remove("surfaceOp") {
+            Some(op) => Some(
+                serde_json::from_value::<SurfaceOp>(op).map_err(serde::de::Error::custom)?,
+            ),
+            None => None,
+        };
+        let ignorable = object
+            .remove("ignorable")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
+        let data: SessionEventData =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            seq,
+            time,
+            data,
+            source_event_seqs,
+            surface_op,
+            ignorable,
+        })
+    }
 }
 
 impl SessionEventData {
@@ -334,6 +482,7 @@ pub fn event_type_name(data: &SessionEventData) -> &str {
         SessionEventData::RequestHeader { .. } => "request/header",
         SessionEventData::RequestContext { .. } => "request/context",
         SessionEventData::SessionTitle { .. } => "session/title",
+        SessionEventData::SessionTitleLlmRequest { .. } => "session/title-llm-request",
         SessionEventData::CompactionStart { .. } => "compaction/start",
         SessionEventData::CompactionSummary { .. } => "compaction/summary",
         SessionEventData::CompactionEnd { .. } => "compaction/end",
@@ -356,6 +505,7 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "request/header",
     "sandbox/mode",
     "session/title",
+    "session/title-llm-request",
     "step/end",
     "step/start",
     "subagent/descriptor",
@@ -400,33 +550,9 @@ pub fn session_event_from_value(value: Value) -> Result<SessionEvent, SessionErr
         .and_then(Value::as_bool)
         .unwrap_or(false);
     refuse_unknown(&type_name, ignorable)?;
-    if !is_known_session_event_type(&type_name) {
-        return Ok(extension_from_value(value, type_name));
-    }
     serde_json::from_value(value).map_err(|error| {
         SessionError::UnknownRequiredEvent(format!("malformed {type_name}: {error}"))
     })
-}
-
-fn extension_from_value(mut value: Value, type_name: String) -> SessionEvent {
-    let seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
-    let surface_op = value
-        .get("surfaceOp")
-        .and_then(|op| serde_json::from_value(op.clone()).ok());
-    if let Value::Object(map) = &mut value {
-        map.remove("seq");
-        map.remove("surfaceOp");
-        map.remove("ignorable");
-    }
-    SessionEvent {
-        seq,
-        data: SessionEventData::Extension {
-            type_name,
-            data: value,
-        },
-        surface_op,
-        ignorable: true,
-    }
 }
 
 /// Errors from append or fold.
@@ -438,6 +564,9 @@ pub enum SessionError {
     /// Non-surface event carried a surface op.
     #[error("non-surface event must not carry surfaceOp")]
     UnexpectedSurfaceOp,
+    /// Non-surface event carried source-event citations.
+    #[error("non-surface event must not carry sourceEventSeqs")]
+    UnexpectedSourceSeqs,
     /// Replace cited a seq that is not on the current surface.
     #[error("replace range is not on the current surface")]
     InvalidReplace,
@@ -487,15 +616,24 @@ impl SessionSurface {
 /// One append-only session.
 pub struct Session {
     id: SessionId,
+    header: SessionHeader,
     events: Mutex<Vec<SessionEvent>>,
     surface: Mutex<SessionSurface>,
 }
 
 impl Session {
-    /// Create an empty session.
+    /// Create an empty session with a fresh top-level header.
     pub fn new(id: SessionId) -> Self {
+        let header = SessionHeader::new(id.clone(), None);
+        Self::with_header(header)
+    }
+
+    /// Create an empty session under explicit creation metadata.
+    /// The header id names the session.
+    pub fn with_header(header: SessionHeader) -> Self {
         Self {
-            id,
+            id: header.id.clone(),
+            header,
             events: Mutex::new(Vec::new()),
             surface: Mutex::new(SessionSurface::default()),
         }
@@ -506,24 +644,51 @@ impl Session {
         &self.id
     }
 
+    /// Immutable creation metadata persisted as the header line.
+    pub fn header(&self) -> &SessionHeader {
+        &self.header
+    }
+
     /// Append one event. `seq` equals the new log length minus one.
     pub fn append(
         &self,
         data: SessionEventData,
         surface_op: Option<SurfaceOp>,
     ) -> Result<SessionEvent, SessionError> {
-        self.append_inner(data, surface_op, false)
+        self.append_inner(data, surface_op, None, false, None)
+    }
+
+    /// Append a surface event that cites earlier events as sources.
+    pub fn append_cited(
+        &self,
+        data: SessionEventData,
+        surface_op: SurfaceOp,
+        source_event_seqs: Vec<u64>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_inner(
+            data,
+            Some(surface_op),
+            Some(source_event_seqs),
+            false,
+            None,
+        )
     }
 
     /// Append a log-only event that unknown readers may skip.
     pub fn append_ignorable(&self, data: SessionEventData) -> Result<SessionEvent, SessionError> {
-        self.append_inner(data, None, true)
+        self.append_inner(data, None, None, true, None)
     }
 
     /// Append a previously logged event after refusing unknown required types.
     pub fn append_logged(&self, event: SessionEvent) -> Result<SessionEvent, SessionError> {
         refuse_unknown(event_type_name(&event.data), event.ignorable)?;
-        self.append_inner(event.data, event.surface_op, event.ignorable)
+        self.append_inner(
+            event.data,
+            event.surface_op,
+            event.source_event_seqs,
+            event.ignorable,
+            Some(event.time),
+        )
     }
 
     /// Reconstruct a session by appending each logged event in order.
@@ -547,13 +712,18 @@ impl Session {
         &self,
         data: SessionEventData,
         surface_op: Option<SurfaceOp>,
+        source_event_seqs: Option<Vec<u64>>,
         ignorable: bool,
+        time: Option<u64>,
     ) -> Result<SessionEvent, SessionError> {
         if data.is_surface() && surface_op.is_none() {
             return Err(SessionError::MissingSurfaceOp);
         }
         if !data.is_surface() && surface_op.is_some() {
             return Err(SessionError::UnexpectedSurfaceOp);
+        }
+        if !data.is_surface() && source_event_seqs.is_some() {
+            return Err(SessionError::UnexpectedSourceSeqs);
         }
         let mut events = self.events.lock().expect("log");
         let seq = events.len() as u64;
@@ -562,7 +732,9 @@ impl Session {
         }
         let event = SessionEvent {
             seq,
+            time: time.unwrap_or_else(now_ms),
             data,
+            source_event_seqs,
             surface_op,
             ignorable,
         };
@@ -638,13 +810,21 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Create a session under a caller-supplied id.
+    /// Create a session under a caller-supplied id, stamping the run cwd.
     pub fn create(&self, id: SessionId) -> Arc<Session> {
-        let session = Arc::new(Session::new(id.clone()));
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string());
+        self.publish(Session::with_header(SessionHeader::new(id, cwd)))
+    }
+
+    /// Publish a caller-constructed session (explicit header) into the store.
+    pub fn publish(&self, session: Session) -> Arc<Session> {
+        let session = Arc::new(session);
         self.sessions
             .lock()
             .expect("sessions")
-            .insert(id.as_str().to_string(), Arc::clone(&session));
+            .insert(session.id().as_str().to_string(), Arc::clone(&session));
         session
     }
 
@@ -720,7 +900,7 @@ mod tests {
                 SessionEventData::AssistantMessage {
                     turn: 1,
                     step: 1,
-                    message: AssistantMessage::default(),
+                    message: AssistantMessage::model(vec![], "p", "m"),
                     usage: None,
                 },
                 Some(SurfaceOp::append()),
@@ -746,10 +926,10 @@ mod tests {
             .unwrap();
         session
             .append(
-                SessionEventData::UserMessage(UserMessage {
-                    content: vec![ContentBlock::text("summary")],
-                    source: dsh_llm::MessageSource::plugin("compaction"),
-                }),
+                SessionEventData::UserMessage(UserMessage::from_parts(
+                    vec![ContentBlock::text("summary")],
+                    dsh_llm::MessageSource::plugin("compaction"),
+                )),
                 Some(SurfaceOp::Replace {
                     start: a.seq,
                     end: a.seq,
@@ -789,10 +969,12 @@ mod tests {
         assert_eq!(child.events(), source.events());
         let unknown = SessionEvent {
             seq: 0,
+            time: 0,
             data: SessionEventData::Extension {
                 type_name: "future/event".into(),
                 data: serde_json::json!({}),
             },
+            source_event_seqs: None,
             surface_op: None,
             ignorable: false,
         };
@@ -815,10 +997,18 @@ mod tests {
             )
             .unwrap();
         let events = session.events();
-        assert_eq!(
-            serde_json::to_value(&events[0]).unwrap(),
-            serde_json::json!({"seq":0,"type":"turn/start","data":{"turn":1}})
-        );
+        let first = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(first["type"], "turn/start");
+        assert_eq!(first["seq"], 0);
+        assert!(first["time"].as_u64().is_some());
+        assert_eq!(first["data"], serde_json::json!({"turn":1}));
+        let keys: Vec<&str> = first
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["type", "seq", "time", "data"]);
         assert_eq!(
             serde_json::to_value(&events[1]).unwrap()["surfaceOp"],
             serde_json::json!("append")
@@ -827,6 +1017,46 @@ mod tests {
             serde_json::to_value(&events[1]).unwrap()["data"]["source"],
             serde_json::json!({"kind":"user"})
         );
+    }
+
+    #[test]
+    fn cited_surface_event_round_trips_source_event_seqs() {
+        let session = Session::new(session_id("s"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let cited = session
+            .append_cited(
+                SessionEventData::UserMessage(UserMessage::text("hi")),
+                SurfaceOp::append(),
+                vec![0],
+            )
+            .unwrap();
+        let wire = serde_json::to_value(&cited).unwrap();
+        assert_eq!(wire["sourceEventSeqs"], serde_json::json!([0]));
+        let parsed: SessionEvent = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.source_event_seqs, Some(vec![0]));
+        let err = session
+            .append_inner(
+                SessionEventData::TurnStart { turn: 2 },
+                None,
+                Some(vec![0]),
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, SessionError::UnexpectedSourceSeqs));
+    }
+
+    #[test]
+    fn header_records_creation_metadata() {
+        let session = Session::new(session_id("h"));
+        assert_eq!(session.header().version, SESSION_FORMAT_VERSION);
+        assert_eq!(session.header().id.as_str(), "h");
+        assert_eq!(session.header().delegation_depth, 0);
+        let store = SessionStore::new();
+        let created = store.create(session_id("c"));
+        assert!(created.header().cwd.is_some());
     }
 }
 

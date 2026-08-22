@@ -69,6 +69,8 @@ members = [
   "crates/guard/repeat-tool-reminder",
   "crates/session/session-persistence",
   "crates/session/session-persistence-jsonl",
+  "crates/session/session-title",
+  "crates/session/session-title-first-prompt-llm",
   "crates/session/session-persistence-sqlite",
   "crates/session/session-projection",
   "crates/session-query/session-query",
@@ -106,7 +108,7 @@ async-trait = "=0.1.83"
 bytes = "=1.9.0"
 futures = "=0.3.31"
 serde = { version = "=1.0.216", features = ["derive"] }
-serde_json = "=1.0.133"
+serde_json = { version = "=1.0.133", features = ["preserve_order"] }
 thiserror = "=1.0.69"
 tokio = { version = "=1.42.0", features = ["full"] }
 uuid = { version = "=1.11.0", features = ["v4", "serde"] }
@@ -181,6 +183,8 @@ dsh-tool-workflow = { path = "crates/workflow/tool-workflow" }
 dsh-timeout-policy = { path = "crates/guard/timeout-policy" }
 dsh-repeat-tool-reminder = { path = "crates/guard/repeat-tool-reminder" }
 dsh-session-persistence = { path = "crates/session/session-persistence" }
+dsh-session-title = { path = "crates/session/session-title" }
+dsh-session-title-first-prompt-llm = { path = "crates/session/session-title-first-prompt-llm" }
 dsh-session-persistence-jsonl = { path = "crates/session/session-persistence-jsonl" }
 dsh-session-persistence-sqlite = { path = "crates/session/session-persistence-sqlite" }
 dsh-session-projection = { path = "crates/session/session-projection" }

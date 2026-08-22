@@ -98,8 +98,8 @@ fn request_body(model: &str, request: &LlmRequest) -> String {
             Message::Tool(tool) => {
                 messages.push(json!({
                     "role": "tool",
-                    "content": blocks_text(&tool.content),
-                    "tool_call_id": tool.tool_call_id.as_str(),
+                    "content": blocks_text(tool.result_blocks()),
+                    "tool_call_id": tool.tool_call_id().unwrap_or(""),
                 }));
             }
         }
@@ -277,6 +277,7 @@ mod tests {
         let stream = adapter
             .stream(LlmRequest {
                 config: LlmCallConfig::default(),
+                adapter_defaults: None,
                 system: None,
                 messages: vec![Message::User(UserMessage::text("ping"))],
                 tools: vec![],

@@ -181,6 +181,7 @@ dependencies = [
  "dsh-cordis",
  "dsh-llm",
  "dsh-session",
+ "dsh-session-title",
  "dsh-system-prompt",
  "dsh-tools",
  "futures",
@@ -207,6 +208,7 @@ dependencies = [
  "dsh-repeat-tool-reminder",
  "dsh-sandbox-local",
  "dsh-session",
+ "dsh-session-title",
  "dsh-shell",
  "dsh-spill-local",
  "dsh-spill-policy",
@@ -273,6 +275,8 @@ dependencies = [
  "dsh-session-persistence-jsonl",
  "dsh-session-persistence-sqlite",
  "dsh-session-query-sqlite",
+ "dsh-session-title",
+ "dsh-session-title-first-prompt-llm",
  "dsh-shell",
  "dsh-spill-local",
  "dsh-spill-policy",
@@ -584,6 +588,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -798,6 +803,33 @@ dependencies = [
  "dsh-session-persistence",
  "dsh-session-query",
  "rusqlite",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-session-title"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-llm",
+ "dsh-session",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-session-title-first-prompt-llm"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-llm",
+ "dsh-llm-replay",
+ "dsh-session",
+ "dsh-session-title",
+ "futures",
  "serde_json",
  "tokio",
 ]
@@ -1220,6 +1252,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "equivalent"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1372,12 +1410,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+
+[[package]]
 name = "hashlink"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
- "hashbrown",
+ "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "indexmap"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c9c992b02b5b4c94ea26e32fe5bccb7aa7d9f390ab5c1221ff895bc7ea8b652"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -1573,6 +1627,7 @@ version = "1.0.133"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7fceb2473b9166b2294ef05efcb65a3db80803f0b03ef86a5fc88a2b85ee377"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "ryu",

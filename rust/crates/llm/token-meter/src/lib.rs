@@ -51,6 +51,9 @@ impl TokenMeter {
                         + self.tokens_for(arguments.len())
                         + BLOCK_OVERHEAD;
                 }
+                ContentBlock::ToolResult { content, .. } => {
+                    tokens += self.estimate_content(content) + BLOCK_OVERHEAD;
+                }
             }
         }
         tokens

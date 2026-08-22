@@ -332,10 +332,7 @@ mod tests {
     fn inject_does_not_count_as_pending_wake() {
         let inbox = Inbox::default();
         inbox.push(InboxEntry {
-            message: UserMessage {
-                content: vec![],
-                source: dsh_llm::MessageSource::plugin("inject"),
-            },
+            message: UserMessage::from_parts(vec![], dsh_llm::MessageSource::plugin("inject")),
             target: InboxTarget::NextStep,
             wakeup: false,
         });

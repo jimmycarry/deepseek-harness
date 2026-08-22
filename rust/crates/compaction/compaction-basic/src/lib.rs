@@ -143,10 +143,10 @@ impl BasicCompactionEngine {
         )];
         session
             .append(
-                SessionEventData::UserMessage(dsh_llm::UserMessage {
-                    content: summary.clone(),
-                    source: dsh_llm::MessageSource::plugin("compaction"),
-                }),
+                SessionEventData::UserMessage(dsh_llm::UserMessage::from_parts(
+                    summary.clone(),
+                    dsh_llm::MessageSource::plugin("compaction"),
+                )),
                 Some(SurfaceOp::Replace { start, end }),
             )
             .ok();

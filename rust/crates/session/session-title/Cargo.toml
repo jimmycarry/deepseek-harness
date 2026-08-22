@@ -1,18 +1,17 @@
 [package]
-name = "dsh-llm"
+name = "dsh-session-title"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Message and stream vocabulary plus the LLM adapter seam (ctx.llm)."
+description = "Log-backed session titles (ctx.sessionTitle): deterministic fallback plus provider registry."
 
 [dependencies]
 async-trait.workspace = true
-dsh-brand.workspace = true
 dsh-cordis.workspace = true
-futures.workspace = true
-serde.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+
+[dev-dependencies]
 tokio.workspace = true
-uuid.workspace = true

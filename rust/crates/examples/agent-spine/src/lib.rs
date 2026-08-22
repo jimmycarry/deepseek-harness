@@ -27,6 +27,14 @@ pub fn apply(ctx: &Context, adapter: Arc<dyn LlmAdapter>) -> Result<()> {
     ctx.provide(Arc::new(prompt))?;
     ctx.provide(Arc::new(ToolRuntime::new()))?;
     ctx.provide(Arc::new(CommandRegistry::new()))?;
+    dsh_session_title::SessionTitleService::install(
+        ctx,
+        dsh_session_title::SessionTitleConfig {
+            fallback_max_words: 5,
+            fallback_max_bytes: 40,
+            max_title_bytes: 80,
+        },
+    )?;
     ctx.provide(Arc::new(AgentRegistry::new()))?;
     AgentLoop::install(ctx)?;
     Ok(())
