@@ -14,4 +14,5 @@ dsh-cordis-loader.workspace = true
 dsh-llm.workspace = true
 dsh-session.workspace = true
 dsh-session-persistence.workspace = true
+dsh-subagent.workspace = true
 serde_json.workspace = true

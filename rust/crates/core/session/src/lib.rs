@@ -417,6 +417,11 @@ pub enum SessionEventData {
         error: Option<String>,
     },
     /// Plugin-merged log-only event.
+    ///
+    /// TODO: TypeScript logs extension payloads nested under a `data` key;
+    /// this untagged variant flattens them to the top level. Aligning the
+    /// wire format moves every extension writer (goal, workflow, web-search,
+    /// subagent descriptors) in one change.
     #[serde(untagged)]
     Extension {
         /// Event type name.

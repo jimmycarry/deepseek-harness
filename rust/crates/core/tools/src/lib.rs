@@ -50,6 +50,14 @@ pub trait Tool: Send + Sync {
     fn timeout_ms(&self) -> Option<u64> {
         None
     }
+
+    /// Whether this tool is registered for `agent_id`'s scope. A scope-locked
+    /// tool (a continuable child's `report`) narrows this; outside its scope
+    /// the tool is absent from schemas and rejects execution as unknown. The
+    /// default keeps the tool globally visible.
+    fn enabled_for(&self, _agent_id: Option<&str>) -> bool {
+        true
+    }
 }
 
 /// Cordis service key checked before enforcing a tool's declared deadline.
@@ -195,11 +203,17 @@ impl ToolRuntime {
 
     /// Schemas in registration order of names (sorted for determinism).
     pub fn schemas(&self) -> Vec<ToolSchema> {
+        self.schemas_for(None)
+    }
+
+    /// Schemas visible to `agent_id`, honoring each tool's scope lock.
+    pub fn schemas_for(&self, agent_id: Option<&str>) -> Vec<ToolSchema> {
         let mut tools: Vec<_> = self
             .tools
             .lock()
             .expect("tools")
             .values()
+            .filter(|tool| tool.enabled_for(agent_id))
             .map(|tool| ToolSchema {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
@@ -260,7 +274,7 @@ impl ToolRuntime {
             let outcome = ToolOutcome::error(ToolError::Denied(name.into()).to_string());
             return Ok(post_execute(ctx, name, &args, agent_id, outcome));
         }
-        let Some(tool) = self.get(name) else {
+        let Some(tool) = self.get(name).filter(|tool| tool.enabled_for(agent_id)) else {
             let outcome = ToolOutcome::error(ToolError::Unknown(name.into()).to_string());
             return Ok(post_execute(ctx, name, &args, agent_id, outcome));
         };
@@ -340,7 +354,7 @@ impl ToolRuntime {
                     continue;
                 }
             }
-            match self.get(&name) {
+            match self.get(&name).filter(|tool| tool.enabled_for(agent_id)) {
                 Some(tool) => prepared.push(Prepared::Ready { name, tool, args }),
                 None => prepared.push(Prepared::Unknown { name, args }),
             }

@@ -176,6 +176,35 @@ pub enum MessageSource {
         /// Complete catalog entries in rank order.
         entries: Vec<SkillCatalogEntry>,
     },
+    /// A message another agent's tool call addressed to this one.
+    #[serde(rename = "coordinator")]
+    Coordinator {
+        /// Relay context form; always `relay`.
+        form: String,
+        /// Session id of the agent whose tool call produced the follow-up.
+        #[serde(rename = "senderSessionId")]
+        sender_session_id: String,
+    },
+    /// A continuable child's explicit report to its direct parent.
+    #[serde(rename = "subagent-report")]
+    SubagentReport {
+        /// Relay context form; always `relay`.
+        form: String,
+        /// Session id of the reporting child.
+        #[serde(rename = "senderSessionId")]
+        sender_session_id: String,
+    },
+    /// The runtime's account of a continuable child settling.
+    #[serde(rename = "subagent-settled")]
+    SubagentSettled {
+        /// Notice context form; always `notice`.
+        form: String,
+        /// One-line account of how the child ended.
+        summary: String,
+        /// Session id of the child that settled.
+        #[serde(rename = "senderSessionId")]
+        sender_session_id: String,
+    },
     /// Same-session goal-round continuation.
     #[serde(rename = "goal")]
     Goal {
@@ -253,6 +282,50 @@ impl MessageSource {
             revision,
             round,
         }
+    }
+
+    /// Coordinator relay source for a parent's follow-up to its child.
+    pub fn coordinator(sender_session_id: impl Into<String>) -> Self {
+        Self::Coordinator {
+            form: "relay".into(),
+            sender_session_id: sender_session_id.into(),
+        }
+    }
+
+    /// Relay source for a continuable child's explicit report.
+    pub fn subagent_report(sender_session_id: impl Into<String>) -> Self {
+        Self::SubagentReport {
+            form: "relay".into(),
+            sender_session_id: sender_session_id.into(),
+        }
+    }
+
+    /// Notice source for the runtime's account of a child settling.
+    pub fn subagent_settled(
+        summary: impl Into<String>,
+        sender_session_id: impl Into<String>,
+    ) -> Self {
+        Self::SubagentSettled {
+            form: "notice".into(),
+            summary: bound_context_summary(&summary.into()),
+            sender_session_id: sender_session_id.into(),
+        }
+    }
+}
+
+/// Longest `notice` summary a context row renders without truncation.
+pub const CONTEXT_SUMMARY_MAX_CHARS: usize = 120;
+
+/// Bound one `notice` summary to [`CONTEXT_SUMMARY_MAX_CHARS`] characters,
+/// replacing the overflow with a single trailing `…`.
+pub fn bound_context_summary(summary: &str) -> String {
+    let chars: Vec<char> = summary.chars().collect();
+    if chars.len() <= CONTEXT_SUMMARY_MAX_CHARS {
+        summary.to_string()
+    } else {
+        let mut bounded: String = chars[..CONTEXT_SUMMARY_MAX_CHARS - 1].iter().collect();
+        bounded.push('…');
+        bounded
     }
 }
 

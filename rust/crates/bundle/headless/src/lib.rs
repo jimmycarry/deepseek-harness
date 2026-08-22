@@ -98,6 +98,25 @@ pub async fn run_session(ctx: &Context) -> std::result::Result<Arc<Session>, Str
     run_followup(handle.agent.as_ref(), UserMessage::text(task))
         .await
         .map_err(|error| error.to_string())?;
+    // Continuable background children accepted work during the root turn.
+    // Drive them to settlement — each settlement notice wakes the root — and
+    // run every root turn those notices open, until the whole tree is quiet.
+    if let Some(subagents) = ctx.get::<dsh_subagent::SubagentRuntime>() {
+        loop {
+            let ran = subagents.run_pending().await;
+            if handle.agent.inbox().has_pending() {
+                handle
+                    .agent
+                    .run()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+            if !ran {
+                break;
+            }
+        }
+    }
     if let Some(persistence) = ctx.get::<PersistenceRuntime>() {
         persistence
             .save(handle.agent.session().as_ref())
@@ -117,10 +136,10 @@ mod tests {
         assert!(patch_yaml().contains("id: headless-runner"));
         let patches = patches();
         assert!(patches.iter().any(|patch| {
-            patch
-                .insert
-                .as_ref()
-                .is_some_and(|rows| rows.iter().any(|entry| entry.id.as_deref() == Some("headless-runner")))
+            patch.insert.as_ref().is_some_and(|rows| {
+                rows.iter()
+                    .any(|entry| entry.id.as_deref() == Some("headless-runner"))
+            })
         }));
         assert!(patches.iter().any(|patch| {
             patch.id.as_deref() == Some("hmr")

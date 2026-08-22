@@ -45,6 +45,12 @@ impl SubagentProvider for InProcessProvider {
         self.inherits
     }
 
+    fn supports_continuable(&self) -> bool {
+        // Fork stays one-shot: its inherited history must remain the exact
+        // parent prefix, which a continuable child's contributions would break.
+        !self.inherits
+    }
+
     async fn start(
         &self,
         request: SubagentStartRequest,
@@ -98,12 +104,10 @@ impl SubagentProvider for InProcessProvider {
     }
 }
 
-fn completed_turn_prefix(
-    events: &[dsh_session::SessionEvent],
-) -> Vec<dsh_session::SessionEvent> {
-    let last_end = events.iter().rposition(|event| {
-        event_type_name(&event.data) == "turn/end"
-    });
+fn completed_turn_prefix(events: &[dsh_session::SessionEvent]) -> Vec<dsh_session::SessionEvent> {
+    let last_end = events
+        .iter()
+        .rposition(|event| event_type_name(&event.data) == "turn/end");
     match last_end {
         Some(index) => events[..=index].to_vec(),
         None => Vec::new(),

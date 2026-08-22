@@ -5,8 +5,10 @@ use dsh_app_boot::{compose_profile, register_profile_plugins, shipped_bundles};
 use dsh_bundle_headless::HeadlessStartup;
 use dsh_cordis::Context;
 use dsh_cordis_loader::{Entry, EntryPatch, Loader};
-use dsh_llm::{FinishReason, StreamChunk};
-use dsh_session::{event_type_name, Session, SessionEventData};
+use dsh_llm::{ContentBlock, FinishReason, StreamChunk};
+use dsh_session::{event_type_name, session_id, Session, SessionEventData, SessionStore};
+use dsh_subagent::SubagentRuntime;
+use dsh_tools::ToolRuntime;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -27,6 +29,13 @@ fn replay_turns_overlay(turns: Value) -> Vec<EntryPatch> {
 }
 
 async fn run_profile(task: &str, overlay: Vec<EntryPatch>) -> Vec<Value> {
+    let (_ctx, session) = run_profile_host(task, overlay).await;
+    events_of(&session)
+}
+
+/// Mount and drive the profile, keeping the host context alive so a test can
+/// inspect other sessions in the catalog or call services after the run.
+async fn run_profile_host(task: &str, overlay: Vec<EntryPatch>) -> (Context, Arc<Session>) {
     let dir = std::env::temp_dir().join(format!(
         "dsh-wave-d-{}-{}",
         std::process::id(),
@@ -45,7 +54,7 @@ async fn run_profile(task: &str, overlay: Vec<EntryPatch>) -> Vec<Value> {
     register_profile_plugins(&loader);
     loader.mount(&ctx, &entries).unwrap();
     let session = dsh_bundle_headless::run_session(&ctx).await.unwrap();
-    events_of(&session)
+    (ctx, session)
 }
 
 fn uuid_stamp() -> u128 {
@@ -507,6 +516,312 @@ async fn subagent_turn_profile() {
         .as_str()
         .unwrap_or("");
     assert_eq!(text, "child-done");
+}
+
+/// Every tool/result in log order as (text, isError).
+fn tool_result_texts(events: &[Value]) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .filter(|event| event["type"] == "tool/result")
+        .map(|event| {
+            let block = &event["data"]["message"]["content"][0];
+            (
+                block["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                block["isError"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+/// The durable child id from the first `started subagent <id>` tool result.
+fn started_child_id(events: &[Value]) -> String {
+    let (text, is_error) = tool_result_texts(events)
+        .into_iter()
+        .next()
+        .expect("delegation tool result");
+    assert!(!is_error, "{text}");
+    text.strip_prefix("started subagent ")
+        .unwrap_or_else(|| panic!("unexpected delegation result: {text}"))
+        .to_string()
+}
+
+fn turn_numbers(events: &[Value]) -> Vec<u64> {
+    events
+        .iter()
+        .filter(|event| event["type"] == "turn/start")
+        .filter_map(|event| event["data"]["turn"].as_u64())
+        .collect()
+}
+
+#[tokio::test]
+async fn continuable_settlement_turn_profile() {
+    // The parent never polls: the runtime's settlement notice must carry the
+    // child's closing message into the parent's second turn.
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "subagent",
+                "arguments": "{\"description\":\"child task\",\"prompt\":\"Reply with exactly CHILD_RESULT\"}"
+            }
+        },
+        { "text": "waiting" },
+        { "text": "CHILD_RESULT" },
+        { "text": "PARENT_RECEIVED_CHILD_RESULT" }
+    ]);
+    let (ctx, session) =
+        run_profile_host("delegate in background", replay_turns_overlay(turns)).await;
+    let events = events_of(&session);
+    let child_id = started_child_id(&events);
+    let notice = events
+        .iter()
+        .find(|event| {
+            event["type"] == "user/message" && event["data"]["source"]["kind"] == "subagent-settled"
+        })
+        .expect("settlement notice");
+    assert_eq!(notice["data"]["source"]["form"], "notice");
+    assert_eq!(
+        notice["data"]["source"]["senderSessionId"],
+        Value::String(child_id.clone())
+    );
+    let summary = format!(
+        "Background subagent {child_id} finished and will do no further work unless you send it more."
+    );
+    assert_eq!(
+        notice["data"]["source"]["summary"],
+        Value::String(summary.clone())
+    );
+    let content = notice["data"]["content"]
+        .as_array()
+        .expect("notice content");
+    let texts: Vec<&str> = content
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        [summary.as_str(), "Its closing message:", "CHILD_RESULT"]
+    );
+    assert_eq!(turn_numbers(&events), vec![1, 2]);
+    assert_eq!(
+        session.last_assistant_text().as_deref(),
+        Some("PARENT_RECEIVED_CHILD_RESULT")
+    );
+    let store = ctx.get::<SessionStore>().expect("session store");
+    let child = store.get(&session_id(&child_id)).expect("child session");
+    let header = child.header().clone();
+    assert_eq!(header.parent_session.as_ref(), Some(session.id()));
+    assert_eq!(header.origin.as_deref(), Some("subagent"));
+    assert_eq!(header.delegation_depth, 1);
+    let child_events = events_of(&child);
+    let descriptor = child_events
+        .iter()
+        .find(|event| event["type"] == "subagent/descriptor")
+        .expect("child descriptor");
+    assert_eq!(descriptor["version"], 2);
+    assert_eq!(descriptor["mode"], "continuable");
+    assert_eq!(descriptor["provider"], "spawn");
+    assert_eq!(descriptor["label"], "child task");
+    assert_eq!(turn_numbers(&child_events), vec![1]);
+    assert_eq!(child.last_assistant_text().as_deref(), Some("CHILD_RESULT"));
+}
+
+#[tokio::test]
+async fn continuable_report_turn_profile() {
+    // The child's scope-local report steers the parent; the unconditional
+    // settlement notice follows, and the parent claims both in causal order.
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "subagent",
+                "arguments": "{\"description\":\"reporting child\",\"prompt\":\"Report REPORT_PAYLOAD to your parent.\"}"
+            }
+        },
+        { "text": "spawned" },
+        {
+            "text": "",
+            "tool": {
+                "id": "c2",
+                "name": "report",
+                "arguments": "{\"output\":\"REPORT_PAYLOAD\"}"
+            }
+        },
+        { "text": "child closing" },
+        { "text": "PARENT_GOT_REPORT" }
+    ]);
+    let (ctx, session) = run_profile_host("delegate and listen", replay_turns_overlay(turns)).await;
+    let events = events_of(&session);
+    let child_id = started_child_id(&events);
+    let store = ctx.get::<SessionStore>().expect("session store");
+    let child = store.get(&session_id(&child_id)).expect("child session");
+    let child_events = events_of(&child);
+    let (report_text, report_error) = tool_result_texts(&child_events)
+        .into_iter()
+        .next()
+        .expect("child report result");
+    assert!(!report_error, "{report_text}");
+    assert!(
+        report_text.starts_with("report accepted by the agent that started you as message "),
+        "{report_text}"
+    );
+    let report = events
+        .iter()
+        .find(|event| {
+            event["type"] == "user/message" && event["data"]["source"]["kind"] == "subagent-report"
+        })
+        .expect("parent-facing report");
+    assert_eq!(report["data"]["source"]["form"], "relay");
+    assert_eq!(
+        report["data"]["source"]["senderSessionId"],
+        Value::String(child_id.clone())
+    );
+    let report_texts: Vec<&str> = report["data"]["content"]
+        .as_array()
+        .expect("report content")
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert_eq!(
+        report_texts,
+        [
+            format!("Background subagent {child_id} reported:").as_str(),
+            "REPORT_PAYLOAD"
+        ]
+    );
+    let settled = events
+        .iter()
+        .find(|event| {
+            event["type"] == "user/message" && event["data"]["source"]["kind"] == "subagent-settled"
+        })
+        .expect("settlement notice");
+    assert!(
+        report["seq"].as_u64() < settled["seq"].as_u64(),
+        "report must precede the settlement notice"
+    );
+    assert_eq!(
+        session.last_assistant_text().as_deref(),
+        Some("PARENT_GOT_REPORT")
+    );
+    // The child-scoped report tool never reaches the root's schema set.
+    let tools = ctx.get::<ToolRuntime>().expect("tool runtime");
+    assert!(tools
+        .schemas_for(Some(session.id().as_str()))
+        .iter()
+        .all(|schema| schema.name != "report"));
+}
+
+#[tokio::test]
+async fn list_agents_and_unknown_send_message_turn_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "subagent",
+                "arguments": "{\"description\":\"child task\",\"prompt\":\"Reply with exactly CHILD_OK\"}"
+            }
+        },
+        {
+            "text": "",
+            "tool": { "id": "c2", "name": "list_agents", "arguments": "{}" }
+        },
+        {
+            "text": "",
+            "tool": {
+                "id": "c3",
+                "name": "send_message",
+                "arguments": "{\"subagent_id\":\"22222222-2222-4222-8222-222222222222\",\"message\":\"Please continue.\"}"
+            }
+        },
+        { "text": "DONE" },
+        { "text": "CHILD_OK" },
+        { "text": "acknowledged" }
+    ]);
+    let events = run_profile("list then misaddress", replay_turns_overlay(turns)).await;
+    let child_id = started_child_id(&events);
+    let results = tool_result_texts(&events);
+    assert_eq!(results.len(), 3, "{results:?}");
+    assert_eq!(
+        results[1],
+        (format!("{child_id} [idle] — child task"), false)
+    );
+    assert_eq!(
+        results[2],
+        (
+            "Error: subagent \"22222222-2222-4222-8222-222222222222\" is unavailable".to_string(),
+            true
+        )
+    );
+}
+
+#[tokio::test]
+async fn send_message_resumes_settled_child() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "subagent",
+                "arguments": "{\"description\":\"child task\",\"prompt\":\"Reply with exactly CHILD_RESULT\"}"
+            }
+        },
+        { "text": "waiting" },
+        { "text": "CHILD_RESULT" },
+        { "text": "SECOND_OK" }
+    ]);
+    let (ctx, session) =
+        run_profile_host("delegate then continue", replay_turns_overlay(turns)).await;
+    let child_id = started_child_id(&events_of(&session));
+    let tools = ctx.get::<ToolRuntime>().expect("tool runtime");
+    let delivered = tools
+        .execute_for(
+            &ctx,
+            "send_message",
+            serde_json::json!({
+                "subagent_id": child_id,
+                "message": "Now reply with exactly SECOND_OK."
+            }),
+            Some(session.id().as_str()),
+        )
+        .await
+        .expect("send_message execution");
+    assert!(!delivered.outcome.is_error);
+    let ContentBlock::Text { text } = &delivered.outcome.content[0] else {
+        panic!("send_message outcome must be text");
+    };
+    assert_eq!(
+        text,
+        &format!("message queued as the next turn for subagent {child_id}")
+    );
+    let subagents = ctx.get::<SubagentRuntime>().expect("subagent runtime");
+    assert!(subagents.run_pending().await, "resumed child must run");
+    let store = ctx.get::<SessionStore>().expect("session store");
+    let child = store.get(&session_id(&child_id)).expect("child session");
+    let child_events = events_of(&child);
+    let followup = child_events
+        .iter()
+        .find(|event| {
+            event["type"] == "user/message" && event["data"]["source"]["kind"] == "coordinator"
+        })
+        .expect("coordinator follow-up");
+    assert_eq!(followup["data"]["source"]["form"], "relay");
+    assert_eq!(
+        followup["data"]["source"]["senderSessionId"],
+        Value::String(session.id().as_str().to_string())
+    );
+    assert_eq!(
+        followup["data"]["content"][0]["text"],
+        "Now reply with exactly SECOND_OK."
+    );
+    // The resumed continuation extends the same log instead of restarting at 1.
+    assert_eq!(turn_numbers(&child_events), vec![1, 2]);
+    assert_eq!(child.last_assistant_text().as_deref(), Some("SECOND_OK"));
 }
 
 #[tokio::test]

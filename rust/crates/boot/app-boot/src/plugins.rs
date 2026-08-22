@@ -89,6 +89,11 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-subagent-spawn-in-process" => apply_subagent_provider(ctx, config, false),
         "@deepseek-ai/dsh-subagent-fork-in-process" => apply_subagent_provider(ctx, config, true),
         "@deepseek-ai/dsh-tool-subagent" => apply_tool_subagent(ctx, config),
+        "@deepseek-ai/dsh-tool-subagent-control" => apply_tool_subagent_control(ctx),
+        "@deepseek-ai/dsh-tool-subagent-control/list-agents" => {
+            apply_tool_subagent_list_agents(ctx)
+        }
+        "@deepseek-ai/dsh-tool-subagent-report" => apply_tool_subagent_report(ctx, config),
         "@deepseek-ai/dsh-workflow-worker-thread" => apply_workflow(ctx, config),
         "@deepseek-ai/dsh-tool-workflow" => apply_tool_workflow(ctx, config),
         "@deepseek-ai/dsh-repeat-tool-reminder" => apply_repeat_tool_reminder(ctx, config),
@@ -578,6 +583,33 @@ fn apply_tool_subagent(ctx: &Context, config: Option<Value>) -> Result<()> {
     let resolved =
         dsh_tool_subagent::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     dsh_tool_subagent::install(ctx, resolved)
+}
+
+fn ensure_subagents(ctx: &Context) -> Result<()> {
+    if !ctx.has_service(dsh_subagent::SubagentRuntime::KEY) {
+        dsh_subagent::SubagentRuntime::install(ctx)?;
+    }
+    Ok(())
+}
+
+fn apply_tool_subagent_control(ctx: &Context) -> Result<()> {
+    ensure_subagents(ctx)?;
+    ensure_tools(ctx)?;
+    dsh_tool_subagent_control::install(ctx)
+}
+
+fn apply_tool_subagent_list_agents(ctx: &Context) -> Result<()> {
+    ensure_subagents(ctx)?;
+    ensure_tools(ctx)?;
+    dsh_tool_subagent_control::install_list_agents(ctx)
+}
+
+fn apply_tool_subagent_report(ctx: &Context, config: Option<Value>) -> Result<()> {
+    ensure_subagents(ctx)?;
+    ensure_tools(ctx)?;
+    let resolved = dsh_tool_subagent_report::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
+    dsh_tool_subagent_report::install(ctx, resolved)
 }
 
 fn apply_workflow(ctx: &Context, config: Option<Value>) -> Result<()> {

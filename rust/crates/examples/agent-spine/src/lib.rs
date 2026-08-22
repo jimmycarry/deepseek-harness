@@ -107,6 +107,7 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
                 provider: "spawn".into(),
                 tool_name: "subagent".into(),
                 background_mode: "one-shot".into(),
+                enable_run_in_background: true,
             },
         )?;
         dsh_workflow_local::install(ctx, "in-process")?;

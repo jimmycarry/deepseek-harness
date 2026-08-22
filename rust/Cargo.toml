@@ -62,6 +62,8 @@ members = [
   "crates/subagent/subagent",
   "crates/subagent/subagent-inprocess",
   "crates/subagent/tool-subagent",
+  "crates/subagent/tool-subagent-control",
+  "crates/subagent/tool-subagent-report",
   "crates/workflow/workflow",
   "crates/workflow/workflow-local",
   "crates/workflow/tool-workflow",
@@ -178,6 +180,8 @@ dsh-tool-goal = { path = "crates/goal/tool-goal" }
 dsh-subagent = { path = "crates/subagent/subagent" }
 dsh-subagent-inprocess = { path = "crates/subagent/subagent-inprocess" }
 dsh-tool-subagent = { path = "crates/subagent/tool-subagent" }
+dsh-tool-subagent-control = { path = "crates/subagent/tool-subagent-control" }
+dsh-tool-subagent-report = { path = "crates/subagent/tool-subagent-report" }
 dsh-workflow = { path = "crates/workflow/workflow" }
 dsh-workflow-local = { path = "crates/workflow/workflow-local" }
 dsh-tool-workflow = { path = "crates/workflow/tool-workflow" }

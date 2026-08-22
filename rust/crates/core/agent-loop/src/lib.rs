@@ -207,7 +207,11 @@ impl LoopAgent {
 
     async fn step(&self, turn: u32, step: u32) -> Option<TurnEndReason> {
       loop {
-        let tools = self.ctx.get::<ToolRuntime>().map(|runtime| runtime.schemas()).unwrap_or_default();
+        let tools = self
+            .ctx
+            .get::<ToolRuntime>()
+            .map(|runtime| runtime.schemas_for(Some(self.session.id().as_str())))
+            .unwrap_or_default();
         let assembly = self
             .ctx
             .get::<SystemPrompt>()
@@ -550,7 +554,19 @@ impl Agent for LoopAgent {
 
     async fn run(&self) -> Result<(), AgentError> {
         self.set_status(AgentStatus::Running);
-        let mut turn = 0u32;
+        // Turn numbering is session-scoped: a later drive of the same agent
+        // (a continuable child resumed, a root woken by a settlement notice)
+        // continues after the last logged turn instead of restarting at 1.
+        let mut turn = self
+            .session
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.data {
+                SessionEventData::TurnStart { turn } => Some(turn),
+                _ => None,
+            })
+            .unwrap_or(0);
         while self.inbox.has_pending() {
             turn += 1;
             let more = self.turn(turn).await?;
