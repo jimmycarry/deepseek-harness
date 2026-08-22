@@ -84,6 +84,9 @@ mod tests {
         assert!(ctx.has_service("subagents"));
         assert!(ctx.has_service("web"));
         assert!(ctx.has_service("workflowEngine"));
+        assert!(ctx.has_service("attachments"));
+        assert!(ctx.has_service("sessionQuery"));
+        assert!(ctx.has_service("spillStore"));
     }
 
     #[test]

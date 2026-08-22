@@ -643,6 +643,68 @@ async fn repeat_tool_reminder_snapshot() {
 }
 
 #[tokio::test]
+async fn spill_policy_turn_snapshot() {
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"yes x | head -c 60000"}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "spilled".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("huge"))
+        .await
+        .unwrap();
+    let result = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("tool result");
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("text"),
+    };
+    assert!(
+        text.contains("Full formatted result stored at:"),
+        "{text}"
+    );
+    assert!(text.contains("Omitted"), "{text}");
+    assert!(text.len() <= 50_000, "{}", text.len());
+    let locator = text
+        .split("stored at: ")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .expect("locator");
+    let spilled = std::fs::read_to_string(locator.trim()).expect("host reread");
+    assert!(spilled.len() >= 50_000, "{}", spilled.len());
+}
+
+#[tokio::test]
 async fn with_key_e2e_self_skips_without_secret() {
     if std::env::var("DEEPSEEK_API_KEY").is_err() {
         return;

@@ -437,6 +437,42 @@ async fn subagent_turn_profile() {
 }
 
 #[tokio::test]
+async fn spill_policy_turn_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "bash",
+                "arguments": "{\"command\":\"yes x | head -c 60000\"}"
+            }
+        },
+        { "text": "spilled" }
+    ]);
+    let events = run_profile("huge", replay_turns_overlay(turns)).await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("Full formatted result stored at:"),
+        "{text}"
+    );
+    assert!(text.contains("Omitted"), "{text}");
+    assert!(text.len() <= 50_000, "{}", text.len());
+    let locator = text
+        .split("stored at: ")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .expect("locator");
+    let spilled = std::fs::read_to_string(locator.trim()).expect("host reread");
+    assert!(spilled.len() >= 50_000, "{}", spilled.len());
+}
+
+#[tokio::test]
 async fn repeat_tool_reminder_profile() {
     let turns = serde_json::json!([
         {

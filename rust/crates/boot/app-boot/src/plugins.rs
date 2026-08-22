@@ -44,6 +44,11 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
             Ok(())
         }
         "@deepseek-ai/dsh-session-persistence-jsonl" => apply_persistence(ctx, config),
+        "@deepseek-ai/dsh-session-persistence-sqlite" => apply_persistence_sqlite(ctx, config),
+        "@deepseek-ai/dsh-attachment-local" => apply_attachment(ctx, config),
+        "@deepseek-ai/dsh-session-query-sqlite" => apply_session_query(ctx, config),
+        "@deepseek-ai/dsh-spill-local" => apply_spill_local(ctx, config),
+        "@deepseek-ai/dsh-spill-policy" => apply_spill_policy(ctx, config),
         "@deepseek-ai/dsh-subprocess-local" => apply_subprocess(ctx),
         "@deepseek-ai/dsh-sandbox-local" => apply_sandbox(ctx, config),
         "@deepseek-ai/dsh-sandbox-policy" => apply_sandbox_policy(ctx, config),
@@ -196,6 +201,51 @@ fn apply_default_model(ctx: &Context, config: Option<Value>) -> Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| CordisError::Validation("agent-default-model requires model".into()))?;
     ctx.provide(Arc::new(AgentDefaultModel::new(provider, model)))
+}
+
+fn apply_persistence_sqlite(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let path = config
+        .as_ref()
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CordisError::Validation("session-persistence-sqlite requires path".into())
+        })?;
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).map_err(|error| CordisError::plugin(error.to_string()))?;
+    }
+    dsh_session_persistence_sqlite::install(ctx, path)?;
+    Ok(())
+}
+
+fn apply_attachment(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let resolved =
+        dsh_attachment_local::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_attachment_local::install(ctx, resolved)?;
+    Ok(())
+}
+
+fn apply_session_query(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if !ctx.has_service(dsh_session::SessionStore::KEY) {
+        ctx.provide(Arc::new(dsh_session::SessionStore::new()))?;
+    }
+    let resolved =
+        dsh_session_query_sqlite::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_session_query_sqlite::install(ctx, resolved)?;
+    Ok(())
+}
+
+fn apply_spill_local(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let resolved =
+        dsh_spill_local::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_spill_local::install(ctx, resolved)?;
+    Ok(())
+}
+
+fn apply_spill_policy(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let resolved =
+        dsh_spill_policy::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_spill_policy::install(ctx, resolved)
 }
 
 fn apply_persistence(ctx: &Context, config: Option<Value>) -> Result<()> {

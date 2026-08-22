@@ -1,91 +1,95 @@
-//! File-backed session store using `{schema_version, events}`. Newer schemas are refused.
+//! SQLite session store. Newer `user_version` values are refused.
+//!
+//! Physical records are one JSON event row per seq. This crate's
+//! `SCHEMA_VERSION` is monotonic and starts at `1`; it does not read the
+//! TypeScript packed schema.
 
 use async_trait::async_trait;
-use dsh_atomic_write::{write_file_atomic, AtomicWriteError, WriteFileAtomicOptions};
+use dsh_cordis::{Context, Result};
 use dsh_session::{
-    refuse_unknown, session_event_from_value, Session, SessionEvent, SessionEventData, SessionId,
-    TurnEndReason,
+    refuse_unknown, session_event_from_value, session_id, Session, SessionEvent, SessionEventData,
+    SessionId, TurnEndReason,
 };
-use dsh_session_persistence::{PersistenceError, SessionStoreBackend};
-use serde::{Deserialize, Serialize};
+use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
+use rusqlite::Connection;
 use serde_json::Value;
 use std::path::PathBuf;
-use tokio::fs;
+use std::sync::{Arc, Mutex};
 
-/// Physical record version stamped on every file this build writes.
+/// Physical record version stamped on every database this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
+/// Application id reserved for DeepSeek Harness SQLite session databases.
+pub const SESSION_PERSISTENCE_SQLITE_APPLICATION_ID: i32 = 0x4453_4850;
 
-#[derive(Serialize, Deserialize)]
-struct SqliteFile {
-    schema_version: u32,
-    events: Vec<Value>,
-}
-
-/// Directory-backed store. Each session is `{dir}/{id}.json`.
+/// SQLite-backed store. One database file holds every session.
 pub struct SqliteBackend {
-    dir: PathBuf,
+    path: PathBuf,
+    db: Mutex<Connection>,
 }
 
 impl SqliteBackend {
-    /// Persist under `dir`.
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+    /// Open or create `path` (`:memory:` is supported).
+    pub fn open(path: impl Into<PathBuf>) -> std::result::Result<Self, PersistenceError> {
+        let path = path.into();
+        if path != PathBuf::from(":memory:") {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let db = Connection::open(&path).map_err(sqlite_error)?;
+        configure(&db)?;
+        Ok(Self {
+            path,
+            db: Mutex::new(db),
+        })
     }
 
-    /// Artifact path for one session id.
-    pub fn path_for(&self, id: &SessionId) -> PathBuf {
-        self.dir.join(format!("{}.json", id.as_str()))
+    /// Artifact path for this store.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
-#[async_trait]
-impl SessionStoreBackend for SqliteBackend {
-    async fn save(&self, session: &Session) -> Result<(), PersistenceError> {
-        let events = session
-            .events()
-            .into_iter()
-            .map(|event| serde_json::to_value(event).map_err(|error| PersistenceError::Format(error.to_string())))
-            .collect::<Result<Vec<_>, _>>()?;
-        let body = serde_json::to_string_pretty(&SqliteFile {
-            schema_version: SCHEMA_VERSION,
-            events,
-        })
-        .map_err(|error| PersistenceError::Format(error.to_string()))?;
-        write_file_atomic(
-            self.path_for(session.id()),
-            body,
-            WriteFileAtomicOptions {
-                mode: 0o600,
-                dir_mode: Some(0o700),
-            },
-        )
-        .await
-        .map_err(atomic_error)
+fn configure(db: &Connection) -> std::result::Result<(), PersistenceError> {
+    let application_id: i32 = db
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(sqlite_error)?;
+    let version: i32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if application_id != 0 && application_id != SESSION_PERSISTENCE_SQLITE_APPLICATION_ID {
+        return Err(PersistenceError::Format(format!(
+            "session database belongs to another application ({application_id})"
+        )));
     }
+    if version as u32 > SCHEMA_VERSION {
+        return Err(PersistenceError::Format(format!(
+            "schema version {version} is newer than supported {SCHEMA_VERSION}"
+        )));
+    }
+    db.pragma_update(None, "application_id", SESSION_PERSISTENCE_SQLITE_APPLICATION_ID)
+        .map_err(sqlite_error)?;
+    db.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(sqlite_error)?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS events (
+            session_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY (session_id, seq),
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+         );",
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
 
-    async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
-        let body = fs::read_to_string(self.path_for(id)).await?;
-        let file: SqliteFile = serde_json::from_str(&body)
-            .map_err(|error| PersistenceError::Format(error.to_string()))?;
-        if file.schema_version > SCHEMA_VERSION {
-            return Err(PersistenceError::Format(format!(
-                "schema version {} is newer than supported {SCHEMA_VERSION}",
-                file.schema_version
-            )));
-        }
-        let mut events: Vec<SessionEvent> = Vec::new();
-        for value in file.events {
-            let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");
-            let ignorable = value
-                .get("ignorable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            refuse_unknown(type_name, ignorable)?;
-            events.push(session_event_from_value(value)?);
-        }
-        repair_open_turn(&mut events);
-        Ok(Session::replay(id.clone(), events)?)
-    }
+fn sqlite_error(error: rusqlite::Error) -> PersistenceError {
+    PersistenceError::Format(error.to_string())
 }
 
 fn repair_open_turn(events: &mut Vec<SessionEvent>) {
@@ -111,32 +115,129 @@ fn repair_open_turn(events: &mut Vec<SessionEvent>) {
     }
 }
 
-fn atomic_error(error: AtomicWriteError) -> PersistenceError {
-    match error {
-        AtomicWriteError::Io(io) => PersistenceError::Io(io),
-        AtomicWriteError::LockTimeout(path) => {
-            PersistenceError::Format(format!("atomic-write lock timeout at {path}"))
+#[async_trait]
+impl SessionStoreBackend for SqliteBackend {
+    async fn save(&self, session: &Session) -> std::result::Result<(), PersistenceError> {
+        let id = session.id().as_str().to_string();
+        let payloads = session
+            .events()
+            .into_iter()
+            .map(|event| {
+                serde_json::to_string(&event)
+                    .map_err(|error| PersistenceError::Format(error.to_string()))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let db = self.db.lock().expect("sqlite");
+        let tx = db.unchecked_transaction().map_err(sqlite_error)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sessions(id, created_at) VALUES (?1, strftime('%s','now'))",
+            [&id],
+        )
+        .map_err(sqlite_error)?;
+        tx.execute("DELETE FROM events WHERE session_id = ?1", [&id])
+            .map_err(sqlite_error)?;
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO events(session_id, seq, payload) VALUES (?1, ?2, ?3)")
+                .map_err(sqlite_error)?;
+            for (seq, payload) in payloads.iter().enumerate() {
+                insert
+                    .execute(rusqlite::params![id, seq as i64, payload])
+                    .map_err(sqlite_error)?;
+            }
         }
+        tx.commit().map_err(sqlite_error)?;
+        Ok(())
     }
+
+    async fn load(&self, id: &SessionId) -> std::result::Result<Session, PersistenceError> {
+        let key = id.as_str().to_string();
+        let rows = {
+            let db = self.db.lock().expect("sqlite");
+            let mut stmt = db
+                .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
+                .map_err(sqlite_error)?;
+            let mapped = stmt
+                .query_map([&key], |row| row.get::<_, String>(0))
+                .map_err(sqlite_error)?;
+            mapped
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)?
+        };
+        if rows.is_empty() {
+            let exists = {
+                let db = self.db.lock().expect("sqlite");
+                let mut stmt = db
+                    .prepare("SELECT 1 FROM sessions WHERE id = ?1")
+                    .map_err(sqlite_error)?;
+                stmt.exists([&key]).map_err(sqlite_error)?
+            };
+            if !exists {
+                return Err(PersistenceError::Format(format!(
+                    "session {} is not in the store",
+                    id.as_str()
+                )));
+            }
+        }
+        let mut events = Vec::new();
+        for payload in rows {
+            let value: Value =
+                serde_json::from_str(&payload).map_err(|error| PersistenceError::Format(error.to_string()))?;
+            let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");
+            let ignorable = value
+                .get("ignorable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            refuse_unknown(type_name, ignorable)?;
+            events.push(session_event_from_value(value)?);
+        }
+        repair_open_turn(&mut events);
+        Ok(Session::replay(id.clone(), events)?)
+    }
+
+    async fn list_ids(&self) -> std::result::Result<Vec<SessionId>, PersistenceError> {
+        let db = self.db.lock().expect("sqlite");
+        let mut stmt = db
+            .prepare("SELECT id FROM sessions ORDER BY id")
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_error)?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(session_id(id.map_err(sqlite_error)?));
+        }
+        Ok(ids)
+    }
+}
+
+/// Provide [`PersistenceRuntime`] over a SQLite file.
+pub fn install(ctx: &Context, path: impl Into<PathBuf>) -> Result<Arc<PersistenceRuntime>> {
+    let backend = Arc::new(
+        SqliteBackend::open(path).map_err(|error| dsh_cordis::CordisError::plugin(error.to_string()))?,
+    );
+    let runtime = Arc::new(PersistenceRuntime::new(backend));
+    ctx.provide(Arc::clone(&runtime))?;
+    Ok(runtime)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_session::{session_id, SessionEventData};
+    use dsh_session::session_id;
 
-    fn tmp_dir(name: &str) -> PathBuf {
+    fn tmp_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("dsh-sqlite-{name}-{nanos}"))
+        std::env::temp_dir().join(format!("dsh-sqlite-{name}-{nanos}.db"))
     }
 
     #[tokio::test]
-    async fn round_trip_and_refuse_newer_schema() {
-        let dir = tmp_dir("round");
-        let backend = SqliteBackend::new(&dir);
+    async fn round_trip_list_and_refuse_newer_schema() {
+        let path = tmp_path("round");
+        let backend = SqliteBackend::open(&path).unwrap();
         let session = Session::new(session_id("s"));
         session
             .append(SessionEventData::TurnStart { turn: 1 }, None)
@@ -153,20 +254,47 @@ mod tests {
         backend.save(&session).await.unwrap();
         let loaded = backend.load(&session_id("s")).await.unwrap();
         assert_eq!(loaded.events().len(), 2);
+        assert_eq!(
+            backend
+                .list_ids()
+                .await
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["s".to_string()]
+        );
 
-        let path = backend.path_for(&session_id("newer"));
-        fs::create_dir_all(&dir).await.unwrap();
-        fs::write(
-            &path,
-            r#"{"schema_version":99,"events":[]}"#,
-        )
-        .await
-        .unwrap();
-        let err = match backend.load(&session_id("newer")).await {
-            Ok(_) => panic!("newer schema must be refused"),
-            Err(error) => error,
-        };
+        let newer = tmp_path("newer");
+        {
+            let db = Connection::open(&newer).unwrap();
+            db.pragma_update(None, "application_id", SESSION_PERSISTENCE_SQLITE_APPLICATION_ID)
+                .unwrap();
+            db.pragma_update(None, "user_version", 99).unwrap();
+        }
+        let err = SqliteBackend::open(&newer).unwrap_err();
         assert!(matches!(err, PersistenceError::Format(message) if message.contains("newer")));
-        let _ = fs::remove_dir_all(&dir).await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&newer);
+    }
+
+    #[tokio::test]
+    async fn crash_repair_closes_open_turn() {
+        let path = tmp_path("repair");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let session = Session::new(session_id("s"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        backend.save(&session).await.unwrap();
+        let loaded = backend.load(&session_id("s")).await.unwrap();
+        assert!(matches!(
+            loaded.events().last().unwrap().data,
+            SessionEventData::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 }

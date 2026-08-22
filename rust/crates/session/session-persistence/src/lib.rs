@@ -27,6 +27,8 @@ pub trait SessionStoreBackend: Send + Sync {
     async fn save(&self, session: &Session) -> Result<(), PersistenceError>;
     /// Reconstruct a session from durable storage.
     async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError>;
+    /// Session ids currently stored by this backend.
+    async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError>;
 }
 
 /// `ctx.sessionPersistence`.
@@ -48,6 +50,11 @@ impl PersistenceRuntime {
     /// Reconstruct a session from durable storage.
     pub async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
         self.backend.load(id).await
+    }
+
+    /// Session ids currently stored by the backend.
+    pub async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
+        self.backend.list_ids().await
     }
 }
 
@@ -72,6 +79,10 @@ mod tests {
 
         async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
             Ok(Session::new(id.clone()))
+        }
+
+        async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
+            Ok(vec![session_id("s")])
         }
     }
 

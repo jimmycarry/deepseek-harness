@@ -214,18 +214,12 @@ impl ToolRuntime {
             Ok(ref value) if value.get("deny").and_then(Value::as_bool) == Some(true)
         );
         if denied {
-            let additional_contexts = post_execute(ctx, name, &args, agent_id);
-            return Ok(ToolExecutionResult {
-                outcome: ToolOutcome::error(ToolError::Denied(name.into()).to_string()),
-                additional_contexts,
-            });
+            let outcome = ToolOutcome::error(ToolError::Denied(name.into()).to_string());
+            return Ok(post_execute(ctx, name, &args, agent_id, outcome));
         }
         let Some(tool) = self.get(name) else {
-            let additional_contexts = post_execute(ctx, name, &args, agent_id);
-            return Ok(ToolExecutionResult {
-                outcome: ToolOutcome::error(ToolError::Unknown(name.into()).to_string()),
-                additional_contexts,
-            });
+            let outcome = ToolOutcome::error(ToolError::Unknown(name.into()).to_string());
+            return Ok(post_execute(ctx, name, &args, agent_id, outcome));
         };
         let call = ToolCall {
             name: name.to_string(),
@@ -233,11 +227,7 @@ impl ToolRuntime {
             agent_id: agent_id.map(str::to_string),
         };
         let outcome = tool.execute_call(&call).await?;
-        let additional_contexts = post_execute(ctx, name, &args, agent_id);
-        Ok(ToolExecutionResult {
-            outcome,
-            additional_contexts,
-        })
+        Ok(post_execute(ctx, name, &args, agent_id, outcome))
     }
 
     /// Run many calls: pre-execute stays model-ordered, bodies overlap up to
@@ -355,11 +345,7 @@ impl ToolRuntime {
                 | Prepared::Denied { name, args }
                 | Prepared::Unknown { name, args } => (name.as_str(), args),
             };
-            let additional_contexts = post_execute(ctx, name, args, agent_id);
-            results.push(outcome.map(|outcome| ToolExecutionResult {
-                outcome,
-                additional_contexts,
-            }));
+            results.push(outcome.map(|outcome| post_execute(ctx, name, args, agent_id, outcome)));
         }
         results
     }
@@ -370,18 +356,41 @@ fn post_execute(
     name: &str,
     args: &Value,
     agent_id: Option<&str>,
-) -> Vec<UserMessage> {
+    outcome: ToolOutcome,
+) -> ToolExecutionResult {
     let payload = serde_json::json!({
         "name": name,
         "args": args,
         "agentId": agent_id,
+        "isError": outcome.is_error,
+        "content": outcome.content,
         "additionalContexts": []
     });
-    ctx.waterfall("tools/post-execute", payload, |payload| payload)
-        .ok()
-        .and_then(|value| value.get("additionalContexts").cloned())
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
+    match ctx.waterfall("tools/post-execute", payload, |payload| payload) {
+        Ok(value) => {
+            let additional_contexts = value
+                .get("additionalContexts")
+                .cloned()
+                .and_then(|item| serde_json::from_value(item).ok())
+                .unwrap_or_default();
+            let content = value
+                .get("content")
+                .cloned()
+                .and_then(|item| serde_json::from_value(item).ok())
+                .unwrap_or(outcome.content);
+            ToolExecutionResult {
+                outcome: ToolOutcome {
+                    content,
+                    is_error: outcome.is_error,
+                },
+                additional_contexts,
+            }
+        }
+        Err(_) => ToolExecutionResult {
+            outcome,
+            additional_contexts: Vec::new(),
+        },
+    }
 }
 
 fn outcome_text(outcome: &ToolOutcome) -> String {
@@ -536,6 +545,32 @@ mod tests {
         );
         assert_eq!(posts.lock().expect("posts").as_slice(), ["slow", "fast"]);
         assert_eq!(starts.lock().expect("starts").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_execute_can_replace_content() {
+        let ctx = Context::new();
+        let tools = Arc::new(ToolRuntime::new());
+        tools.insert(Arc::new(ScriptTool::new("echo", "echo", |_| {
+            ToolOutcome::text("huge")
+        })));
+        ctx.provide(Arc::clone(&tools)).unwrap();
+        ctx.on_waterfall("tools/post-execute", |mut payload, next| {
+            let mut downstream = next.call(payload);
+            if let Value::Object(map) = &mut downstream {
+                map.insert(
+                    "content".into(),
+                    serde_json::json!([{ "type": "text", "text": "preview" }]),
+                );
+            }
+            downstream
+        })
+        .unwrap();
+        let result = tools
+            .execute_for(&ctx, "echo", serde_json::json!({}), Some("sess"))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome.content[0], ContentBlock::text("preview"));
     }
 
     #[tokio::test]

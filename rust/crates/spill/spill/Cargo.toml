@@ -1,11 +1,11 @@
 [package]
-name = "dsh-session-query"
+name = "dsh-spill"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "In-log session search."
+description = "Spill storage seam (ctx.spillStore)."
 
 [dependencies]
-dsh-session.workspace = true
-serde_json.workspace = true
+dsh-cordis.workspace = true
+thiserror.workspace = true

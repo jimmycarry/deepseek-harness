@@ -110,6 +110,13 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
             ctx,
             dsh_repeat_tool_reminder::Config::resolve(None).expect("reminder defaults"),
         )?;
+        dsh_spill_local::install(ctx, dsh_spill_local::Config { root: None })?;
+        dsh_spill_policy::install(
+            ctx,
+            dsh_spill_policy::Config {
+                max_inline_bytes: Some(50_000),
+            },
+        )?;
     }
     Ok(())
 }
@@ -176,5 +183,6 @@ mod tests {
         assert!(ctx.has_service("fs"));
         assert!(ctx.has_service("shell"));
         assert!(ctx.has_service("subprocess"));
+        assert!(ctx.has_service("spillStore"));
     }
 }

@@ -41,6 +41,26 @@ impl SessionStoreBackend for JsonlBackend {
         read_jsonl(self.path_for(id), &session).await?;
         Ok(session)
     }
+
+    async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
+        let mut ids = Vec::new();
+        let mut entries = match fs::read_dir(&self.dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                ids.push(dsh_session::session_id(stem));
+            }
+        }
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(ids)
+    }
 }
 
 /// Provide [`PersistenceRuntime`] over a JSONL directory.
