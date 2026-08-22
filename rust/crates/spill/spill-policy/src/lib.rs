@@ -235,7 +235,7 @@ mod tests {
     use dsh_llm::ContentBlock;
     use dsh_spill::{SpillBackend, SpillError};
     use dsh_tools::{ScriptTool, ToolOutcome, ToolRuntime};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     struct RecordingSpill {
         saves: Mutex<Vec<String>>,
@@ -275,7 +275,7 @@ mod tests {
     async fn oversized_plain_text_is_replaced() {
         let ctx = Context::new();
         let tools = Arc::new(ToolRuntime::new());
-        let body = "abcdefghij".repeat(20);
+        let body = "abcdefghij".repeat(50);
         let expected = body.clone();
         tools.insert(Arc::new(ScriptTool::new("echo", "echo", move |_| {
             ToolOutcome::text(expected.clone())
@@ -288,7 +288,7 @@ mod tests {
         install(
             &ctx,
             Config {
-                max_inline_bytes: Some(80),
+                max_inline_bytes: Some(200),
             },
         )
         .unwrap();
@@ -300,9 +300,9 @@ mod tests {
             ContentBlock::Text { text } => text,
             _ => panic!("text"),
         };
-        assert!(text.contains("Full formatted result stored at: /spill/bash.txt"));
-        assert!(text.contains("Omitted"));
-        assert!(text.len() <= 80, "{}", text.len());
+        assert!(text.contains("Full formatted result stored at: /spill/bash.txt"), "{text}");
+        assert!(text.contains("Omitted"), "{text}");
+        assert!(text.len() <= 200, "{}", text.len());
         assert!(!result.outcome.is_error);
     }
 

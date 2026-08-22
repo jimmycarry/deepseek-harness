@@ -698,7 +698,7 @@ async fn spill_policy_turn_snapshot() {
     let locator = text
         .split("stored at: ")
         .nth(1)
-        .and_then(|rest| rest.split('.').next())
+        .and_then(|rest| rest.split(". Use read").next())
         .expect("locator");
     let spilled = std::fs::read_to_string(locator.trim()).expect("host reread");
     assert!(spilled.len() >= 50_000, "{}", spilled.len());

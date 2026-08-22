@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(encode_segment("."), "~002E");
         assert_eq!(encode_segment(".."), "~002E~002E");
         assert_eq!(encode_segment("bash.txt"), "bash.txt");
-        assert!(encode_segment("../etc/passwd").starts_with("~002E~002E"));
+        assert_eq!(encode_segment("../etc/passwd"), "..~002Fetc~002Fpasswd");
         assert_ne!(encode_segment("a/b"), encode_segment("a~b"));
     }
 

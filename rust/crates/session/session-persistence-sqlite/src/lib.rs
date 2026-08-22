@@ -272,7 +272,10 @@ mod tests {
                 .unwrap();
             db.pragma_update(None, "user_version", 99).unwrap();
         }
-        let err = SqliteBackend::open(&newer).unwrap_err();
+        let err = match SqliteBackend::open(&newer) {
+            Ok(_) => panic!("newer schema must be refused"),
+            Err(error) => error,
+        };
         assert!(matches!(err, PersistenceError::Format(message) if message.contains("newer")));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&newer);
