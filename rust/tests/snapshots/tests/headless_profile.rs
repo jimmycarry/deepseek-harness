@@ -39,10 +39,8 @@ async fn run_profile(task: &str, overlay: Vec<EntryPatch>) -> Vec<Value> {
     let layers = shipped_bundles("headless").unwrap();
     let entries = compose_profile(&layers, &[], &[], &overlay).unwrap();
     let ctx = Context::new();
-    ctx.provide(Arc::new(HeadlessStartup {
-        task: task.into(),
-    }))
-    .unwrap();
+    ctx.provide(Arc::new(HeadlessStartup { task: task.into() }))
+        .unwrap();
     let loader = Loader::new();
     register_profile_plugins(&loader);
     loader.mount(&ctx, &entries).unwrap();
@@ -68,7 +66,12 @@ fn events_of(session: &Session) -> Vec<Value> {
 fn types_of(events: &[Value]) -> Vec<String> {
     events
         .iter()
-        .filter_map(|event| event.get("type").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|event| {
+            event
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -201,6 +204,79 @@ async fn bash_turn_profile_types_and_payloads() {
         .as_str()
         .unwrap_or("");
     assert_eq!(text.trim(), "hello");
+}
+
+#[tokio::test]
+async fn glob_turn_profile_rereads_workspace() {
+    let workspace = std::env::temp_dir().join(format!(
+        "dsh-wave-e-glob-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("found.txt"), "x").unwrap();
+    let path = workspace.to_string_lossy();
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "glob",
+                "arguments": format!("{{\"pattern\":\"*.txt\",\"path\":\"{path}\"}}")
+            }
+        },
+        { "text": "listed" }
+    ]);
+    let events = run_profile("find txt", replay_turns_overlay(turns)).await;
+    assert_eq!(
+        types_of(&events),
+        BASH_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(text.contains("found.txt"), "glob result: {text}");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn str_replace_editor_turn_profile_rereads_file() {
+    let workspace = std::env::temp_dir().join(format!(
+        "dsh-wave-e-editor-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let path = workspace.join("note.txt");
+    let path_str = path.to_string_lossy();
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "str_replace_editor",
+                "arguments": format!("{{\"command\":\"create\",\"path\":\"{path_str}\",\"file_text\":\"from-editor\"}}")
+            }
+        },
+        { "text": "created" }
+    ]);
+    let events = run_profile("create the note", replay_turns_overlay(turns)).await;
+    assert_eq!(
+        types_of(&events),
+        BASH_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-editor");
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[test]

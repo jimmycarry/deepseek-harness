@@ -49,6 +49,12 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
             tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs))));
             tools.insert(Arc::new(WriteFileTool::new(fs)));
         }
+        dsh_tool_fs_search::install(ctx, dsh_tool_fs_search::Config::with_sample_over_cap(false))?;
+        dsh_tool_str_replace_editor::install(
+            ctx,
+            dsh_tool_str_replace_editor::Config::resolve(None)
+                .expect("str-replace-editor TypeScript defaults"),
+        )?;
     }
     Ok(())
 }
@@ -71,13 +77,14 @@ mod tests {
         let ctx = Context::new();
         apply_replay(&ctx, "pong").unwrap();
         let session = ctx.service::<SessionStore>().unwrap().create_fresh();
-        let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
-        run_followup(
-            handle.agent.as_ref(),
-            UserMessage::text("ping"),
-        )
-        .await
-        .unwrap();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        run_followup(handle.agent.as_ref(), UserMessage::text("ping"))
+            .await
+            .unwrap();
         assert_eq!(
             handle.agent.session().last_assistant_text().as_deref(),
             Some("pong")
@@ -92,10 +99,17 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         apply_world(&ctx, root.to_string_lossy().into_owned()).unwrap();
         let tools = ctx.service::<ToolRuntime>().unwrap();
-        let names: Vec<_> = tools.schemas().into_iter().map(|schema| schema.name).collect();
+        let names: Vec<_> = tools
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
         assert!(names.contains(&"bash".into()));
         assert!(names.contains(&"read_file".into()));
         assert!(names.contains(&"write_file".into()));
+        assert!(names.contains(&"glob".into()));
+        assert!(names.contains(&"grep".into()));
+        assert!(names.contains(&"str_replace_editor".into()));
         assert!(ctx.has_service("sandbox"));
         assert!(ctx.has_service("fs"));
         assert!(ctx.has_service("shell"));

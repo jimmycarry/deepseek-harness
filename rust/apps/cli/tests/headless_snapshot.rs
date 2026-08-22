@@ -67,13 +67,14 @@ async fn text_turn_snapshot() {
     let ctx = Context::new();
     apply_replay(&ctx, "pong").unwrap();
     let session = ctx.service::<SessionStore>().unwrap().create_fresh();
-    let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
-    run_followup(
-        handle.agent.as_ref(),
-        UserMessage::text("ping"),
-    )
-    .await
-    .unwrap();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("ping"))
+        .await
+        .unwrap();
     assert_eq!(
         event_types(handle.agent.session().as_ref()),
         TEXT_TURN_TYPES
@@ -114,13 +115,14 @@ async fn bash_turn_snapshot() {
     .unwrap();
     apply_world(&ctx, root.to_string_lossy().into_owned()).unwrap();
     let session = ctx.service::<SessionStore>().unwrap().create_fresh();
-    let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
-    run_followup(
-        handle.agent.as_ref(),
-        UserMessage::text("run echo"),
-    )
-    .await
-    .unwrap();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("run echo"))
+        .await
+        .unwrap();
     assert_eq!(
         event_types(handle.agent.session().as_ref()),
         TOOL_TURN_TYPES
@@ -181,13 +183,14 @@ async fn fs_edit_turn_snapshot() {
     .unwrap();
     apply_world(&ctx, root.to_string_lossy().into_owned()).unwrap();
     let session = ctx.service::<SessionStore>().unwrap().create_fresh();
-    let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
-    run_followup(
-        handle.agent.as_ref(),
-        UserMessage::text("write the note"),
-    )
-    .await
-    .unwrap();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("write the note"))
+        .await
+        .unwrap();
     assert_eq!(
         event_types(handle.agent.session().as_ref()),
         TOOL_TURN_TYPES
@@ -200,6 +203,122 @@ async fn fs_edit_turn_snapshot() {
         handle.agent.session().last_assistant_text().as_deref(),
         Some("wrote")
     );
+}
+
+#[tokio::test]
+async fn glob_turn_snapshot() {
+    let root = std::env::temp_dir().join(format!("dsh-glob-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("found.txt"), "x").unwrap();
+    let path = root.to_string_lossy().replace('\\', "\\\\");
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "glob".into(),
+                    arguments: format!(r#"{{"pattern":"*.txt","path":"{path}"}}"#),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "listed".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, root.to_string_lossy().into_owned()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("find txt"))
+        .await
+        .unwrap();
+    assert_eq!(
+        event_types(handle.agent.session().as_ref()),
+        TOOL_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+    let result = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("tool result");
+    let text = match &result.content[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("expected text"),
+    };
+    assert!(text.contains("found.txt"), "glob result: {text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn str_replace_editor_turn_snapshot() {
+    let root = std::env::temp_dir().join(format!("dsh-editor-snap-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("note.txt");
+    let path_str = path.to_string_lossy().replace('\\', "\\\\");
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "str_replace_editor".into(),
+                    arguments: format!(
+                        r#"{{"command":"create","path":"{path_str}","file_text":"from-editor"}}"#
+                    ),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "created".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, root.to_string_lossy().into_owned()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("create the note"))
+        .await
+        .unwrap();
+    assert_eq!(
+        event_types(handle.agent.session().as_ref()),
+        TOOL_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-editor");
+    assert_eq!(
+        handle.agent.session().last_assistant_text().as_deref(),
+        Some("created")
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]

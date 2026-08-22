@@ -36,6 +36,9 @@ pub enum ShellError {
     /// Backend failure.
     #[error("{0}")]
     Failed(String),
+    /// A confined mode was requested and no sandbox backend is usable.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 /// Provider interface.

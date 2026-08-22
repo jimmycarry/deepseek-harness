@@ -24,5 +24,7 @@ dsh-subprocess-local.workspace = true
 dsh-system-prompt.workspace = true
 dsh-tool-bash.workspace = true
 dsh-tool-fs.workspace = true
+dsh-tool-fs-search.workspace = true
+dsh-tool-str-replace-editor.workspace = true
 dsh-tools.workspace = true
 tokio.workspace = true

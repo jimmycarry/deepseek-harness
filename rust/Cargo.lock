@@ -148,6 +148,8 @@ dependencies = [
  "dsh-system-prompt",
  "dsh-tool-bash",
  "dsh-tool-fs",
+ "dsh-tool-fs-search",
+ "dsh-tool-str-replace-editor",
  "dsh-tools",
  "tokio",
 ]
@@ -170,6 +172,7 @@ dependencies = [
  "dsh-agent",
  "dsh-agent-loop",
  "dsh-bash-local",
+ "dsh-bash-sandbox",
  "dsh-bundle-base",
  "dsh-bundle-headless",
  "dsh-commands",
@@ -192,6 +195,8 @@ dependencies = [
  "dsh-system-prompt",
  "dsh-tool-bash",
  "dsh-tool-fs",
+ "dsh-tool-fs-search",
+ "dsh-tool-str-replace-editor",
  "dsh-tools",
  "futures",
  "serde",
@@ -225,6 +230,21 @@ dependencies = [
  "dsh-cordis",
  "dsh-shell",
  "dsh-subprocess",
+]
+
+[[package]]
+name = "dsh-bash-sandbox"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-bash-local",
+ "dsh-cordis",
+ "dsh-sandbox",
+ "dsh-sandbox-local",
+ "dsh-shell",
+ "dsh-subprocess",
+ "dsh-subprocess-local",
+ "tokio",
 ]
 
 [[package]]
@@ -485,6 +505,7 @@ name = "dsh-sandbox"
 version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
+ "thiserror",
 ]
 
 [[package]]
@@ -752,6 +773,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-tool-fs-search"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-llm",
+ "dsh-subprocess",
+ "dsh-subprocess-local",
+ "dsh-system-prompt",
+ "dsh-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dsh-tool-goal"
 version = "0.1.1-rc.2"
 dependencies = [
@@ -806,6 +842,21 @@ dependencies = [
  "async-trait",
  "dsh-cordis",
  "dsh-skill",
+ "dsh-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-tool-str-replace-editor"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-fs",
+ "dsh-fs-local",
+ "dsh-llm",
+ "dsh-sandbox-local",
  "dsh-tools",
  "serde_json",
  "tokio",

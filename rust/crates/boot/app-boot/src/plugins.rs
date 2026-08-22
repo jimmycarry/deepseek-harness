@@ -47,12 +47,14 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-subprocess-local" => apply_subprocess(ctx),
         "@deepseek-ai/dsh-sandbox-local" => apply_sandbox(ctx, config),
         "@deepseek-ai/dsh-sandbox-policy" => apply_sandbox_policy(ctx, config),
-        "@deepseek-ai/dsh-bash-sandbox" => Ok(()),
+        "@deepseek-ai/dsh-bash-sandbox" => apply_bash_sandbox(ctx),
         "@deepseek-ai/dsh-user-approval" => apply_approval(ctx, config),
         "@deepseek-ai/dsh-permission-presets" => apply_permission(ctx, config),
         "@deepseek-ai/dsh-shell-env" => apply_shell(ctx),
         "@deepseek-ai/dsh-tool-bash" => apply_tool_bash(ctx),
         "@deepseek-ai/dsh-tool-fs" => apply_tool_fs(ctx),
+        "@deepseek-ai/dsh-tool-fs-search" => apply_tool_fs_search(ctx, config),
+        "@deepseek-ai/dsh-tool-str-replace-editor" => apply_tool_str_replace_editor(ctx, config),
         "@deepseek-ai/dsh-tools" => {
             ensure_tools(ctx)?;
             Ok(())
@@ -126,7 +128,10 @@ struct UnsetAdapter;
 
 #[async_trait::async_trait]
 impl LlmAdapter for UnsetAdapter {
-    async fn stream(&self, _request: LlmRequest) -> std::result::Result<BoxStream<'static, StreamChunk>, LlmError> {
+    async fn stream(
+        &self,
+        _request: LlmRequest,
+    ) -> std::result::Result<BoxStream<'static, StreamChunk>, LlmError> {
         Err(LlmError::Failure(dsh_llm::LlmFailure {
             message: "no LLM adapter is mounted".into(),
             code: "MISSING_ADAPTER".into(),
@@ -282,6 +287,35 @@ fn apply_permission(ctx: &Context, _config: Option<Value>) -> Result<()> {
     ctx.provide(Arc::new(PermissionService { preset }))
 }
 
+fn apply_bash_sandbox(ctx: &Context) -> Result<()> {
+    apply_subprocess(ctx)?;
+    if !ctx.has_service(SandboxRuntime::KEY) {
+        apply_sandbox(ctx, None)?;
+    }
+    if ctx.has_service(ShellRuntime::KEY) {
+        return Ok(());
+    }
+    let (mode, workspace_root) = ctx
+        .get::<SandboxPolicyService>()
+        .map(|policy| (policy.mode.clone(), policy.workspace_root.clone()))
+        .unwrap_or_else(|| {
+            (
+                "workspace-write".into(),
+                std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| ".".into()),
+            )
+        });
+    dsh_bash_sandbox::install(
+        ctx,
+        dsh_bash_sandbox::Config {
+            mode,
+            workspace_root,
+        },
+    )?;
+    Ok(())
+}
+
 fn apply_shell(ctx: &Context) -> Result<()> {
     if ctx.has_service(ShellRuntime::KEY) {
         return Ok(());
@@ -321,8 +355,38 @@ fn apply_tool_fs(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+fn apply_tool_fs_search(ctx: &Context, config: Option<Value>) -> Result<()> {
+    apply_subprocess(ctx)?;
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    let resolved =
+        dsh_tool_fs_search::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_fs_search::install(ctx, resolved)?;
+    Ok(())
+}
+
+fn apply_tool_str_replace_editor(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if !ctx.has_service(FsRuntime::KEY) {
+        dsh_fs_local::install(ctx)?;
+    }
+    ensure_tools(ctx)?;
+    let resolved = dsh_tool_str_replace_editor::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
+    dsh_tool_str_replace_editor::install(ctx, resolved)?;
+    Ok(())
+}
+
+fn ensure_system_prompt(ctx: &Context) -> Result<Arc<SystemPrompt>> {
+    if let Some(prompt) = ctx.get::<SystemPrompt>() {
+        return Ok(prompt);
+    }
+    let prompt = Arc::new(SystemPrompt::new());
+    ctx.provide(Arc::clone(&prompt))?;
+    Ok(prompt)
+}
+
 fn apply_system_prompt(ctx: &Context, config: Option<Value>) -> Result<()> {
-    let prompt = SystemPrompt::new();
+    let prompt = ensure_system_prompt(ctx)?;
     if let Some(persona) = config
         .as_ref()
         .and_then(|value| value.get("persona"))
@@ -344,7 +408,7 @@ fn apply_system_prompt(ctx: &Context, config: Option<Value>) -> Result<()> {
             order: 20,
         });
     }
-    ctx.provide(Arc::new(prompt))
+    Ok(())
 }
 
 fn apply_llm_deepseek(ctx: &Context) -> Result<()> {
@@ -361,12 +425,16 @@ fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
         .cloned()
         .and_then(|value| serde_json::from_value::<Vec<dsh_llm_replay::ReplayTurn>>(value).ok())
     {
-        return ctx.provide(Arc::new(LlmRuntime::new(Arc::new(ReplayAdapter::new(turns)))));
+        return ctx.provide(Arc::new(LlmRuntime::new(Arc::new(ReplayAdapter::new(
+            turns,
+        )))));
     }
     let text = config
         .as_ref()
         .and_then(|value| value.get("text"))
         .and_then(Value::as_str)
         .unwrap_or("pong");
-    ctx.provide(Arc::new(LlmRuntime::new(Arc::new(ReplayAdapter::text(text)))))
+    ctx.provide(Arc::new(LlmRuntime::new(Arc::new(ReplayAdapter::text(
+        text,
+    )))))
 }

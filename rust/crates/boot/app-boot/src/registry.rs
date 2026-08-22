@@ -47,7 +47,8 @@ mod tests {
     fn headless_tree_mounts() {
         let loader = Loader::new();
         register_profile_plugins(&loader);
-        let entries = compose_profile(&shipped_bundles("headless").unwrap(), &[], &[], &[]).unwrap();
+        let entries =
+            compose_profile(&shipped_bundles("headless").unwrap(), &[], &[], &[]).unwrap();
         let ctx = Context::new();
         ctx.provide(std::sync::Arc::new(dsh_bundle_headless::HeadlessStartup {
             task: "ping".into(),
@@ -60,6 +61,17 @@ mod tests {
         assert!(ctx.has_service("agentDefaultModel"));
         assert!(ctx.has_service("llm"));
         assert!(!ctx.has_service("hmr"));
+        assert!(ctx.has_service("shell"));
+        let tools = ctx.service::<dsh_tools::ToolRuntime>().unwrap();
+        let names: Vec<_> = tools
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        assert!(names.contains(&"glob".into()));
+        assert!(names.contains(&"grep".into()));
+        assert!(names.contains(&"str_replace_editor".into()));
+        assert!(names.contains(&"bash".into()));
     }
 
     #[test]

@@ -8,3 +8,4 @@ description = "Process-confinement seam (ctx.sandbox)."
 
 [dependencies]
 dsh-cordis.workspace = true
+thiserror.workspace = true

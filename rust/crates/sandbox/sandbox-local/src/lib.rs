@@ -1,9 +1,13 @@
-//! Local cwd-rooted sandbox backend.
+//! Local cwd-rooted sandbox backend, plus Linux process wrapping (bwrap, then landlock-run).
 
 use dsh_cordis::Context;
-use dsh_sandbox::{SandboxPolicy, SandboxRuntime};
+use dsh_sandbox::{
+    ConfinedArgv, ProcessConfiner, SandboxEnforcement, SandboxError, SandboxExecutionPolicy,
+    SandboxMode, SandboxPolicy, SandboxRuntime,
+};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 /// Plugin role name.
 pub fn name() -> &'static str {
@@ -78,9 +82,145 @@ impl SandboxPolicy for CwdSandbox {
     }
 }
 
-/// Provide `ctx.sandbox` as a cwd-rooted [`CwdSandbox`].
+/// bwrap profile arguments for one file-effect policy (before `--` and the command).
+pub fn bwrap_profile_args(policy: &SandboxExecutionPolicy) -> Vec<String> {
+    let mut args = vec![
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--unshare-pid".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--die-with-parent".into(),
+    ];
+    if policy.mode == SandboxMode::WorkspaceWrite {
+        args.extend([
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--bind".into(),
+            policy.workspace_root.clone(),
+            policy.workspace_root.clone(),
+        ]);
+    }
+    args
+}
+
+/// landlock-run grant arguments for one file-effect policy (before `--` and the command).
+pub fn landlock_grant_args(policy: &SandboxExecutionPolicy) -> Vec<String> {
+    let mut args = vec!["--ro".into(), "/".into(), "--rw".into(), "/dev/null".into()];
+    if policy.mode == SandboxMode::WorkspaceWrite {
+        args.extend([
+            "--rw".into(),
+            "/tmp".into(),
+            "--rw".into(),
+            policy.workspace_root.clone(),
+        ]);
+    }
+    args
+}
+
+/// Selected Linux runner. Probed once per process.
+#[derive(Clone)]
+enum LinuxRunner {
+    Bwrap,
+    Landlock { path: PathBuf },
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn probe_bwrap() -> bool {
+    let profile = bwrap_profile_args(&SandboxExecutionPolicy {
+        mode: SandboxMode::ReadOnly,
+        workspace_root: "/".into(),
+    });
+    Command::new("bwrap")
+        .args(&profile)
+        .arg("--")
+        .arg("true")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn probe_landlock(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--probe")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn select_linux_runner() -> Option<LinuxRunner> {
+    static SELECTED: OnceLock<Option<LinuxRunner>> = OnceLock::new();
+    SELECTED
+        .get_or_init(|| {
+            if find_on_path("bwrap").is_some() && probe_bwrap() {
+                return Some(LinuxRunner::Bwrap);
+            }
+            let path = find_on_path("landlock-run")?;
+            if probe_landlock(&path) {
+                Some(LinuxRunner::Landlock { path })
+            } else {
+                None
+            }
+        })
+        .clone()
+}
+
+/// Linux process confiner: bwrap, then landlock-run, else fail closed.
+pub struct LocalConfiner;
+
+impl ProcessConfiner for LocalConfiner {
+    fn confine(
+        &self,
+        argv: &[String],
+        policy: &SandboxExecutionPolicy,
+    ) -> Result<ConfinedArgv, SandboxError> {
+        if matches!(policy.mode, SandboxMode::DangerFullAccess) {
+            return Ok(ConfinedArgv {
+                argv: argv.to_vec(),
+                enforcement: SandboxEnforcement::Full,
+            });
+        }
+        match select_linux_runner() {
+            Some(LinuxRunner::Bwrap) => {
+                let mut wrapped = vec!["bwrap".into()];
+                wrapped.extend(bwrap_profile_args(policy));
+                wrapped.push("--".into());
+                wrapped.extend(argv.iter().cloned());
+                Ok(ConfinedArgv {
+                    argv: wrapped,
+                    enforcement: SandboxEnforcement::Full,
+                })
+            }
+            Some(LinuxRunner::Landlock { path }) => {
+                let mut wrapped = vec![path.display().to_string()];
+                wrapped.extend(landlock_grant_args(policy));
+                wrapped.push("--".into());
+                wrapped.extend(argv.iter().cloned());
+                Ok(ConfinedArgv {
+                    argv: wrapped,
+                    enforcement: SandboxEnforcement::Partial,
+                })
+            }
+            None => Err(SandboxError::unavailable(policy.mode.as_str(), None)),
+        }
+    }
+}
+
+/// Provide `ctx.sandbox` as a cwd-rooted [`CwdSandbox`] plus a Linux process confiner.
 pub fn install(ctx: &Context, root: impl Into<String>) -> dsh_cordis::Result<Arc<SandboxRuntime>> {
-    let runtime = Arc::new(SandboxRuntime::new(Arc::new(CwdSandbox::new(root))));
+    let runtime = Arc::new(
+        SandboxRuntime::new(Arc::new(CwdSandbox::new(root))).with_confiner(Arc::new(LocalConfiner)),
+    );
     ctx.provide(Arc::clone(&runtime))?;
     Ok(runtime)
 }
@@ -134,5 +274,70 @@ mod tests {
     #[test]
     fn seam_is_present() {
         assert_eq!(name(), "dsh-sandbox-local");
+    }
+
+    #[test]
+    fn bwrap_profile_read_only_has_no_bind() {
+        let args = bwrap_profile_args(&SandboxExecutionPolicy {
+            mode: SandboxMode::ReadOnly,
+            workspace_root: "/tmp/ws".into(),
+        });
+        assert!(!args.iter().any(|part| part == "--bind"));
+        assert!(args.windows(2).any(|pair| pair == ["--ro-bind", "/"]));
+    }
+
+    #[test]
+    fn bwrap_profile_workspace_write_binds_root() {
+        let args = bwrap_profile_args(&SandboxExecutionPolicy {
+            mode: SandboxMode::WorkspaceWrite,
+            workspace_root: "/tmp/ws".into(),
+        });
+        assert!(args
+            .windows(3)
+            .any(|pair| pair == ["--bind", "/tmp/ws", "/tmp/ws"]));
+        assert!(args.windows(2).any(|pair| pair == ["--tmpfs", "/tmp"]));
+    }
+
+    #[test]
+    fn landlock_grants_workspace_write() {
+        let args = landlock_grant_args(&SandboxExecutionPolicy {
+            mode: SandboxMode::WorkspaceWrite,
+            workspace_root: "/tmp/ws".into(),
+        });
+        assert_eq!(
+            args,
+            [
+                "--ro",
+                "/",
+                "--rw",
+                "/dev/null",
+                "--rw",
+                "/tmp",
+                "--rw",
+                "/tmp/ws"
+            ]
+        );
+    }
+
+    #[test]
+    fn confine_without_runner_fails_closed() {
+        if select_linux_runner().is_some() {
+            return;
+        }
+        let err = LocalConfiner
+            .confine(
+                &["true".into()],
+                &SandboxExecutionPolicy {
+                    mode: SandboxMode::ReadOnly,
+                    workspace_root: "/tmp".into(),
+                },
+            )
+            .unwrap_err();
+        match err {
+            SandboxError::Unavailable { mode, message } => {
+                assert_eq!(mode, "read-only");
+                assert!(message.contains("refusing to run the command unconfined"));
+            }
+        }
     }
 }

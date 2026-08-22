@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use dsh_cordis::Context;
-use dsh_fs::{FsError, FsProvider, FsRuntime};
+use dsh_fs::{DirEntry, FsError, FsInfo, FsKind, FsProvider, FsRuntime};
 use dsh_sandbox::{SandboxPolicy, SandboxRuntime};
 use std::sync::Arc;
 use tokio::fs;
@@ -61,6 +61,57 @@ impl FsProvider for LocalFs {
             .await
             .map_err(|error| FsError::Io(error.to_string()))
     }
+
+    async fn exists(&self, path: &str) -> Result<bool, FsError> {
+        Ok(self.stat(path).await?.is_some())
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<FsInfo>, FsError> {
+        self.deny_if_needed(path)?;
+        match fs::metadata(path).await {
+            Ok(meta) => Ok(Some(FsInfo {
+                kind: if meta.is_dir() {
+                    FsKind::Directory
+                } else if meta.is_file() {
+                    FsKind::File
+                } else {
+                    FsKind::Other
+                },
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(FsError::Io(error.to_string())),
+        }
+    }
+
+    async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
+        self.deny_if_needed(path)?;
+        let mut entries = fs::read_dir(path)
+            .await
+            .map_err(|error| FsError::Io(error.to_string()))?;
+        let mut out = Vec::new();
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => return Err(FsError::Io(error.to_string())),
+            };
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|error| FsError::Io(error.to_string()))?;
+            out.push(DirEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                kind: if file_type.is_dir() {
+                    FsKind::Directory
+                } else if file_type.is_file() {
+                    FsKind::File
+                } else {
+                    FsKind::Other
+                },
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// Provide `ctx.fs`, wrapping the optional `ctx.sandbox` policy when present.
@@ -98,6 +149,47 @@ mod tests {
         assert!(matches!(err, FsError::Denied(path) if path == "/etc/passwd"));
         let err = fs.write_text("/etc/passwd", "nope").await.unwrap_err();
         assert!(matches!(err, FsError::Denied(path) if path == "/etc/passwd"));
+        let err = fs.stat("/etc/passwd").await.unwrap_err();
+        assert!(matches!(err, FsError::Denied(_)));
+        let err = fs.list_dir("/etc").await.unwrap_err();
+        assert!(matches!(err, FsError::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn stat_and_list_round_trip() {
+        let root = std::env::temp_dir().join(format!("dsh-fs-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let fs = LocalFs::new();
+        let path = root.to_str().unwrap();
+        assert!(fs.exists(path).await.unwrap());
+        assert_eq!(
+            fs.stat(path).await.unwrap().map(|info| info.kind),
+            Some(FsKind::Directory)
+        );
+        assert_eq!(
+            fs.stat(root.join("a.txt").to_str().unwrap())
+                .await
+                .unwrap()
+                .map(|info| info.kind),
+            Some(FsKind::File)
+        );
+        assert!(fs
+            .stat(root.join("missing").to_str().unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        let mut names: Vec<_> = fs
+            .list_dir(path)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.txt", "sub"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

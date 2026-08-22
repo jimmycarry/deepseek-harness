@@ -23,10 +23,13 @@ members = [
   "crates/sandbox/sandbox-local",
   "crates/shell/shell",
   "crates/shell/bash-local",
+  "crates/shell/bash-sandbox",
   "crates/shell/tool-bash",
   "crates/fs/fs",
   "crates/fs/fs-local",
   "crates/fs/tool-fs",
+  "crates/fs/tool-fs-search",
+  "crates/fs/tool-str-replace-editor",
   "crates/terminal/terminal",
   "crates/terminal/terminal-local",
   "crates/terminal/tool-terminal",
@@ -123,10 +126,13 @@ dsh-sandbox = { path = "crates/sandbox/sandbox" }
 dsh-sandbox-local = { path = "crates/sandbox/sandbox-local" }
 dsh-shell = { path = "crates/shell/shell" }
 dsh-bash-local = { path = "crates/shell/bash-local" }
+dsh-bash-sandbox = { path = "crates/shell/bash-sandbox" }
 dsh-tool-bash = { path = "crates/shell/tool-bash" }
 dsh-fs = { path = "crates/fs/fs" }
 dsh-fs-local = { path = "crates/fs/fs-local" }
 dsh-tool-fs = { path = "crates/fs/tool-fs" }
+dsh-tool-fs-search = { path = "crates/fs/tool-fs-search" }
+dsh-tool-str-replace-editor = { path = "crates/fs/tool-str-replace-editor" }
 dsh-terminal = { path = "crates/terminal/terminal" }
 dsh-terminal-local = { path = "crates/terminal/terminal-local" }
 dsh-tool-terminal = { path = "crates/terminal/tool-terminal" }
