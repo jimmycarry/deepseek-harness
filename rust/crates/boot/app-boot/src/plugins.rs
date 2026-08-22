@@ -44,9 +44,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
             Ok(())
         }
         "@deepseek-ai/dsh-session-title" => apply_session_title(ctx, config),
-        "@deepseek-ai/dsh-session-title-first-prompt-llm" => {
-            apply_session_title_llm(ctx, config)
-        }
+        "@deepseek-ai/dsh-session-title-first-prompt-llm" => apply_session_title_llm(ctx, config),
         "@deepseek-ai/dsh-session-persistence-jsonl" => apply_persistence(ctx, config),
         "@deepseek-ai/dsh-session-persistence-sqlite" => apply_persistence_sqlite(ctx, config),
         "@deepseek-ai/dsh-attachment-local" => apply_attachment(ctx, config),
@@ -94,6 +92,20 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-workflow-worker-thread" => apply_workflow(ctx, config),
         "@deepseek-ai/dsh-tool-workflow" => apply_tool_workflow(ctx, config),
         "@deepseek-ai/dsh-repeat-tool-reminder" => apply_repeat_tool_reminder(ctx, config),
+        "@deepseek-ai/dsh-tool-todo" => apply_tool_todo(ctx, config),
+        "@deepseek-ai/dsh-tool-call-timeout-policy" => dsh_timeout_policy::install(ctx),
+        "@deepseek-ai/dsh-compaction-tool-result-pruner" => apply_tool_result_pruner(ctx, config),
+        "@deepseek-ai/dsh-plan-mode" => apply_plan_mode(ctx, config),
+        "@deepseek-ai/dsh-user-questions" => {
+            dsh_user_questions::UserQuestionsService::install(ctx)?;
+            Ok(())
+        }
+        "@deepseek-ai/dsh-skill" => apply_skill(ctx),
+        "@deepseek-ai/dsh-skill-filesystem" => apply_skill_filesystem(ctx, config),
+        "@deepseek-ai/dsh-tool-skill" => apply_tool_skill(ctx, config),
+        "@deepseek-ai/dsh-token-meter" => apply_token_meter(ctx, config),
+        "@deepseek-ai/dsh-compaction-basic" => apply_compaction_basic(ctx, config),
+        "@deepseek-ai/dsh-command-compact" => apply_command_compact(ctx),
         "@deepseek-ai/dsh-web" => apply_web(ctx, config),
         "@deepseek-ai/dsh-web-search-deepseek" => apply_web_search_deepseek(ctx, config),
         "@deepseek-ai/dsh-tool-web" => apply_tool_web(ctx, config),
@@ -233,8 +245,8 @@ fn apply_session_query(ctx: &Context, config: Option<Value>) -> Result<()> {
     if !ctx.has_service(dsh_session::SessionStore::KEY) {
         ctx.provide(Arc::new(dsh_session::SessionStore::new()))?;
     }
-    let resolved =
-        dsh_session_query_sqlite::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    let resolved = dsh_session_query_sqlite::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
     dsh_session_query_sqlite::install(ctx, resolved)?;
     Ok(())
 }
@@ -540,7 +552,8 @@ fn apply_goal(ctx: &Context, config: Option<Value>) -> Result<()> {
 fn apply_tool_goal(ctx: &Context, config: Option<Value>) -> Result<()> {
     ensure_tools(ctx)?;
     ensure_system_prompt(ctx)?;
-    let resolved = dsh_tool_goal::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    let resolved =
+        dsh_tool_goal::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     dsh_tool_goal::install(ctx, resolved)
 }
 
@@ -594,6 +607,101 @@ fn apply_repeat_tool_reminder(ctx: &Context, config: Option<Value>) -> Result<()
     dsh_repeat_tool_reminder::install(ctx, resolved)
 }
 
+fn apply_tool_todo(ctx: &Context, config: Option<Value>) -> Result<()> {
+    ensure_tools(ctx)?;
+    let resolved =
+        dsh_tool_todo::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_todo::install(ctx, resolved)
+}
+
+fn apply_tool_result_pruner(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let resolved = dsh_tool_result_pruner::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
+    dsh_tool_result_pruner::ToolResultPruner::install(
+        ctx,
+        resolved.threshold_chars,
+        resolved.head_chars,
+        resolved.tail_chars,
+    )?;
+    Ok(())
+}
+
+fn apply_plan_mode(ctx: &Context, config: Option<Value>) -> Result<()> {
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    dsh_plan_mode::apply(ctx, config.as_ref())?;
+    Ok(())
+}
+
+fn apply_skill(ctx: &Context) -> Result<()> {
+    if ctx.has_service(dsh_skill::SkillRuntime::KEY) {
+        return Ok(());
+    }
+    ctx.provide(Arc::new(dsh_skill::SkillRuntime::new()))
+}
+
+fn apply_skill_filesystem(ctx: &Context, config: Option<Value>) -> Result<()> {
+    apply_skill(ctx)?;
+    let resolved =
+        dsh_skill_filesystem::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_skill_filesystem::install(ctx, resolved)
+}
+
+fn apply_tool_skill(ctx: &Context, config: Option<Value>) -> Result<()> {
+    apply_skill(ctx)?;
+    ensure_tools(ctx)?;
+    let resolved =
+        dsh_tool_skill::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_skill::install(ctx, resolved)
+}
+
+fn apply_token_meter(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if ctx.has_service("tokenMeter") {
+        return Ok(());
+    }
+    let chars_per_token = match config.as_ref().and_then(|value| value.get("charsPerToken")) {
+        None => 4,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(|value| value as usize)
+            .ok_or_else(|| {
+                CordisError::Validation(
+                    "token-meter: charsPerToken must be a positive integer".into(),
+                )
+            })?,
+    };
+    ctx.provide(Arc::new(dsh_token_meter::TokenMeter::new(chars_per_token)))
+}
+
+fn apply_compaction_basic(ctx: &Context, config: Option<Value>) -> Result<()> {
+    fn field(config: Option<&Value>, key: &str, default: usize) -> Result<usize> {
+        match config.and_then(|value| value.get(key)) {
+            None => Ok(default),
+            Some(value) => value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .map(|value| value as usize)
+                .ok_or_else(|| {
+                    CordisError::Validation(format!(
+                        "compaction-basic: {key} must be a positive integer"
+                    ))
+                }),
+        }
+    }
+    let threshold_messages = field(config.as_ref(), "thresholdMessages", 40)?;
+    let retain_tail = field(config.as_ref(), "retainTail", 8)?;
+    dsh_compaction_basic::BasicCompactionEngine::install(ctx, threshold_messages, retain_tail)?;
+    Ok(())
+}
+
+fn apply_command_compact(ctx: &Context) -> Result<()> {
+    if !ctx.has_service(CommandRegistry::KEY) {
+        ctx.provide(Arc::new(CommandRegistry::new()))?;
+    }
+    dsh_command_compact::install(ctx)
+}
+
 fn apply_web(ctx: &Context, config: Option<Value>) -> Result<()> {
     if ctx.has_service(dsh_web::WebRuntime::KEY) {
         return Ok(());
@@ -606,8 +714,8 @@ fn apply_web_search_deepseek(ctx: &Context, config: Option<Value>) -> Result<()>
     if !ctx.has_service(dsh_web::WebRuntime::KEY) {
         apply_web(ctx, None)?;
     }
-    let resolved =
-        dsh_web_search_deepseek::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    let resolved = dsh_web_search_deepseek::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
     dsh_web_search_deepseek::install(ctx, resolved)
 }
 
@@ -617,7 +725,8 @@ fn apply_tool_web(ctx: &Context, config: Option<Value>) -> Result<()> {
     }
     ensure_tools(ctx)?;
     ensure_system_prompt(ctx)?;
-    let resolved = dsh_tool_web::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    let resolved =
+        dsh_tool_web::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     dsh_tool_web::install(ctx, resolved)
 }
 

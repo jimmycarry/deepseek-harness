@@ -44,11 +44,17 @@ impl CommandHandler for CompactHandler {
         let Some(agent) = agents.get(&session_id(id)) else {
             return Err("unknown session".into());
         };
-        match block_on(self.compaction.engine().compact_now(agent.as_ref())) {
+        let command_id = format!("cmd-{}", uuid::Uuid::new_v4());
+        match block_on(
+            self.compaction
+                .engine()
+                .compact_now(agent.as_ref(), Some(&command_id)),
+        ) {
             Ok(None) => Ok("No compactable history yet.".into()),
             Ok(Some(result)) => Ok(format!(
-                "Compacted {} history items.",
-                result.shadowed_seqs.len()
+                "Compacted {} history items (~{} tokens).",
+                result.shadowed_seqs.len(),
+                result.shadowed_token_count
             )),
             Err(ManualCompactionError::Busy) => Err(
                 "Compaction is unavailable because this process has an active compaction, or the agent is not idle."
@@ -108,6 +114,7 @@ mod tests {
         async fn compact_now(
             &self,
             _: &dyn Agent,
+            _: Option<&str>,
         ) -> Result<Option<CompactionResult>, ManualCompactionError> {
             Ok(None)
         }

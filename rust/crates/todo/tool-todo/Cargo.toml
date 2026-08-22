@@ -8,7 +8,9 @@ description = "todo_write tool."
 
 [dependencies]
 async-trait.workspace = true
+dsh-agent.workspace = true
 dsh-cordis.workspace = true
+dsh-llm.workspace = true
 dsh-session.workspace = true
 dsh-tools.workspace = true
 serde_json.workspace = true

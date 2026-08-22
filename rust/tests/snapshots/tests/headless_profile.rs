@@ -270,10 +270,7 @@ async fn bash_turn_profile_types_and_payloads() {
         .iter()
         .find(|event| event["type"] == "tool/call")
         .expect("tool call");
-    assert_eq!(
-        result["sourceEventSeqs"],
-        serde_json::json!([call["seq"]])
-    );
+    assert_eq!(result["sourceEventSeqs"], serde_json::json!([call["seq"]]));
 }
 
 #[tokio::test]
@@ -319,11 +316,14 @@ async fn glob_turn_profile_rereads_workspace() {
 #[tokio::test]
 async fn str_replace_editor_turn_profile_rereads_file() {
     // `ctx.fs` is confined to the process cwd (the sandbox workspace root).
-    let workspace = std::env::current_dir().unwrap().join("target").join(format!(
-        "dsh-wave-e-editor-{}-{}",
-        std::process::id(),
-        uuid_stamp()
-    ));
+    let workspace = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "dsh-wave-e-editor-{}-{}",
+            std::process::id(),
+            uuid_stamp()
+        ));
     std::fs::create_dir_all(&workspace).unwrap();
     let path = workspace.join("note.txt");
     let path_str = path.to_string_lossy();
@@ -405,9 +405,9 @@ async fn goal_turn_profile_writes_goal_change() {
         .as_str()
         .unwrap_or("");
     assert!(text.contains("\"activation\":\"armed\""), "{text}");
-    let has_goal_round = events.iter().any(|event| {
-        event["type"] == "user/message" && event["data"]["source"]["kind"] == "goal"
-    });
+    let has_goal_round = events
+        .iter()
+        .any(|event| event["type"] == "user/message" && event["data"]["source"]["kind"] == "goal");
     assert!(has_goal_round, "expected goal_round user/message");
 }
 
@@ -466,7 +466,10 @@ async fn workflow_turn_profile() {
     ]);
     let events = run_profile("run workflow", replay_turns_overlay(turns)).await;
     let types = types_of(&events);
-    assert!(types.contains(&"tool-workflow/run-start".into()), "{types:?}");
+    assert!(
+        types.contains(&"tool-workflow/run-start".into()),
+        "{types:?}"
+    );
     assert!(types.contains(&"tool-workflow/run-end".into()), "{types:?}");
     let result = events
         .iter()
@@ -527,10 +530,7 @@ async fn spill_policy_turn_profile() {
     let text = result["data"]["message"]["content"][0]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
-    assert!(
-        text.contains("Full formatted result stored at:"),
-        "{text}"
-    );
+    assert!(text.contains("Full formatted result stored at:"), "{text}");
     assert!(text.contains("Omitted"), "{text}");
     assert!(text.len() <= 50_000, "{}", text.len());
     let locator = text
@@ -567,6 +567,130 @@ async fn repeat_tool_reminder_profile() {
     let notice = notice.expect("repeat-tool-reminder notice");
     assert_eq!(notice["data"]["source"]["form"], "notice");
     assert_eq!(notice["data"]["source"]["summary"], "bash × 3");
+}
+
+#[tokio::test]
+async fn todo_write_turn_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "todo_write",
+                "arguments": "{\"todos\":[{\"content\":\"ship\",\"status\":\"in_progress\"},{\"content\":\"test\",\"status\":\"pending\"}]}"
+            }
+        },
+        { "text": "tracked" }
+    ]);
+    let events = run_profile("track the work", replay_turns_overlay(turns)).await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        text,
+        "Updated todo list: 1 pending, 1 in progress, 0 completed."
+    );
+    let write = events
+        .iter()
+        .find(|event| event["type"] == "todo/write")
+        .expect("todo/write event");
+    assert!(
+        write["ignorable"].is_null(),
+        "todo/write is required-on-read"
+    );
+    assert_eq!(write["data"]["todos"][0]["content"], "ship");
+    assert_eq!(write["data"]["todos"][0]["status"], "in_progress");
+    assert_eq!(write["data"]["todos"][1]["status"], "pending");
+}
+
+#[tokio::test]
+async fn skill_turn_profile_publishes_catalog_and_loads_skill() {
+    let skills_dir = std::env::temp_dir().join(format!(
+        "dsh-wave-h-skills-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    std::fs::create_dir_all(skills_dir.join("demo")).unwrap();
+    std::fs::write(
+        skills_dir.join("demo").join("SKILL.md"),
+        "---\nname: demo\ndescription: demo skill for the snapshot\n---\nfollow the demo steps",
+    )
+    .unwrap();
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "skill",
+                "arguments": "{\"name\":\"demo\"}"
+            }
+        },
+        { "text": "loaded" }
+    ]);
+    let mut overlay = replay_turns_overlay(turns);
+    let mut skill_fs = EntryPatch::replace("skill-filesystem");
+    skill_fs.config = Some(serde_json::json!({
+        "includeDefaultRoots": false,
+        "customSkillDirs": [skills_dir.to_string_lossy()]
+    }));
+    overlay.push(skill_fs);
+    let events = run_profile("use the demo skill", overlay).await;
+    let catalog = events
+        .iter()
+        .find(|event| {
+            event["type"] == "user/message" && event["data"]["source"]["kind"] == "skill-catalog"
+        })
+        .expect("skill catalog publication");
+    assert_eq!(catalog["data"]["source"]["form"], "catalog");
+    assert_eq!(catalog["data"]["source"]["entries"][0]["name"], "demo");
+    let body = catalog["data"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(body.starts_with("<system-reminder>"), "{body}");
+    assert!(
+        body.contains("- `demo`: demo skill for the snapshot"),
+        "{body}"
+    );
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(text.starts_with("<skill_content name=\"demo\">"), "{text}");
+    assert!(
+        text.contains("<skill_instructions>\nfollow the demo steps\n</skill_instructions>"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&skills_dir);
+}
+
+#[tokio::test]
+async fn exit_plan_mode_outside_plan_mode_fails() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "exit_plan_mode",
+                "arguments": "{\"plan\":\"# Plan\"}"
+            }
+        },
+        { "text": "stayed" }
+    ]);
+    let events = run_profile("try to exit", replay_turns_overlay(turns)).await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    assert_eq!(result["data"]["message"]["content"][0]["isError"], true);
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(text, "Error: exit_plan_mode is only available in plan mode");
 }
 
 #[test]

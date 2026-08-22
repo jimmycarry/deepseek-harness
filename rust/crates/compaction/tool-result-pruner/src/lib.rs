@@ -1,16 +1,72 @@
 //! Tool-result pruner (`ctx.toolResultPruner`).
 //!
-//! Thresholds are Config at construction. The prune marker is a protocol
-//! constant, not a tunable.
+//! Runs inside compaction, not on the execute pipeline: `prune_session` scans
+//! surface `tool/result` events over the threshold, appends a log-only
+//! `compaction/prune` record, and immediately lands a `tool/result`
+//! replacement (`surfaceOp: replace`, `sourceEventSeqs: [seq]`) carrying the
+//! pruned content. Thresholds are Config at construction; the prune marker is
+//! a protocol constant, not a tunable.
 
 use dsh_cordis::{Context, Service};
 use dsh_llm::ContentBlock;
+use dsh_session::{Session, SessionEventData, SurfaceOp};
+use dsh_token_meter::TokenMeter;
 use dsh_tools::ToolOutcome;
-use serde_json::Value;
 use std::sync::Arc;
 
 /// Fixed marker substituted for every removed middle span.
 pub const PRUNE_MARKER: &str = "\n\n[... tool result middle pruned ...]\n\n";
+
+/// Character budgets validated from cordis.yml.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Results at or under this many characters are never pruned.
+    pub threshold_chars: usize,
+    /// Characters kept from the head.
+    pub head_chars: usize,
+    /// Characters kept from the tail.
+    pub tail_chars: usize,
+}
+
+impl Config {
+    /// Validate raw cordis.yml config; missing fields take the TypeScript
+    /// defaults (8192 / 4096 / 1024).
+    ///
+    /// # Errors
+    /// A non-positive `thresholdChars`, negative budget, or an emitted size
+    /// (`headChars` + marker + `tailChars`) above `thresholdChars`.
+    pub fn resolve(config: Option<&serde_json::Value>) -> Result<Self, String> {
+        fn field(
+            config: Option<&serde_json::Value>,
+            key: &str,
+            default: usize,
+        ) -> Result<usize, String> {
+            match config.and_then(|value| value.get(key)) {
+                None => Ok(default),
+                Some(value) => value.as_u64().map(|value| value as usize).ok_or_else(|| {
+                    format!("tool-result-pruner: {key} must be a non-negative integer")
+                }),
+            }
+        }
+        let threshold_chars = field(config, "thresholdChars", 8192)?;
+        if threshold_chars == 0 {
+            return Err("tool-result-pruner: thresholdChars must be a positive integer".into());
+        }
+        let head_chars = field(config, "headChars", 4096)?;
+        let tail_chars = field(config, "tailChars", 1024)?;
+        let emitted = head_chars + PRUNE_MARKER.chars().count() + tail_chars;
+        if emitted > threshold_chars {
+            return Err(format!(
+                "tool-result-pruner: headChars + marker + tailChars ({emitted}) must be at most thresholdChars ({threshold_chars})"
+            ));
+        }
+        Ok(Self {
+            threshold_chars,
+            head_chars,
+            tail_chars,
+        })
+    }
+}
 
 /// Replay-safe, model-free tool-result pruning service.
 pub struct ToolResultPruner {
@@ -38,7 +94,7 @@ impl ToolResultPruner {
         }
     }
 
-    /// Provide `ctx.toolResultPruner` and register `tools/post-execute`.
+    /// Provide `ctx.toolResultPruner`.
     pub fn install(
         ctx: &Context,
         threshold_chars: usize,
@@ -46,29 +102,74 @@ impl ToolResultPruner {
         tail_chars: usize,
     ) -> dsh_cordis::Result<Arc<Self>> {
         let pruner = Arc::new(Self::new(threshold_chars, head_chars, tail_chars));
-        pruner.register(ctx)?;
         ctx.provide(Arc::clone(&pruner))?;
         Ok(pruner)
     }
 
-    /// Register the post-execute waterfall that prunes `text` / `content`.
-    pub fn register(self: &Arc<Self>, ctx: &Context) -> dsh_cordis::Result<()> {
-        let pruner = Arc::clone(self);
-        ctx.on_waterfall("tools/post-execute", move |mut payload, next| {
-            if let Some(text) = payload.get("text").and_then(Value::as_str) {
-                let pruned = pruner.prune_text(text);
-                payload["text"] = Value::String(pruned);
+    /// Prune every over-threshold surface `tool/result` in `session`.
+    ///
+    /// Each prune appends `compaction/prune` then the `tool/result`
+    /// replacement; the pair is adjacent in the log. Returns the seqs of the
+    /// replaced results.
+    pub fn prune_session(&self, session: &Session, meter: Option<&TokenMeter>) -> Vec<u64> {
+        let surface = session.surface();
+        let mut pruned = Vec::new();
+        for seq in surface.nodes {
+            let Some(event) = session.events().into_iter().find(|event| event.seq == seq) else {
+                continue;
+            };
+            let SessionEventData::ToolResult {
+                turn,
+                step,
+                message,
+            } = &event.data
+            else {
+                continue;
+            };
+            let blocks = message.result_blocks().to_vec();
+            let replaced = self.prune_blocks(&blocks);
+            if replaced == blocks {
+                continue;
             }
-            if let Some(content) = payload.get("content").and_then(Value::as_array).cloned() {
-                let blocks: Vec<ContentBlock> = content
-                    .into_iter()
-                    .filter_map(|block| serde_json::from_value(block).ok())
-                    .collect();
-                let pruned = pruner.prune_blocks(&blocks);
-                payload["content"] = serde_json::to_value(pruned).unwrap_or(Value::Null);
+            let shadowed_tokens = meter
+                .map(|meter| meter.estimate_content(&blocks))
+                .unwrap_or(0);
+            let replacement = dsh_llm::ToolResultMessage::new(
+                message
+                    .tool_call_id()
+                    .map(dsh_llm::call_id)
+                    .unwrap_or_else(|| dsh_llm::call_id("")),
+                replaced,
+                message.is_error(),
+            );
+            let record = session.append(
+                SessionEventData::CompactionPrune {
+                    shadowed_range: serde_json::json!({ "start": seq, "end": seq }),
+                    shadowed_seqs: vec![seq],
+                    shadowed_token_count: shadowed_tokens as u64,
+                },
+                None,
+            );
+            if record.is_err() {
+                continue;
             }
-            next.call(payload)
-        })
+            let landed = session.append_cited(
+                SessionEventData::ToolResult {
+                    turn: *turn,
+                    step: *step,
+                    message: replacement,
+                },
+                SurfaceOp::Replace {
+                    start: seq,
+                    end: seq,
+                },
+                vec![seq],
+            );
+            if landed.is_ok() {
+                pruned.push(seq);
+            }
+        }
+        pruned
     }
 
     /// Replace an over-budget text middle while retaining head and tail.
@@ -110,7 +211,8 @@ impl Service for ToolResultPruner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_cordis::Context;
+    use dsh_llm::{call_id, ToolResultMessage};
+    use dsh_session::session_id;
 
     #[test]
     fn provide_and_dispose() {
@@ -134,19 +236,57 @@ mod tests {
     }
 
     #[test]
-    fn register_post_execute_prunes_text() {
-        let ctx = Context::new();
-        let pruner = ToolResultPruner::install(&ctx, 64, 4, 4).unwrap();
-        let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!!!!";
-        let expected = pruner.prune_text(long);
-        assert!(expected.contains(PRUNE_MARKER));
-        let result = ctx
-            .waterfall(
-                "tools/post-execute",
-                serde_json::json!({ "name": "bash", "text": long }),
-                |payload| payload,
+    fn prune_session_writes_prune_record_and_replacement() {
+        let session = Session::new(session_id("prune"));
+        let long = "x".repeat(100);
+        session
+            .append(
+                SessionEventData::ToolResult {
+                    turn: 1,
+                    step: 1,
+                    message: ToolResultMessage::new(
+                        call_id("c1"),
+                        vec![ContentBlock::text(long)],
+                        false,
+                    ),
+                },
+                Some(SurfaceOp::append()),
             )
             .unwrap();
-        assert_eq!(result["text"].as_str(), Some(expected.as_str()));
+        let pruner = ToolResultPruner::new(64, 4, 4);
+        let meter = TokenMeter::new(4);
+        let pruned = pruner.prune_session(&session, Some(&meter));
+        assert_eq!(pruned, vec![0]);
+        let events = session.events();
+        assert_eq!(events.len(), 3);
+        match &events[1].data {
+            SessionEventData::CompactionPrune {
+                shadowed_seqs,
+                shadowed_token_count,
+                shadowed_range,
+            } => {
+                assert_eq!(shadowed_seqs, &vec![0]);
+                assert!(*shadowed_token_count > 0);
+                assert_eq!(shadowed_range["start"], 0);
+                assert_eq!(shadowed_range["end"], 0);
+            }
+            other => panic!("expected compaction/prune, got {other:?}"),
+        }
+        assert_eq!(
+            events[2].surface_op,
+            Some(SurfaceOp::Replace { start: 0, end: 0 })
+        );
+        assert_eq!(events[2].source_event_seqs, Some(vec![0]));
+        match &events[2].data {
+            SessionEventData::ToolResult { message, .. } => {
+                let text = match &message.result_blocks()[0] {
+                    ContentBlock::Text { text } => text.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                assert!(text.contains(PRUNE_MARKER));
+            }
+            other => panic!("expected tool/result, got {other:?}"),
+        }
+        assert!(pruner.prune_session(&session, Some(&meter)).is_empty());
     }
 }

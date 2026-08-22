@@ -44,6 +44,49 @@ pub trait Tool: Send + Sync {
     async fn execute_call(&self, call: &ToolCall) -> Result<ToolOutcome, ToolError> {
         self.execute(call.args.clone()).await
     }
+
+    /// Registration-declared body deadline in milliseconds. `None` means the
+    /// tool declares no deadline; the timeout policy then leaves it untouched.
+    fn timeout_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Cordis service key checked before enforcing a tool's declared deadline.
+pub const TOOL_TIMEOUT_POLICY_KEY: &str = "toolCallTimeoutPolicy";
+
+/// Stable failure code for a policy-enforced tool deadline.
+pub const TOOL_TIMEOUT: &str = "TOOL_TIMEOUT";
+
+/// Run one tool body, enforcing its declared deadline when the timeout policy
+/// service is mounted. A deadline hit replaces the result with the
+/// model-visible `TOOL_TIMEOUT` failure.
+async fn run_body(
+    ctx: &Context,
+    tool: &Arc<dyn Tool>,
+    call: &ToolCall,
+) -> Result<ToolOutcome, ToolError> {
+    let deadline = if ctx.has_service(TOOL_TIMEOUT_POLICY_KEY) {
+        tool.timeout_ms()
+    } else {
+        None
+    };
+    match deadline {
+        None => tool.execute_call(call).await,
+        Some(timeout_ms) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                tool.execute_call(call),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => Ok(ToolOutcome::error(format!(
+                    "Error: tool call timed out after {timeout_ms}ms"
+                ))),
+            }
+        }
+    }
 }
 
 /// Successful or failed tool body.
@@ -226,7 +269,7 @@ impl ToolRuntime {
             args: args.clone(),
             agent_id: agent_id.map(str::to_string),
         };
-        let outcome = tool.execute_call(&call).await?;
+        let outcome = run_body(ctx, &tool, &call).await?;
         Ok(post_execute(ctx, name, &args, agent_id, outcome))
     }
 
@@ -269,8 +312,14 @@ impl ToolRuntime {
         agent_id: Option<&str>,
     ) -> Vec<Result<ToolExecutionResult, ToolError>> {
         enum Prepared {
-            Denied { name: String, args: Value },
-            Unknown { name: String, args: Value },
+            Denied {
+                name: String,
+                args: Value,
+            },
+            Unknown {
+                name: String,
+                args: Value,
+            },
             Ready {
                 name: String,
                 tool: Arc<dyn Tool>,
@@ -326,9 +375,10 @@ impl ToolRuntime {
                     agent_id: agent_id.map(str::to_string),
                 };
                 let semaphore = Arc::clone(&semaphore);
+                let body_ctx = ctx.clone();
                 set.spawn(async move {
                     let _permit = semaphore.acquire().await.expect("tools semaphore");
-                    (index, tool.execute_call(&call).await)
+                    (index, run_body(&body_ctx, &tool, &call).await)
                 });
             }
         }
@@ -463,9 +513,10 @@ mod tests {
             ToolOutcome::text("ok")
         })));
         ctx.provide(Arc::clone(&tools)).unwrap();
-        ctx.on_waterfall("tools/pre-execute", |_payload, _next| {
-            serde_json::json!({ "deny": true })
-        })
+        ctx.on_waterfall(
+            "tools/pre-execute",
+            |_payload, _next| serde_json::json!({ "deny": true }),
+        )
         .unwrap();
         let err = tools
             .execute(&ctx, "echo", serde_json::json!({}))

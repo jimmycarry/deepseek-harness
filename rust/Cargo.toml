@@ -81,6 +81,7 @@ members = [
   "crates/spill/spill-local",
   "crates/spill/spill-policy",
   "crates/interaction/commands",
+  "crates/interaction/user-questions",
   "crates/sdk/protocol",
   "crates/sdk/client",
   "crates/sdk/server",
@@ -196,6 +197,7 @@ dsh-spill = { path = "crates/spill/spill" }
 dsh-spill-local = { path = "crates/spill/spill-local" }
 dsh-spill-policy = { path = "crates/spill/spill-policy" }
 dsh-commands = { path = "crates/interaction/commands" }
+dsh-user-questions = { path = "crates/interaction/user-questions" }
 dsh-sdk-protocol = { path = "crates/sdk/protocol" }
 dsh-sdk-client = { path = "crates/sdk/client" }
 dsh-sdk-server = { path = "crates/sdk/server" }

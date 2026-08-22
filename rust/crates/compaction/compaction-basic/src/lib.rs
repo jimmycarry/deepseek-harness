@@ -19,14 +19,17 @@ pub struct BasicCompactionEngine {
     pub threshold_messages: usize,
     /// Messages to keep after the checkpoint.
     pub retain_tail: usize,
+    /// Meter used to price the shadowed span, when mounted.
+    meter: Option<Arc<TokenMeter>>,
 }
 
 impl BasicCompactionEngine {
-    /// Build from explicit policy.
+    /// Build from explicit policy without a token meter.
     pub fn new(threshold_messages: usize, retain_tail: usize) -> Self {
         Self {
             threshold_messages,
             retain_tail,
+            meter: None,
         }
     }
 
@@ -36,7 +39,11 @@ impl BasicCompactionEngine {
         threshold_messages: usize,
         retain_tail: usize,
     ) -> dsh_cordis::Result<Arc<Self>> {
-        let engine = Arc::new(Self::new(threshold_messages, retain_tail));
+        let engine = Arc::new(Self {
+            threshold_messages,
+            retain_tail,
+            meter: ctx.get::<TokenMeter>(),
+        });
         engine.register_automatic(ctx)?;
         ctx.provide(Arc::new(CompactionRuntime::new(
             Arc::clone(&engine) as Arc<dyn CompactionEngine>
@@ -52,7 +59,13 @@ impl BasicCompactionEngine {
             if let Some(id) = payload.get("sessionId").and_then(|value| value.as_str()) {
                 if let Some(agents) = lookup.get::<AgentRegistry>() {
                     if let Some(agent) = agents.get(&session_id(id)) {
-                        if let Some(meter) = lookup.get::<TokenMeter>() {
+                        let meter = lookup.get::<TokenMeter>();
+                        if let Some(pruner) =
+                            lookup.get::<dsh_tool_result_pruner::ToolResultPruner>()
+                        {
+                            let _ = pruner.prune_session(&agent.session(), meter.as_deref());
+                        }
+                        if let Some(meter) = &meter {
                             let _pressure = meter.estimate_session(&agent.session());
                         }
                         let _ = block_on(
@@ -73,6 +86,14 @@ impl BasicCompactionEngine {
                 if let Some(id) = payload.get("sessionId").and_then(|value| value.as_str()) {
                     if let Some(agents) = lookup.get::<AgentRegistry>() {
                         if let Some(agent) = agents.get(&session_id(id)) {
+                            if let Some(pruner) =
+                                lookup.get::<dsh_tool_result_pruner::ToolResultPruner>()
+                            {
+                                let _ = pruner.prune_session(
+                                    &agent.session(),
+                                    lookup.get::<TokenMeter>().as_deref(),
+                                );
+                            }
                             let _ = block_on(engine.compact_if_needed(
                                 agent.as_ref(),
                                 CompactionTrigger::ContextOverflow,
@@ -91,7 +112,7 @@ impl BasicCompactionEngine {
             if let Some(id) = payload.get("sessionId").and_then(|value| value.as_str()) {
                 if let Some(agents) = lookup.get::<AgentRegistry>() {
                     if let Some(agent) = agents.get(&session_id(id)) {
-                        let _ = block_on(engine.compact_now(agent.as_ref()));
+                        let _ = block_on(engine.compact_now(agent.as_ref(), None));
                     }
                 }
             }
@@ -104,6 +125,7 @@ impl BasicCompactionEngine {
         &self,
         agent: &dyn Agent,
         force: bool,
+        source_command_id: Option<&str>,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
         let session = agent.session();
         let events = session.events();
@@ -127,32 +149,87 @@ impl BasicCompactionEngine {
         let start = surface.nodes[0];
         let end = surface.nodes[end_idx];
         let shadowed = surface.nodes[..=end_idx].to_vec();
-        session
-            .append(SessionEventData::CompactionStart { turn: None }, None)
-            .ok();
-        session
+        let compaction_id = uuid::Uuid::new_v4().to_string();
+        let source_command_id = source_command_id.map(str::to_string);
+        let start_event = session
             .append(
-                SessionEventData::CompactionSummary {
-                    shadowed_seqs: shadowed.clone(),
+                SessionEventData::CompactionStart {
+                    compaction_id: compaction_id.clone(),
+                    source_command_id: source_command_id.clone(),
+                    turn: None,
                 },
                 None,
             )
             .ok();
-        let summary = vec![ContentBlock::text(
-            "<compacted-summary>earlier conversation condensed</compacted-summary>",
-        )];
-        session
+        let summary_text = "earlier conversation condensed".to_string();
+        let shadowed_token_count = self
+            .meter
+            .as_ref()
+            .map(|meter| {
+                events
+                    .iter()
+                    .filter(|event| shadowed.contains(&event.seq))
+                    .map(|event| match &event.data {
+                        SessionEventData::UserMessage(message) => {
+                            meter.estimate_content(&message.content) as u64
+                        }
+                        SessionEventData::AssistantMessage { message, .. } => {
+                            meter.estimate_content(&message.content) as u64
+                        }
+                        SessionEventData::ToolResult { message, .. } => {
+                            meter.estimate_content(message.result_blocks()) as u64
+                        }
+                        _ => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        let summary_event = session
             .append(
+                SessionEventData::CompactionSummary {
+                    compaction_id: compaction_id.clone(),
+                    source_command_id: source_command_id.clone(),
+                    summary: summary_text.clone(),
+                    shadowed_range: serde_json::json!({ "start": start, "end": end }),
+                    shadowed_seqs: shadowed.clone(),
+                    shadowed_token_count,
+                },
+                None,
+            )
+            .ok();
+        let summary = vec![ContentBlock::text(format!(
+            "{CHECKPOINT_PREAMBLE}\n\n<compacted-summary>\n{summary_text}\n</compacted-summary>"
+        ))];
+        let mut cited: Vec<u64> = Vec::new();
+        if let Some(event) = &start_event {
+            cited.push(event.seq);
+        }
+        if let Some(event) = &summary_event {
+            cited.push(event.seq);
+        }
+        cited.extend(shadowed.iter().copied());
+        session
+            .append_cited(
                 SessionEventData::UserMessage(dsh_llm::UserMessage::from_parts(
                     summary.clone(),
-                    dsh_llm::MessageSource::plugin("compaction"),
+                    dsh_llm::MessageSource::Plugin {
+                        plugin: "compact".into(),
+                        form: None,
+                        summary: None,
+                        sections: Vec::new(),
+                        compaction_id: Some(compaction_id.clone()),
+                        source_command_id: source_command_id.clone(),
+                    },
                 )),
-                Some(SurfaceOp::Replace { start, end }),
+                SurfaceOp::Replace { start, end },
+                cited,
             )
             .ok();
         session
             .append(
                 SessionEventData::CompactionEnd {
+                    compaction_id,
+                    source_command_id,
                     turn: None,
                     error: None,
                 },
@@ -161,10 +238,15 @@ impl BasicCompactionEngine {
             .ok();
         Ok(Some(CompactionResult {
             shadowed_seqs: shadowed,
+            shadowed_token_count,
             summary,
         }))
     }
 }
+
+/// Model-facing framing that precedes the `<compacted-summary>` block.
+pub const CHECKPOINT_PREAMBLE: &str =
+    "This is an automatically generated checkpoint condensing an earlier span of this conversation.";
 
 #[async_trait]
 impl CompactionEngine for BasicCompactionEngine {
@@ -173,14 +255,15 @@ impl CompactionEngine for BasicCompactionEngine {
         agent: &dyn Agent,
         trigger: CompactionTrigger,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
-        self.compact_session(agent, trigger == CompactionTrigger::ContextOverflow)
+        self.compact_session(agent, trigger == CompactionTrigger::ContextOverflow, None)
     }
 
     async fn compact_now(
         &self,
         agent: &dyn Agent,
+        source_command_id: Option<&str>,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
-        self.compact_session(agent, true)
+        self.compact_session(agent, true, source_command_id)
     }
 }
 
@@ -238,7 +321,7 @@ mod tests {
             inbox: Arc::new(Inbox::default()),
         };
         let engine = BasicCompactionEngine::new(3, 1);
-        let result = engine.compact_now(&agent).await.unwrap().unwrap();
+        let result = engine.compact_now(&agent, None).await.unwrap().unwrap();
         assert!(!result.shadowed_seqs.is_empty());
         let messages = session.derive_messages();
         assert!(messages.iter().any(|message| match message {
@@ -266,14 +349,21 @@ mod tests {
         append_user(&session, "a");
         append_user(&session, "b");
         session
-            .append(SessionEventData::CompactionStart { turn: None }, None)
+            .append(
+                SessionEventData::CompactionStart {
+                    compaction_id: "stale".into(),
+                    source_command_id: None,
+                    turn: None,
+                },
+                None,
+            )
             .unwrap();
         let agent = StubAgent {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
         let engine = BasicCompactionEngine::new(1, 0);
-        let err = engine.compact_now(&agent).await.unwrap_err();
+        let err = engine.compact_now(&agent, None).await.unwrap_err();
         assert!(matches!(err, ManualCompactionError::Busy));
     }
 

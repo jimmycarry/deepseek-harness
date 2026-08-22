@@ -120,6 +120,15 @@ pub struct SnapshotSection {
     pub text: String,
 }
 
+/// One skill-catalog entry carried on a `skill-catalog` message source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillCatalogEntry {
+    /// Exact loadable skill name.
+    pub name: String,
+    /// Truncated model-facing description.
+    pub description: String,
+}
+
 /// Who produced a message. Discriminated by `kind`, same as TypeScript `MessageSource`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
@@ -141,6 +150,31 @@ pub enum MessageSource {
         /// Snapshot contributions, required when `form` is `snapshot`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sections: Vec<SnapshotSection>,
+        /// Compaction attempt identity on a `compact` checkpoint message.
+        #[serde(
+            rename = "compactionId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        compaction_id: Option<String>,
+        /// Originating `/compact` command id on a manual checkpoint message.
+        #[serde(
+            rename = "sourceCommandId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_command_id: Option<String>,
+    },
+    /// Skill-catalog publication injected before a step.
+    #[serde(rename = "skill-catalog")]
+    SkillCatalog {
+        /// Publication form; always `catalog`.
+        form: String,
+        /// Present and `true` when a changed catalog replaces an earlier one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update: Option<bool>,
+        /// Complete catalog entries in rank order.
+        entries: Vec<SkillCatalogEntry>,
     },
     /// Same-session goal-round continuation.
     #[serde(rename = "goal")]
@@ -183,6 +217,8 @@ impl MessageSource {
             form: None,
             summary: None,
             sections: Vec::new(),
+            compaction_id: None,
+            source_command_id: None,
         }
     }
 
@@ -193,6 +229,8 @@ impl MessageSource {
             form: Some("snapshot".into()),
             summary: None,
             sections,
+            compaction_id: None,
+            source_command_id: None,
         }
     }
 
@@ -203,6 +241,8 @@ impl MessageSource {
             form: Some("notice".into()),
             summary: Some(summary.into()),
             sections: Vec::new(),
+            compaction_id: None,
+            source_command_id: None,
         }
     }
 
@@ -408,9 +448,9 @@ impl ToolResultMessage {
 
     /// Whether the wrapped tool outcome reported a failure.
     pub fn is_error(&self) -> bool {
-        self.content.iter().any(|block| {
-            matches!(block, ContentBlock::ToolResult { is_error: true, .. })
-        })
+        self.content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
     }
 }
 
@@ -517,7 +557,11 @@ pub enum StreamChunk {
         /// Why the stream ended.
         reason: FinishReason,
         /// Adapter-private replay metadata for a successful response.
-        #[serde(rename = "replayState", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "replayState",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         replay_state: Option<Value>,
     },
 }
@@ -610,13 +654,25 @@ pub struct TokenUsage {
     #[serde(rename = "outputTokens", default)]
     pub output_tokens: u32,
     /// Cached input tokens read.
-    #[serde(rename = "cacheReadTokens", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "cacheReadTokens",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_read_tokens: Option<u32>,
     /// Cached input tokens written.
-    #[serde(rename = "cacheWriteTokens", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "cacheWriteTokens",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_write_tokens: Option<u32>,
     /// Reasoning tokens when the provider reports them separately.
-    #[serde(rename = "reasoningTokens", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "reasoningTokens",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_tokens: Option<u32>,
 }
 
@@ -712,7 +768,10 @@ pub struct LlmRequest {
 #[async_trait]
 pub trait PreparedCall: Send + Sync {
     /// Stream chunks for this request.
-    async fn stream(&self, request: LlmRequest) -> Result<BoxStream<'static, StreamChunk>, LlmError>;
+    async fn stream(
+        &self,
+        request: LlmRequest,
+    ) -> Result<BoxStream<'static, StreamChunk>, LlmError>;
 }
 
 /// `ctx.llm` — adapter registry and stream entry.
@@ -732,7 +791,10 @@ impl LlmRuntime {
     }
 
     /// Stream a request through the registered adapter.
-    pub async fn stream(&self, request: LlmRequest) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
+    pub async fn stream(
+        &self,
+        request: LlmRequest,
+    ) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
         self.adapter.stream(request).await
     }
 }
@@ -745,7 +807,10 @@ impl Service for LlmRuntime {
 #[async_trait]
 pub trait LlmAdapter: Send + Sync {
     /// Stream one request.
-    async fn stream(&self, request: LlmRequest) -> Result<BoxStream<'static, StreamChunk>, LlmError>;
+    async fn stream(
+        &self,
+        request: LlmRequest,
+    ) -> Result<BoxStream<'static, StreamChunk>, LlmError>;
 }
 
 /// In-progress block keyed by stream index.
@@ -930,7 +995,10 @@ mod tests {
         let tool = ToolResultMessage::new(call_id("c1"), vec![ContentBlock::text("ok")], false);
         let wire = serde_json::to_value(Message::Tool(tool.clone())).unwrap();
         assert_eq!(wire["role"], "user");
-        assert_eq!(wire["source"], serde_json::json!({"kind":"tool","callId":"c1"}));
+        assert_eq!(
+            wire["source"],
+            serde_json::json!({"kind":"tool","callId":"c1"})
+        );
         assert_eq!(wire["content"][0]["type"], "tool-result");
         assert_eq!(wire["content"][0]["toolCallId"], "c1");
         assert_eq!(wire["content"][0]["isError"], false);

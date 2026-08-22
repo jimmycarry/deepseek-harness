@@ -45,7 +45,11 @@ pub struct SessionHeader {
     )]
     pub parent_session: Option<SessionId>,
     /// Number of seeded events copied from a resume, fork, or replay source.
-    #[serde(rename = "seedLength", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "seedLength",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub seed_length: Option<u64>,
     /// `subagent` when a delegation created this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,22 +330,86 @@ pub enum SessionEventData {
         #[serde(rename = "maxTokens")]
         max_tokens: u32,
     },
+    /// Log-only structured todo snapshot written by `todo_write`.
+    #[serde(rename = "todo/write")]
+    TodoWrite {
+        /// Complete replacement todo list (`content`, `status` items).
+        todos: Value,
+    },
+    /// Log-only plan-mode transition committed at a step boundary.
+    #[serde(rename = "plan/mode")]
+    PlanMode {
+        /// Whether plan mode is in force after this event.
+        active: bool,
+    },
+    /// Log-only record of one tool-result prune; the `tool/result`
+    /// replacement that lands the pruned content immediately follows.
+    #[serde(rename = "compaction/prune")]
+    CompactionPrune {
+        /// Replaced surface range (`{start, end}` seqs).
+        #[serde(rename = "shadowedRange")]
+        shadowed_range: Value,
+        /// Shadowed surface seqs in surface order.
+        #[serde(rename = "shadowedSeqs")]
+        shadowed_seqs: Vec<u64>,
+        /// Estimated token count removed by the prune.
+        #[serde(rename = "shadowedTokenCount")]
+        shadowed_token_count: u64,
+    },
     /// Compaction lock start.
     #[serde(rename = "compaction/start")]
     CompactionStart {
+        /// Attempt identity shared by the start/summary/end triplet.
+        #[serde(rename = "compactionId")]
+        compaction_id: String,
+        /// Originating `/compact` command id for a manual attempt.
+        #[serde(
+            rename = "sourceCommandId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_command_id: Option<String>,
         /// Open turn, or none for a manual attempt.
         turn: Option<u32>,
     },
     /// Compaction summary record (log-only).
     #[serde(rename = "compaction/summary")]
     CompactionSummary {
+        /// Attempt identity shared by the start/summary/end triplet.
+        #[serde(rename = "compactionId")]
+        compaction_id: String,
+        /// Originating `/compact` command id for a manual attempt.
+        #[serde(
+            rename = "sourceCommandId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_command_id: Option<String>,
+        /// Checkpoint summary text.
+        summary: String,
+        /// Replaced surface range (`{start, end}` seqs).
+        #[serde(rename = "shadowedRange")]
+        shadowed_range: Value,
         /// Shadowed surface seqs in surface order.
         #[serde(rename = "shadowedSeqs")]
         shadowed_seqs: Vec<u64>,
+        /// Estimated token count of the shadowed span.
+        #[serde(rename = "shadowedTokenCount")]
+        shadowed_token_count: u64,
     },
     /// Compaction lock end.
     #[serde(rename = "compaction/end")]
     CompactionEnd {
+        /// Attempt identity shared by the start/summary/end triplet.
+        #[serde(rename = "compactionId")]
+        compaction_id: String,
+        /// Originating `/compact` command id for a manual attempt.
+        #[serde(
+            rename = "sourceCommandId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_command_id: Option<String>,
         /// Matching start attribution.
         turn: Option<u32>,
         /// Failure text when the attempt failed.
@@ -425,15 +493,15 @@ impl<'de> Deserialize<'de> for SessionEvent {
             .and_then(|time| time.as_u64())
             .unwrap_or(0);
         let source_event_seqs = match object.remove("sourceEventSeqs") {
-            Some(seqs) => Some(
-                serde_json::from_value::<Vec<u64>>(seqs).map_err(serde::de::Error::custom)?,
-            ),
+            Some(seqs) => {
+                Some(serde_json::from_value::<Vec<u64>>(seqs).map_err(serde::de::Error::custom)?)
+            }
             None => None,
         };
         let surface_op = match object.remove("surfaceOp") {
-            Some(op) => Some(
-                serde_json::from_value::<SurfaceOp>(op).map_err(serde::de::Error::custom)?,
-            ),
+            Some(op) => {
+                Some(serde_json::from_value::<SurfaceOp>(op).map_err(serde::de::Error::custom)?)
+            }
             None => None,
         };
         let ignorable = object
@@ -483,6 +551,9 @@ pub fn event_type_name(data: &SessionEventData) -> &str {
         SessionEventData::RequestContext { .. } => "request/context",
         SessionEventData::SessionTitle { .. } => "session/title",
         SessionEventData::SessionTitleLlmRequest { .. } => "session/title-llm-request",
+        SessionEventData::TodoWrite { .. } => "todo/write",
+        SessionEventData::PlanMode { .. } => "plan/mode",
+        SessionEventData::CompactionPrune { .. } => "compaction/prune",
         SessionEventData::CompactionStart { .. } => "compaction/start",
         SessionEventData::CompactionSummary { .. } => "compaction/summary",
         SessionEventData::CompactionEnd { .. } => "compaction/end",
@@ -497,10 +568,12 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "assistant/chunk",
     "assistant/message",
     "compaction/end",
+    "compaction/prune",
     "compaction/start",
     "compaction/summary",
     "goal/change",
     "permission/preset",
+    "plan/mode",
     "request/context",
     "request/header",
     "sandbox/mode",
@@ -513,6 +586,7 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "tool-workflow/agent-start",
     "tool-workflow/run-end",
     "tool-workflow/run-start",
+    "todo/write",
     "tool/call",
     "tool/result",
     "turn/end",
@@ -665,13 +739,7 @@ impl Session {
         surface_op: SurfaceOp,
         source_event_seqs: Vec<u64>,
     ) -> Result<SessionEvent, SessionError> {
-        self.append_inner(
-            data,
-            Some(surface_op),
-            Some(source_event_seqs),
-            false,
-            None,
-        )
+        self.append_inner(data, Some(surface_op), Some(source_event_seqs), false, None)
     }
 
     /// Append a log-only event that unknown readers may skip.
@@ -768,17 +836,20 @@ impl Session {
 
     /// Last assistant text on the current surface, if any.
     pub fn last_assistant_text(&self) -> Option<String> {
-        self.derive_messages().into_iter().rev().find_map(|message| match message {
-            Message::Assistant(assistant) => {
-                let text = assistant.text();
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(text)
+        self.derive_messages()
+            .into_iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::Assistant(assistant) => {
+                    let text = assistant.text();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
                 }
-            }
-            _ => None,
-        })
+                _ => None,
+            })
     }
 }
 
@@ -884,10 +955,7 @@ mod tests {
     fn surface_event_requires_op() {
         let session = Session::new(session_id("s"));
         let err = session
-            .append(
-                SessionEventData::UserMessage(UserMessage::text("hi")),
-                None,
-            )
+            .append(SessionEventData::UserMessage(UserMessage::text("hi")), None)
             .unwrap_err();
         assert!(matches!(err, SessionError::MissingSurfaceOp));
     }
@@ -1073,10 +1141,7 @@ pub fn append_session_knobs(
         },
         None,
     )?;
-    session.append(
-        SessionEventData::SandboxMode { mode: mode.into() },
-        None,
-    )?;
+    session.append(SessionEventData::SandboxMode { mode: mode.into() }, None)?;
     session.append(
         SessionEventData::ApprovalPolicy {
             policy: policy.into(),

@@ -20,6 +20,8 @@ pub enum CompactionTrigger {
 pub struct CompactionResult {
     /// Shadowed surface seqs in surface order.
     pub shadowed_seqs: Vec<u64>,
+    /// Estimated token count of the shadowed span.
+    pub shadowed_token_count: u64,
     /// Summary content.
     pub summary: Vec<ContentBlock>,
 }
@@ -45,10 +47,13 @@ pub trait CompactionEngine: Send + Sync {
         trigger: CompactionTrigger,
     ) -> Result<Option<CompactionResult>, ManualCompactionError>;
 
-    /// Compact useful history even below pressure.
+    /// Compact useful history even below pressure. A manual `/compact`
+    /// attempt passes its command id so the attempt's session events carry
+    /// `sourceCommandId`.
     async fn compact_now(
         &self,
         agent: &dyn Agent,
+        source_command_id: Option<&str>,
     ) -> Result<Option<CompactionResult>, ManualCompactionError>;
 }
 
@@ -79,6 +84,9 @@ mod tests {
 
     #[test]
     fn trigger_names_stay_stable() {
-        assert_ne!(CompactionTrigger::Pressure, CompactionTrigger::ContextOverflow);
+        assert_ne!(
+            CompactionTrigger::Pressure,
+            CompactionTrigger::ContextOverflow
+        );
     }
 }

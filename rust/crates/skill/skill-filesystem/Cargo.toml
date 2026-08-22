@@ -9,3 +9,4 @@ description = "Filesystem skill provider."
 [dependencies]
 dsh-cordis.workspace = true
 dsh-skill.workspace = true
+serde_json.workspace = true

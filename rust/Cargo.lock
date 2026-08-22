@@ -255,8 +255,10 @@ dependencies = [
  "dsh-bash-sandbox",
  "dsh-bundle-base",
  "dsh-bundle-headless",
+ "dsh-command-compact",
  "dsh-command-goal",
  "dsh-commands",
+ "dsh-compaction-basic",
  "dsh-cordis",
  "dsh-cordis-loader",
  "dsh-credentials-local",
@@ -268,6 +270,7 @@ dependencies = [
  "dsh-llm",
  "dsh-llm-deepseek",
  "dsh-llm-replay",
+ "dsh-plan-mode",
  "dsh-repeat-tool-reminder",
  "dsh-sandbox",
  "dsh-sandbox-local",
@@ -278,6 +281,8 @@ dependencies = [
  "dsh-session-title",
  "dsh-session-title-first-prompt-llm",
  "dsh-shell",
+ "dsh-skill",
+ "dsh-skill-filesystem",
  "dsh-spill-local",
  "dsh-spill-policy",
  "dsh-subagent",
@@ -285,15 +290,21 @@ dependencies = [
  "dsh-subprocess",
  "dsh-subprocess-local",
  "dsh-system-prompt",
+ "dsh-timeout-policy",
+ "dsh-token-meter",
  "dsh-tool-bash",
  "dsh-tool-fs",
  "dsh-tool-fs-search",
  "dsh-tool-goal",
+ "dsh-tool-result-pruner",
+ "dsh-tool-skill",
  "dsh-tool-str-replace-editor",
  "dsh-tool-subagent",
+ "dsh-tool-todo",
  "dsh-tool-web",
  "dsh-tool-workflow",
  "dsh-tools",
+ "dsh-user-questions",
  "dsh-web",
  "dsh-web-search-deepseek",
  "dsh-workflow-local",
@@ -411,6 +422,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -460,9 +472,11 @@ dependencies = [
  "dsh-llm",
  "dsh-session",
  "dsh-token-meter",
+ "dsh-tool-result-pruner",
  "futures",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -637,7 +651,17 @@ dependencies = [
 name = "dsh-plan-mode"
 version = "0.1.1-rc.2"
 dependencies = [
+ "async-trait",
+ "dsh-agent",
+ "dsh-commands",
  "dsh-cordis",
+ "dsh-llm",
+ "dsh-session",
+ "dsh-system-prompt",
+ "dsh-tools",
+ "dsh-user-questions",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -856,6 +880,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
  "dsh-skill",
+ "serde_json",
 ]
 
 [[package]]
@@ -971,8 +996,9 @@ dependencies = [
 name = "dsh-timeout-policy"
 version = "0.1.1-rc.2"
 dependencies = [
+ "async-trait",
  "dsh-cordis",
- "dsh-timeout",
+ "dsh-llm",
  "dsh-tools",
  "serde_json",
  "tokio",
@@ -1070,6 +1096,8 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
  "dsh-llm",
+ "dsh-session",
+ "dsh-token-meter",
  "dsh-tools",
  "serde_json",
 ]
@@ -1080,6 +1108,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
  "dsh-cordis",
+ "dsh-llm",
  "dsh-skill",
  "dsh-tools",
  "serde_json",
@@ -1134,7 +1163,9 @@ name = "dsh-tool-todo"
 version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
+ "dsh-agent",
  "dsh-cordis",
+ "dsh-llm",
  "dsh-session",
  "dsh-tools",
  "serde_json",
@@ -1182,6 +1213,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-user-questions"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
  "tokio",
 ]
 
