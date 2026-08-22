@@ -1,0 +1,15 @@
+[package]
+name = "dsh-attachment-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Content-addressed attachment store under DSH_HOME."
+
+[dependencies]
+dsh-attachment.workspace = true
+dsh-cordis.workspace = true
+dsh-home-paths.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true

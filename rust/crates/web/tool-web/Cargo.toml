@@ -1,0 +1,19 @@
+[package]
+name = "dsh-tool-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Model-facing web tools."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-system-prompt.workspace = true
+dsh-tools.workspace = true
+dsh-web.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-llm.workspace = true
+tokio.workspace = true

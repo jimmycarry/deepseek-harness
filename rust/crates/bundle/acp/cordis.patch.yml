@@ -1,0 +1,25 @@
+# The dsh-acp bundle patch: an automation-only ACP stdio server directly over
+# dsh-base. It mounts no Host, HTTP server, Web runtime, or browser plugin.
+# stdout is reserved for ACP JSON-RPC frames; the launcher serves stdin after
+# the tree is up.
+
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
+
+# The shared module-reload HMR row stays off, as in the headless bundle.
+- id: hmr
+  disabled: true
+
+- id: tools
+  config:
+    mode: !!js process.env.DSH_TOOLS_MODE
+
+- insert:
+    # Code Mode is a core execution capability, not a Web component.
+    - id: code-runtime
+      name: '@deepseek-ai/dsh-code-runtime-worker-thread'
+
+    - id: acp
+      name: '@deepseek-ai/dsh-acp'

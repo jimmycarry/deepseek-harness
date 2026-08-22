@@ -1,0 +1,11 @@
+[package]
+name = "dsh-jobs-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local jobs provider."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-jobs.workspace = true

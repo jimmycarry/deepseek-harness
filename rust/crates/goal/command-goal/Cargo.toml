@@ -1,0 +1,18 @@
+[package]
+name = "dsh-command-goal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Human /goal command."
+
+[dependencies]
+async-trait.workspace = true
+dsh-agent.workspace = true
+dsh-commands.workspace = true
+dsh-cordis.workspace = true
+dsh-goal.workspace = true
+dsh-session.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

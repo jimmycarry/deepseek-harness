@@ -1,0 +1,19 @@
+[package]
+name = "dsh-session-query-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SQLite FTS5 provider for ctx.sessionQuery."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-session.workspace = true
+dsh-session-persistence.workspace = true
+dsh-session-query.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "dsh-bundle-headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "dsh-headless patch layer and one-shot runner."
+
+[dependencies]
+dsh-agent.workspace = true
+dsh-agent-loop.workspace = true
+dsh-cordis.workspace = true
+dsh-cordis-loader.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+dsh-session-persistence.workspace = true
+dsh-subagent.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "dsh-system-prompt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Prompt-section and tool-schema assembly (ctx.systemPrompt)."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-llm.workspace = true

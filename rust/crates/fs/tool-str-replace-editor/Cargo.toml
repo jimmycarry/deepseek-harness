@@ -1,0 +1,20 @@
+[package]
+name = "dsh-tool-str-replace-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Model-facing str_replace_editor over ctx.fs."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-fs.workspace = true
+dsh-tools.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-fs-local.workspace = true
+dsh-llm.workspace = true
+dsh-sandbox-local.workspace = true
+tokio.workspace = true
