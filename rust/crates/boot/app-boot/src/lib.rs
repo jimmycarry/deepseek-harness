@@ -1,6 +1,6 @@
 //! Profile and bundle composition. Layers: bundles, profile patch, home, overlay.
 
-use dsh_cordis_loader::{compose_layers, parse_entry_list, Entry, EntryPatch, Loader, LoaderError};
+use dsh_cordis_loader::{compose_layers, parse_patch_list, Entry, EntryPatch, Loader, LoaderError};
 use serde::Deserialize;
 
 /// A named composition stored in the Harness home.
@@ -81,9 +81,9 @@ pub fn dump_config(entries: &[Entry]) -> String {
     Loader::dump_config(entries)
 }
 
-/// Parse a YAML overlay.
-pub fn parse_overlay(yaml: &str) -> Result<Vec<Entry>, LoaderError> {
-    parse_entry_list(yaml)
+/// Parse a YAML overlay patch list.
+pub fn parse_overlay(yaml: &str) -> Result<Vec<EntryPatch>, LoaderError> {
+    parse_patch_list(yaml)
 }
 
 /// Re-export patch apply for dump-config tooling.
@@ -109,5 +109,115 @@ mod tests {
         let dump = dump_config(&entries);
         assert!(dump.contains("id: llm"));
         assert!(dump.contains("id: headless-runner"));
+        assert!(dump.contains("name: '@deepseek-ai/dsh-llm'"));
+        assert!(dump.contains("!!js process.env.DSH_TOOLS_MODE"));
+        assert!(dump.contains("!!js ctx.headlessStartup.task"));
+    }
+
+    /// Row ids `dsh --profile headless --dump-config` must emit, in order.
+    const HEADLESS_IDS: &[&str] = &[
+        "timer",
+        "hmr",
+        "llm",
+        "session",
+        "typert",
+        "typert-loader",
+        "typert-gateway",
+        "session-title",
+        "session-title-llm",
+        "user-questions",
+        "agent",
+        "agent-default-model",
+        "jobs",
+        "llm-retry",
+        "settings",
+        "credentials",
+        "llm-pi-ai",
+        "session-persistence-jsonl",
+        "attachment-local",
+        "session-query-sqlite",
+        "session-projection",
+        "session-telemetry-otel",
+        "subprocess",
+        "sandbox",
+        "sandbox-policy",
+        "bash-sandbox",
+        "pwsh-sandbox",
+        "approval",
+        "permission",
+        "shell-env",
+        "tool-bash",
+        "tool-pwsh",
+        "tool-jobs",
+        "fs-observation-policy",
+        "tool-fs",
+        "tool-fs-search",
+        "agent-instructions",
+        "skill",
+        "skill-filesystem",
+        "skill-badge",
+        "tool-skill",
+        "commands",
+        "command-feedback",
+        "goal",
+        "goal-round-driver",
+        "command-goal",
+        "plan-mode",
+        "token-meter",
+        "compaction-basic",
+        "command-compact",
+        "subagent",
+        "subagent-spawn-in-process",
+        "subagent-fork-in-process",
+        "tool-subagent-control",
+        "tool-subagent-list-agents",
+        "tool-subagent",
+        "tool-subagent-fork",
+        "tool-subagent-report",
+        "workflow-worker-thread",
+        "tool-workflow",
+        "timeout-policy",
+        "spill-local",
+        "spill-policy",
+        "session-checkpoint-policy",
+        "tool-result-pruner",
+        "tool-todo",
+        "tool-goal",
+        "tool-ralph",
+        "tool-str-replace-editor",
+        "repeat-tool-reminder",
+        "web",
+        "web-search-deepseek",
+        "tool-web",
+        "tools",
+        "system-prompt",
+        "agent-loop",
+        "fs-sandbox",
+        "llm-deepseek",
+        "code-runtime",
+        "headless-startup",
+        "headless-runner",
+    ];
+
+    #[test]
+    fn headless_dump_id_sequence_matches_typescript_profile() {
+        let layers = shipped_bundles("headless").unwrap();
+        let entries = compose_profile(&layers, &[], &[], &[]).unwrap();
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.id.as_deref().expect("composed row has id"))
+            .collect();
+        assert_eq!(ids, HEADLESS_IDS);
+        let hmr = entries.iter().find(|entry| entry.id.as_deref() == Some("hmr")).unwrap();
+        assert_eq!(
+            hmr.disabled.as_ref().and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        let runner = entries
+            .iter()
+            .find(|entry| entry.id.as_deref() == Some("headless-runner"))
+            .unwrap();
+        assert_eq!(runner.name, "@deepseek-ai/dsh-headless");
+        assert_eq!(runner.inject, ["headlessStartup"]);
     }
 }

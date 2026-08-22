@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-TypeScript harness 的语义 1:1 移植。`packages/` 下的 TypeScript 树仍是行为真源。本工作区保留插件树、能力 seam 与会话日志约定。
+TypeScript harness 的语义 1:1 移植。`packages/` 下的 TypeScript 树仍是行为真源。本工作区保留插件树、能力 seam 与会话日志约定。组合身份是 TypeScript 行 `id` 加插件 `name`；`dsh --dump-config` 打印这棵组合树。
 
 crate 名为 `dsh-<pkg>`；目录对齐 `packages/<group>/<pkg>/`。
 

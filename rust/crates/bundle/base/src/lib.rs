@@ -1,6 +1,6 @@
-//! dsh-base patch layer.
+//! dsh-base patch layer. The YAML is the TypeScript bundle file.
 
-use dsh_cordis_loader::{parse_entry_list, EntryPatch};
+use dsh_cordis_loader::{parse_patch_list, EntryPatch};
 
 /// Shipped bundle identity.
 pub fn name() -> &'static str {
@@ -12,19 +12,9 @@ pub fn patch_yaml() -> &'static str {
     include_str!("../cordis.patch.yml")
 }
 
-/// Insert patches for every shipped row.
+/// Patches from the shipped file: one root insert of every base row.
 pub fn patches() -> Vec<EntryPatch> {
-    parse_entry_list(patch_yaml())
-        .expect("shipped dsh-base patch")
-        .into_iter()
-        .map(|entry| EntryPatch {
-            id: entry.id,
-            name: Some(entry.name),
-            config: entry.config,
-            disabled: if entry.disabled { Some(true) } else { None },
-            insert: true,
-        })
-        .collect()
+    parse_patch_list(patch_yaml()).expect("shipped dsh-base patch")
 }
 
 #[cfg(test)]
@@ -33,6 +23,12 @@ mod tests {
     fn names_the_role() {
         assert!(!super::name().is_empty());
         assert!(super::patch_yaml().contains("id: llm"));
-        assert!(super::patches().iter().any(|patch| patch.id.as_deref() == Some("llm")));
+        let patches = super::patches();
+        assert_eq!(patches.len(), 1);
+        let inserted = patches[0].insert.as_ref().expect("base is one insert");
+        assert!(inserted.iter().any(|entry| entry.id.as_deref() == Some("llm")));
+        assert!(inserted
+            .iter()
+            .any(|entry| entry.name == "@deepseek-ai/dsh-llm"));
     }
 }
