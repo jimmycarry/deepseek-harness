@@ -236,6 +236,28 @@ impl Service for AgentRegistry {
     const KEY: &'static str = "agents";
 }
 
+/// Default model selection for Agents created without a session-specific model (`ctx.agentDefaultModel`).
+pub struct AgentDefaultModel {
+    /// Registered provider route.
+    pub provider: String,
+    /// Provider-owned model id.
+    pub model: String,
+}
+
+impl AgentDefaultModel {
+    /// Build from the composition entry.
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+impl Service for AgentDefaultModel {
+    const KEY: &'static str = "agentDefaultModel";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

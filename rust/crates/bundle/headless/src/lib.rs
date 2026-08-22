@@ -6,6 +6,7 @@ use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_cordis_loader::{parse_patch_list, EntryPatch};
 use dsh_llm::{ContentBlock, UserMessage};
 use dsh_session::SessionStore;
+use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -86,6 +87,12 @@ pub async fn run(ctx: &Context) -> std::result::Result<(), String> {
     )
     .await
     .map_err(|error| error.to_string())?;
+    if let Some(persistence) = ctx.get::<PersistenceRuntime>() {
+        persistence
+            .save(handle.agent.session().as_ref())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     if let Some(text) = handle.agent.session().last_assistant_text() {
         println!("{text}");
     }

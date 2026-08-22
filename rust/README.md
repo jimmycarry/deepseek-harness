@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-1:1 semantic port of the TypeScript harness. The TypeScript tree under `packages/` remains the behavior source of truth. This workspace preserves the plugin tree, capability seams, and session-log contract. Composition identity is the TypeScript row `id` plus plugin `name`; `dsh --dump-config` prints that composed tree. A task run mounts the same tree; a plugin name without a Rust apply fails loud.
+1:1 semantic port of the TypeScript harness. The TypeScript tree under `packages/` remains the behavior source of truth. This workspace preserves the plugin tree, capability seams, and session-log contract. Composition identity is the TypeScript row `id` plus plugin `name`; `dsh --dump-config` prints that composed tree. A task run mounts the same tree; `!!js` is evaluated only at mount.
 
 Crate names are `dsh-<pkg>`; directories mirror `packages/<group>/<pkg>/`.
 

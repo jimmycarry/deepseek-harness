@@ -3,8 +3,10 @@
 use dsh_cordis_loader::{compose_layers, parse_patch_list, Entry, EntryPatch, Loader, LoaderError};
 use serde::Deserialize;
 
+mod plugins;
 mod registry;
 
+pub use plugins::{ApprovalService, PermissionService, SandboxPolicyService};
 pub use registry::{register_profile_plugins, shipped_plugin_names};
 
 /// A named composition stored in the Harness home.
@@ -96,6 +98,7 @@ pub use dsh_cordis_loader::apply_entry_patches;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dsh_cordis::Context;
 
     #[test]
     fn headless_template_stacks_base_then_runner() {
@@ -223,5 +226,33 @@ mod tests {
             .unwrap();
         assert_eq!(runner.name, "@deepseek-ai/dsh-headless");
         assert_eq!(runner.inject, ["headlessStartup"]);
+    }
+
+    fn replay_overlay(text: &str) -> Vec<EntryPatch> {
+        let mut disable = EntryPatch::replace("llm-deepseek");
+        disable.disabled = Some(serde_json::json!(true));
+        let mut replay = Entry::new("llm-replay", "@deepseek-ai/dsh-llm-replay");
+        replay.config = Some(serde_json::json!({ "text": text }));
+        vec![disable, EntryPatch::insert_row(replay)]
+    }
+
+    #[tokio::test]
+    async fn headless_replay_turn_flushes() {
+        let dir = std::env::temp_dir().join(format!("dsh-wave-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DSH_HOME", &dir);
+        let layers = shipped_bundles("headless").unwrap();
+        let entries = compose_profile(&layers, &[], &[], &replay_overlay("pong")).unwrap();
+        let ctx = Context::new();
+        ctx.provide(std::sync::Arc::new(dsh_bundle_headless::HeadlessStartup {
+            task: "ping".into(),
+        }))
+        .unwrap();
+        let loader = Loader::new();
+        register_profile_plugins(&loader);
+        loader.mount(&ctx, &entries).unwrap();
+        dsh_bundle_headless::run(&ctx).await.unwrap();
+        let sessions = dir.join("sessions");
+        assert!(sessions.exists());
     }
 }

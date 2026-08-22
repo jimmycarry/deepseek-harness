@@ -4,10 +4,10 @@
 //! composition is registered. Rows without a Rust apply fail at mount with the
 //! plugin name; dump-config never mounts and is unaffected.
 
-use dsh_cordis::CordisError;
 use dsh_cordis_loader::Loader;
 use std::collections::BTreeSet;
 
+use crate::plugins::apply_named;
 use crate::{compose_profile, shipped_bundles};
 
 /// Register factories for every plugin name the headless profile composes.
@@ -34,25 +34,7 @@ pub fn shipped_plugin_names() -> BTreeSet<String> {
 
 fn register_one(loader: &Loader, name: &str) {
     let owned = name.to_string();
-    match name {
-        "@deepseek-ai/dsh-headless/startup" => {
-            loader.register(name, |ctx, config| {
-                dsh_bundle_headless::apply_startup(ctx, config)
-            });
-        }
-        "@deepseek-ai/dsh-headless" => {
-            loader.register(name, |ctx, config| {
-                dsh_bundle_headless::apply_runner(ctx, config)
-            });
-        }
-        _ => {
-            loader.register(name, move |_ctx, _config| {
-                Err(CordisError::plugin(format!(
-                    "plugin `{owned}` is not implemented"
-                )))
-            });
-        }
-    }
+    loader.register(name, move |ctx, config| apply_named(&owned, ctx, config));
 }
 
 #[cfg(test)]
@@ -62,16 +44,22 @@ mod tests {
     use dsh_cordis::Context;
 
     #[test]
-    fn headless_mount_names_the_first_unimplemented_plugin() {
+    fn headless_tree_mounts() {
         let loader = Loader::new();
         register_profile_plugins(&loader);
         let entries = compose_profile(&shipped_bundles("headless").unwrap(), &[], &[], &[]).unwrap();
-        let err = loader.mount(&Context::new(), &entries).unwrap_err();
-        let text = err.to_string();
-        assert!(
-            text.contains("@deepseek-ai/cordis-plugin-timer"),
-            "{text}"
-        );
+        let ctx = Context::new();
+        ctx.provide(std::sync::Arc::new(dsh_bundle_headless::HeadlessStartup {
+            task: "ping".into(),
+        }))
+        .unwrap();
+        loader.mount(&ctx, &entries).unwrap();
+        assert!(ctx.has_service("timer"));
+        assert!(ctx.has_service("sessions"));
+        assert!(ctx.has_service("agents"));
+        assert!(ctx.has_service("agentDefaultModel"));
+        assert!(ctx.has_service("llm"));
+        assert!(!ctx.has_service("hmr"));
     }
 
     #[test]

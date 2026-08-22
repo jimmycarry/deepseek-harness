@@ -12,8 +12,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+mod eval;
 mod yaml;
 
+pub use eval::{eval_disabled, eval_js, eval_value, EvalHost};
 pub use yaml::{as_js_expr, js_expr_value, parse_yaml_document};
 
 /// One config row in a `cordis.yml` entry list.
@@ -297,15 +299,28 @@ impl Loader {
 
     /// Mount every enabled entry. Unknown names fail loud.
     pub fn mount(&self, ctx: &Context, entries: &[Entry]) -> std::result::Result<(), LoaderError> {
+        self.mount_with(ctx, entries, &EvalHost::from_process())
+    }
+
+    /// Mount with an explicit `!!js` host (tests and launchers).
+    pub fn mount_with(
+        &self,
+        ctx: &Context,
+        entries: &[Entry],
+        host: &EvalHost,
+    ) -> std::result::Result<(), LoaderError> {
         let factories = self.factories.lock().expect("factories").clone();
         for entry in entries {
-            if entry.is_statically_disabled() {
+            if eval_disabled(entry.disabled.as_ref(), host)? {
                 continue;
             }
             let factory = factories
                 .get(&entry.name)
                 .ok_or_else(|| LoaderError::UnknownPlugin(entry.name.clone()))?;
-            let config = entry.config.clone();
+            let config = match &entry.config {
+                Some(value) => Some(eval_value(value, host)?),
+                None => None,
+            };
             let factory = Arc::clone(factory);
             ctx.plugin(FnPlugin::new("loader-row", move |child| {
                 factory(child, config.clone())
@@ -568,6 +583,20 @@ mod tests {
         let dump = Loader::dump_config(&entries);
         assert!(dump.contains("dsh-ping"));
         assert!(dump.contains("id: ping"));
+    }
+
+    #[test]
+    fn disabled_js_skips_win32_only_row_on_linux() {
+        let loader = Loader::new();
+        loader.register("win-only", |_ctx, _| {
+            panic!("disabled row must not apply");
+        });
+        let mut entry = Entry::new("pwsh", "win-only");
+        entry.disabled = Some(js_expr_value("process.platform !== 'win32'"));
+        let mut host = EvalHost::from_process();
+        host.platform = "linux".into();
+        let ctx = Context::new();
+        loader.mount_with(&ctx, &[entry], &host).unwrap();
     }
 
     #[test]
