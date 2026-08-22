@@ -16,7 +16,7 @@ Status: implemented
 
 能力 seam 必须完整：Service Definition、Service Provider、Consumer。工具 Consumer 只依赖 Definition crate。随部署变化的值是构造时传入的 `Config` 字段；`run` 不隐藏默认值。模型可见内容必须记入日志；压缩用 `surfaceOp: replace` 推进 surface，不删除历史。会话日志保持 `SESSION_FORMAT_VERSION` `0`；SQLite 后端使用单调递增的 `SCHEMA_VERSION` `1`。未知且 required-on-read 的事件类型会拒绝 resume，除非信封带 `ignorable: true`。
 
-组合身份是行 `id` 加上 TypeScript 插件 `name`（`@deepseek-ai/dsh-*` 或 `@deepseek-ai/cordis-plugin-*`），不是 Rust crate 名。`dsh --dump-config` 与 `compose_profile` 对 TypeScript 的 `dsh-base` 再 `dsh-headless` patch 文件共用一次扁平的 `apply_entry_patches`；`!!js` 原文打印、不求值。缺目标 id 或 name 不匹配会拒载。默认驱动在 `dsh-agent-loop`，并且保持为插件。`max-tokens` 在当前 turn 内粘滞。`agent/turn-stopping` 可以 `steer` 再开一步。第一次 `cancel` 的原因获胜。工具 body 的重叠上限是 `ToolRuntimeConfig.max_parallel`；`tools/post-execute` 按模型顺序提交。headless 二进制在跑任务时仍通过 `apply_world` 挂载 sandbox、文件系统、shell 及其工具。斜杠命令由 `ctx.commands` 分派，不进入模型。
+组合身份是行 `id` 加上 TypeScript 插件 `name`（`@deepseek-ai/dsh-*` 或 `@deepseek-ai/cordis-plugin-*`），不是 Rust crate 名。`dsh --dump-config` 与 `compose_profile` 对 TypeScript 的 `dsh-base` 再 `dsh-headless` patch 文件共用一次扁平的 `apply_entry_patches`；`!!js` 原文打印、不求值。缺目标 id 或 name 不匹配会拒载。默认驱动在 `dsh-agent-loop`，并且保持为插件。`max-tokens` 在当前 turn 内粘滞。`agent/turn-stopping` 可以 `steer` 再开一步。第一次 `cancel` 的原因获胜。工具 body 的重叠上限是 `ToolRuntimeConfig.max_parallel`；`tools/post-execute` 按模型顺序提交。跑任务时组合同一棵树、登记每个插件名并挂载。没有 Rust apply 的名字在挂载时失败并点名该插件；dump-config 从不挂载。`apply_world` 留给不经过 profile 树的 crate 测试。斜杠命令由 `ctx.commands` 分派，不进入模型。
 
 ## Alternatives considered
 

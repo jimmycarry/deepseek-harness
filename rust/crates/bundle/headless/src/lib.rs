@@ -1,6 +1,13 @@
-//! dsh-headless patch layer. The YAML is the TypeScript bundle file.
+//! dsh-headless patch layer plus the one-shot startup and runner plugins.
 
+use dsh_agent::AgentRegistry;
+use dsh_agent_loop::run_followup;
+use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_cordis_loader::{parse_patch_list, EntryPatch};
+use dsh_llm::{ContentBlock, UserMessage};
+use dsh_session::SessionStore;
+use serde_json::Value;
+use std::sync::Arc;
 
 /// Shipped bundle identity.
 pub fn name() -> &'static str {
@@ -17,13 +24,83 @@ pub fn patches() -> Vec<EntryPatch> {
     parse_patch_list(patch_yaml()).expect("shipped dsh-headless patch")
 }
 
+/// Task published by `@deepseek-ai/dsh-headless/startup` (`ctx.headlessStartup`).
+pub struct HeadlessStartup {
+    /// Positional task text.
+    pub task: String,
+}
+
+impl Service for HeadlessStartup {
+    const KEY: &'static str = "headlessStartup";
+}
+
+/// Provide `ctx.headlessStartup` from config.task or an already-mounted value.
+pub fn apply_startup(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if ctx.has_service(HeadlessStartup::KEY) {
+        return Ok(());
+    }
+    let task = config
+        .as_ref()
+        .and_then(|value| value.get("task"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CordisError::plugin("headless-startup: a task is required, for example: dsh --profile headless \"run the tests\"")
+        })?;
+    if task.trim().is_empty() {
+        return Err(CordisError::plugin(
+            "headless-startup: a task is required, for example: dsh --profile headless \"run the tests\"",
+        ));
+    }
+    ctx.provide(Arc::new(HeadlessStartup { task }))?;
+    Ok(())
+}
+
+/// Record that the runner row mounted. The launcher drives the turn after the tree is up.
+pub fn apply_runner(_ctx: &Context, _config: Option<Value>) -> Result<()> {
+    Ok(())
+}
+
+/// Create an Agent, drive `task`, print the last assistant text.
+pub async fn run(ctx: &Context) -> std::result::Result<(), String> {
+    let task = ctx
+        .service::<HeadlessStartup>()
+        .map_err(|error| error.to_string())?
+        .task
+        .clone();
+    let session = ctx
+        .service::<SessionStore>()
+        .map_err(|error| error.to_string())?
+        .create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .map_err(|error| error.to_string())?
+        .create(session)
+        .map_err(|error| error.to_string())?;
+    run_followup(
+        handle.agent.as_ref(),
+        UserMessage {
+            content: vec![ContentBlock::text(task)],
+            source: None,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if let Some(text) = handle.agent.session().last_assistant_text() {
+        println!("{text}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn names_the_role() {
-        assert!(!super::name().is_empty());
-        assert!(super::patch_yaml().contains("id: headless-runner"));
-        let patches = super::patches();
+        assert!(!name().is_empty());
+        assert!(patch_yaml().contains("id: headless-runner"));
+        let patches = patches();
         assert!(patches.iter().any(|patch| {
             patch
                 .insert
@@ -34,5 +111,19 @@ mod tests {
             patch.id.as_deref() == Some("hmr")
                 && patch.disabled.as_ref().and_then(|value| value.as_bool()) == Some(true)
         }));
+    }
+
+    #[test]
+    fn startup_requires_a_task() {
+        let ctx = Context::new();
+        let err = apply_startup(&ctx, None).unwrap_err();
+        assert!(err.to_string().contains("task is required"));
+    }
+
+    #[test]
+    fn startup_provides_the_service() {
+        let ctx = Context::new();
+        apply_startup(&ctx, Some(serde_json::json!({"task": "ping"}))).unwrap();
+        assert_eq!(ctx.service::<HeadlessStartup>().unwrap().task, "ping");
     }
 }

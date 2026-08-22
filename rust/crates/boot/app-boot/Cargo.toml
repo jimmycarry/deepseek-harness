@@ -9,5 +9,6 @@ description = "Profile/bundle boot glue."
 [dependencies]
 dsh-bundle-base.workspace = true
 dsh-bundle-headless.workspace = true
+dsh-cordis.workspace = true
 dsh-cordis-loader.workspace = true
 serde.workspace = true

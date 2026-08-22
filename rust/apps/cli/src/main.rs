@@ -1,15 +1,12 @@
-//! `dsh` binary. Product path runs the compiled artifact, not a source hook.
+//! `dsh` binary. Product path composes the profile tree, then mounts it.
 
-use dsh_agent::AgentRegistry;
-use dsh_agent_loop::run_followup;
-use dsh_agent_spine::{apply, apply_replay, apply_world};
-use dsh_app_boot::{compose_profile, dump_config, shipped_bundles};
-use dsh_commands::CommandRegistry;
+use dsh_app_boot::{
+    compose_profile, dump_config, register_profile_plugins, shipped_bundles,
+};
+use dsh_bundle_headless::HeadlessStartup;
 use dsh_cordis::Context;
-use dsh_llm::{ContentBlock, UserMessage};
-use dsh_llm_deepseek::DeepSeekAdapter;
-use dsh_session::SessionStore;
-use dsh_session_persistence_jsonl::write_jsonl;
+use dsh_cordis_loader::{Entry, EntryPatch};
+use serde_json::Value;
 use std::env;
 use std::sync::Arc;
 
@@ -27,60 +24,36 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     let profile = profile_of(&args).unwrap_or("headless");
-    let prompt = positional_prompt(&args).unwrap_or("hello");
+    let task = positional_prompt(&args).ok_or_else(|| {
+        "error: a task is required, for example: dsh --profile headless \"run the tests\""
+            .to_string()
+    })?;
+    let layers = shipped_bundles(profile).map_err(|error| error.to_string())?;
+    let overlay = replay_overlay();
+    let entries = compose_profile(&layers, &[], &[], &overlay).map_err(|error| error.to_string())?;
     let ctx = Context::new();
-    if env::var("DSH_REPLAY_TEXT").is_ok() || env::var("DEEPSEEK_API_KEY").is_err() {
-        let text = env::var("DSH_REPLAY_TEXT").unwrap_or_else(|_| "pong".into());
-        apply_replay(&ctx, &text).map_err(|error| error.to_string())?;
-    } else {
-        let adapter = DeepSeekAdapter::from_env().map_err(|error| error.to_string())?;
-        apply(&ctx, Arc::new(adapter)).map_err(|error| error.to_string())?;
-    }
-    let workspace = env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| ".".into());
-    apply_world(&ctx, workspace).map_err(|error| error.to_string())?;
-    let _ = profile;
-    if let Some(commands) = ctx.get::<CommandRegistry>() {
-        if let Some(result) = commands.dispatch(prompt).await {
-            match result {
-                Ok(text) => {
-                    if !text.is_empty() {
-                        println!("{text}");
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-            return Ok(());
-        }
-    }
-    let session = ctx
-        .service::<SessionStore>()
-        .map_err(|error| error.to_string())?
-        .create_fresh();
-    let handle = ctx
-        .service::<AgentRegistry>()
-        .map_err(|error| error.to_string())?
-        .create(Arc::clone(&session))
-        .map_err(|error| error.to_string())?;
-    run_followup(
-        handle.agent.as_ref(),
-        UserMessage {
-            content: vec![ContentBlock::text(prompt)],
-            source: None,
-        },
-    )
-    .await
+    ctx.provide(Arc::new(HeadlessStartup {
+        task: task.to_string(),
+    }))
     .map_err(|error| error.to_string())?;
-    if let Some(text) = handle.agent.session().last_assistant_text() {
-        println!("{text}");
+    let loader = dsh_cordis_loader::Loader::new();
+    register_profile_plugins(&loader);
+    loader
+        .mount(&ctx, &entries)
+        .map_err(|error| error.to_string())?;
+    dsh_bundle_headless::run(&ctx).await
+}
+
+fn replay_overlay() -> Vec<EntryPatch> {
+    if env::var("DEEPSEEK_API_KEY").is_ok() && env::var("DSH_REPLAY_TEXT").is_err() {
+        return Vec::new();
     }
-    if let Ok(path) = env::var("DSH_SESSION_JSONL") {
-        write_jsonl(&path, handle.agent.session().as_ref())
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    let text = env::var("DSH_REPLAY_TEXT").unwrap_or_else(|_| "pong".into());
+    let mut disable = EntryPatch::replace("llm-deepseek");
+    disable.disabled = Some(Value::Bool(true));
+    let mut replay = Entry::new("llm-replay", "@deepseek-ai/dsh-llm-replay");
+    replay.config = Some(serde_json::json!({ "text": text }));
+    vec![disable, EntryPatch::insert_row(replay)]
 }
 
 fn profile_of(args: &[String]) -> Option<&str> {

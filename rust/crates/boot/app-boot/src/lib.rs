@@ -3,6 +3,10 @@
 use dsh_cordis_loader::{compose_layers, parse_patch_list, Entry, EntryPatch, Loader, LoaderError};
 use serde::Deserialize;
 
+mod registry;
+
+pub use registry::{register_profile_plugins, shipped_plugin_names};
+
 /// A named composition stored in the Harness home.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
