@@ -146,28 +146,36 @@ impl LoopAgent {
             self.session
                 .append(SessionEventData::StepStart { turn, step }, None)
                 .ok();
+            let mut title_from = None;
             for message in &messages {
-                let event = self.session
-                    .append(SessionEventData::UserMessage(message.clone()), Some(SurfaceOp::append()))
+                let event = self
+                    .session
+                    .append(
+                        SessionEventData::UserMessage(message.clone()),
+                        Some(SurfaceOp::append()),
+                    )
                     .ok();
-                if matches!(message.source, MessageSource::User) && !self.titled.load(Ordering::SeqCst)
+                if title_from.is_none()
+                    && matches!(message.source, MessageSource::User)
+                    && !self.titled.load(Ordering::SeqCst)
                 {
-                    if let Some(event) = event {
-                        let title = fallback_title(&user_text(message));
-                        if !title.is_empty() {
-                            self.session
-                                .append(
-                                    SessionEventData::SessionTitle {
-                                        title,
-                                        message_seqs: vec![event.seq],
-                                        source: serde_json::json!({ "kind": "fallback" }),
-                                    },
-                                    None,
-                                )
-                                .ok();
-                            self.titled.store(true, Ordering::SeqCst);
-                        }
-                    }
+                    title_from = event.map(|event| (event.seq, user_text(message)));
+                }
+            }
+            if let Some((seq, text)) = title_from {
+                let title = fallback_title(&text);
+                if !title.is_empty() {
+                    self.session
+                        .append(
+                            SessionEventData::SessionTitle {
+                                title,
+                                message_seqs: vec![seq],
+                                source: serde_json::json!({ "kind": "fallback" }),
+                            },
+                            None,
+                        )
+                        .ok();
+                    self.titled.store(true, Ordering::SeqCst);
                 }
             }
             let step_end = self.step(turn, step).await;

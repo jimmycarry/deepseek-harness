@@ -5,7 +5,7 @@ use dsh_agent_loop::run_followup;
 use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_cordis_loader::{parse_patch_list, EntryPatch};
 use dsh_llm::UserMessage;
-use dsh_session::{append_session_knobs, SessionStore};
+use dsh_session::{append_session_knobs, Session, SessionStore};
 use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
 use std::sync::Arc;
@@ -64,6 +64,15 @@ pub fn apply_runner(_ctx: &Context, _config: Option<Value>) -> Result<()> {
 
 /// Create an Agent, drive `task`, print the last assistant text.
 pub async fn run(ctx: &Context) -> std::result::Result<(), String> {
+    let session = run_session(ctx).await?;
+    if let Some(text) = session.last_assistant_text() {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// Drive the positional task and return the live session after flush.
+pub async fn run_session(ctx: &Context) -> std::result::Result<Arc<Session>, String> {
     let task = ctx
         .service::<HeadlessStartup>()
         .map_err(|error| error.to_string())?
@@ -86,22 +95,16 @@ pub async fn run(ctx: &Context) -> std::result::Result<(), String> {
     };
     append_session_knobs(handle.agent.session().as_ref(), &mode, &mode, policy)
         .map_err(|error| error.to_string())?;
-    run_followup(
-        handle.agent.as_ref(),
-        UserMessage::text(task),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    run_followup(handle.agent.as_ref(), UserMessage::text(task))
+        .await
+        .map_err(|error| error.to_string())?;
     if let Some(persistence) = ctx.get::<PersistenceRuntime>() {
         persistence
             .save(handle.agent.session().as_ref())
             .await
             .map_err(|error| error.to_string())?;
     }
-    if let Some(text) = handle.agent.session().last_assistant_text() {
-        println!("{text}");
-    }
-    Ok(())
+    Ok(handle.agent.session())
 }
 
 #[cfg(test)]

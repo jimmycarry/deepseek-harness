@@ -6,7 +6,7 @@ use dsh_bundle_headless::HeadlessStartup;
 use dsh_cordis::Context;
 use dsh_cordis_loader::{Entry, EntryPatch, Loader};
 use dsh_llm::{FinishReason, StreamChunk};
-use dsh_session::{event_type_name, SessionEventData};
+use dsh_session::{event_type_name, Session, SessionEventData};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ async fn run_profile(task: &str, overlay: Vec<EntryPatch>) -> Vec<Value> {
     let dir = std::env::temp_dir().join(format!(
         "dsh-wave-d-{}-{}",
         std::process::id(),
-        task.len()
+        uuid_stamp()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -46,19 +46,22 @@ async fn run_profile(task: &str, overlay: Vec<EntryPatch>) -> Vec<Value> {
     let loader = Loader::new();
     register_profile_plugins(&loader);
     loader.mount(&ctx, &entries).unwrap();
-    dsh_bundle_headless::run(&ctx).await.unwrap();
-    let sessions = dir.join("sessions");
-    let path = std::fs::read_dir(&sessions)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        .expect("session jsonl");
-    let body = std::fs::read_to_string(path).unwrap();
-    body.lines()
-        .filter(|line| !line.trim().is_empty())
-        .skip(1)
-        .map(|line| serde_json::from_str(line).unwrap())
+    let session = dsh_bundle_headless::run_session(&ctx).await.unwrap();
+    events_of(&session)
+}
+
+fn uuid_stamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn events_of(session: &Session) -> Vec<Value> {
+    session
+        .events()
+        .into_iter()
+        .map(|event| serde_json::to_value(event).expect("session event"))
         .collect()
 }
 
