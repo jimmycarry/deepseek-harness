@@ -1,0 +1,10 @@
+[package]
+name = "dsh-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Process-confinement seam (ctx.sandbox)."
+
+[dependencies]
+dsh-cordis.workspace = true

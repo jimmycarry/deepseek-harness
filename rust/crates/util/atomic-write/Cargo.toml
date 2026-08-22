@@ -1,0 +1,12 @@
+[package]
+name = "dsh-atomic-write"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Atomic file replacement and cross-process writer locks."
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

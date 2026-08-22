@@ -1,0 +1,18 @@
+[package]
+name = "dsh-agent-spine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runnable agent spine composition."
+
+[dependencies]
+dsh-agent.workspace = true
+dsh-agent-loop.workspace = true
+dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-llm-replay.workspace = true
+dsh-session.workspace = true
+dsh-system-prompt.workspace = true
+dsh-tools.workspace = true
+tokio.workspace = true

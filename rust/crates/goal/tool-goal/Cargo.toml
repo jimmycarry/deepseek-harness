@@ -1,0 +1,14 @@
+[package]
+name = "dsh-tool-goal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Model-facing goal tool."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-goal.workspace = true
+dsh-tools.workspace = true
+serde_json.workspace = true

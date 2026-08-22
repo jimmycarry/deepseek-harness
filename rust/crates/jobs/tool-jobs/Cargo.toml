@@ -1,0 +1,14 @@
+[package]
+name = "dsh-tool-jobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Model-facing job_* tools."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-jobs.workspace = true
+dsh-tools.workspace = true
+serde_json.workspace = true

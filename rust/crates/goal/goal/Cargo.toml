@@ -1,0 +1,10 @@
+[package]
+name = "dsh-goal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Goals (ctx.goals)."
+
+[dependencies]
+dsh-cordis.workspace = true

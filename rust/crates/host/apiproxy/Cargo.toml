@@ -1,0 +1,10 @@
+[package]
+name = "dsh-apiproxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "API proxy (ctx.apiProxy)."
+
+[dependencies]
+dsh-cordis.workspace = true

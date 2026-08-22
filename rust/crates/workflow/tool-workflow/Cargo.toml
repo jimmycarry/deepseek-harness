@@ -1,0 +1,14 @@
+[package]
+name = "dsh-tool-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "workflow/ralph tools."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-workflow.workspace = true
+dsh-tools.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "dsh-fs-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local filesystem provider."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-fs.workspace = true
+tokio.workspace = true

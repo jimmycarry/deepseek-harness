@@ -1,0 +1,10 @@
+[package]
+name = "dsh-subagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Subagent registry (ctx.subagents)."
+
+[dependencies]
+dsh-cordis.workspace = true

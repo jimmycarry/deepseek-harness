@@ -1,0 +1,12 @@
+[package]
+name = "dsh-subagent-inprocess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "In-process subagent provider."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-subagent.workspace = true
+dsh-agent.workspace = true

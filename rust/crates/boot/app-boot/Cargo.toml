@@ -1,0 +1,12 @@
+[package]
+name = "dsh-app-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Profile/bundle boot glue."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-cordis-loader.workspace = true
+serde.workspace = true

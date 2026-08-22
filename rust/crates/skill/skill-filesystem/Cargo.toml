@@ -1,0 +1,11 @@
+[package]
+name = "dsh-skill-filesystem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Filesystem skill provider."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-skill.workspace = true

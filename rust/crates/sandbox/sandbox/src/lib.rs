@@ -1,0 +1,31 @@
+//! Process-confinement seam (ctx.sandbox).
+use dsh_cordis::Service;
+
+/// Runtime placeholder for `sandbox`.
+#[derive(Default)]
+pub struct Runtime;
+
+impl Runtime {
+    /// Create the service.
+    pub fn new() -> Self { Self }
+}
+
+impl Service for Runtime {
+    const KEY: &'static str = "sandbox";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsh_cordis::Context;
+    use std::sync::Arc;
+
+    #[test]
+    fn provide_and_dispose() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(Runtime::new())).unwrap();
+        assert!(ctx.has_service("sandbox"));
+        ctx.dispose();
+        assert!(!ctx.has_service("sandbox"));
+    }
+}

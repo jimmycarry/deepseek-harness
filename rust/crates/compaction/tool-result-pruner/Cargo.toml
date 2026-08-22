@@ -1,0 +1,10 @@
+[package]
+name = "dsh-tool-result-pruner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tool-result pruner (ctx.toolResultPruner)."
+
+[dependencies]
+dsh-cordis.workspace = true

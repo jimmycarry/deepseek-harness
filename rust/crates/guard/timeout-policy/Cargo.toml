@@ -1,0 +1,12 @@
+[package]
+name = "dsh-timeout-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "tools/execute deadline enforcer."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-timeout.workspace = true
+dsh-tools.workspace = true

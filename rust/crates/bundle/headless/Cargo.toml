@@ -1,0 +1,11 @@
+[package]
+name = "dsh-bundle-headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "dsh-headless patch layer."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-cordis-loader.workspace = true

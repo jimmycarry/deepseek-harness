@@ -1,0 +1,15 @@
+[package]
+name = "dsh-llm-deepseek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DeepSeek LLM adapter."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-credentials.workspace = true
+dsh-llm.workspace = true
+futures.workspace = true
+serde_json.workspace = true
