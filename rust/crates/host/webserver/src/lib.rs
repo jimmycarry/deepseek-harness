@@ -2,7 +2,7 @@
 
 use dsh_cordis::{Context, Service};
 use dsh_sdk_protocol::JsonRpcRequest;
-use dsh_sdk_server::handle;
+use dsh_sdk_server::HarnessSdkJsonRpcServer;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,17 +11,24 @@ use tokio::net::TcpListener;
 /// `ctx.webServer`.
 pub struct WebServer {
     ctx: Context,
+    server: HarnessSdkJsonRpcServer,
 }
 
 impl WebServer {
     /// Bind to a live spine context.
     pub fn new(ctx: Context) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            server: HarnessSdkJsonRpcServer::new(),
+        }
     }
 
     /// Handle one JSON-RPC request the TS client would POST to `/rpc`.
+    /// HTTP is request/response only: the notifications a stdio transport
+    /// would stream for the same request are dropped here.
     pub async fn rpc(&self, request: JsonRpcRequest) -> Value {
-        serde_json::to_value(handle(&self.ctx, request).await).unwrap_or(Value::Null)
+        let (_notifications, response) = self.server.handle_request(&self.ctx, request).await;
+        serde_json::to_value(response).unwrap_or(Value::Null)
     }
 
     /// Health payload the TS client can GET from `/health`.
@@ -31,7 +38,9 @@ impl WebServer {
 
     /// Serve `/health` and `/rpc` on `addr` until the task is cancelled.
     pub async fn serve(self: Arc<Self>, addr: &str) -> Result<(), String> {
-        let listener = TcpListener::bind(addr).await.map_err(|error| error.to_string())?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|error| error.to_string())?;
         self.serve_listener(listener).await
     }
 
@@ -41,7 +50,9 @@ impl WebServer {
             let server = Arc::clone(&self);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
-                let Ok(n) = stream.read(&mut buf).await else { return };
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let body = if request.starts_with("GET /health") {
                     server.health().to_string()
@@ -85,10 +96,13 @@ mod tests {
             .rpc(JsonRpcRequest::new(
                 1,
                 methods::SESSION_PROMPT,
-                Some(serde_json::json!({"text":"hi"})),
+                Some(serde_json::json!({
+                    "sessionId": "44444444-4444-4444-4444-444444444444",
+                    "contentBlocks": [{ "type": "text", "text": "hi" }],
+                })),
             ))
             .await;
-        assert_eq!(response["result"]["text"], "pong");
+        assert!(response["result"]["messageId"].is_string());
     }
 
     #[tokio::test]

@@ -9,9 +9,15 @@ description = "ACP automation server."
 [dependencies]
 dsh-agent.workspace = true
 dsh-agent-loop.workspace = true
-dsh-agent-spine.workspace = true
 dsh-cordis.workspace = true
 dsh-llm.workspace = true
+dsh-sdk-protocol.workspace = true
 dsh-session.workspace = true
+dsh-session-persistence.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+dsh-agent-spine.workspace = true
 tokio.workspace = true

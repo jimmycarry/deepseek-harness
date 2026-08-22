@@ -21,15 +21,19 @@ pub fn register_profile_plugins(loader: &Loader) {
     register_one(loader, "@deepseek-ai/dsh-llm-replay");
 }
 
-/// Plugin names in the shipped headless composition, plus overlay extras.
+/// Plugin names across every shipped composition, plus overlay extras.
 pub fn shipped_plugin_names() -> BTreeSet<String> {
-    let Ok(layers) = shipped_bundles("headless") else {
-        return BTreeSet::new();
-    };
-    let Ok(entries) = compose_profile(&layers, &[], &[], &[]) else {
-        return BTreeSet::new();
-    };
-    entries.into_iter().map(|entry| entry.name).collect()
+    let mut names = BTreeSet::new();
+    for profile in ["headless", "acp", "jsonrpc"] {
+        let Ok(layers) = shipped_bundles(profile) else {
+            continue;
+        };
+        let Ok(entries) = compose_profile(&layers, &[], &[], &[]) else {
+            continue;
+        };
+        names.extend(entries.into_iter().map(|entry| entry.name));
+    }
+    names
 }
 
 fn register_one(loader: &Loader, name: &str) {

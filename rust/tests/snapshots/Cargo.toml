@@ -8,8 +8,11 @@ description = "Keyless profile-path session log snapshots."
 publish = false
 
 [dependencies]
+dsh-acp.workspace = true
 dsh-app-boot.workspace = true
 dsh-bundle-headless.workspace = true
+dsh-sdk-protocol.workspace = true
+dsh-sdk-server.workspace = true
 dsh-cordis.workspace = true
 dsh-cordis-loader.workspace = true
 dsh-llm.workspace = true

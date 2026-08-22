@@ -91,6 +91,8 @@ members = [
   "crates/boot/app-boot",
   "crates/bundle/base",
   "crates/bundle/headless",
+  "crates/bundle/acp",
+  "crates/bundle/jsonrpc",
   "crates/examples/agent-spine",
   "crates/host/webserver",
   "crates/host/apiproxy",
@@ -209,6 +211,8 @@ dsh-acp = { path = "crates/acp/acp" }
 dsh-app-boot = { path = "crates/boot/app-boot" }
 dsh-bundle-base = { path = "crates/bundle/base" }
 dsh-bundle-headless = { path = "crates/bundle/headless" }
+dsh-bundle-acp = { path = "crates/bundle/acp" }
+dsh-bundle-jsonrpc = { path = "crates/bundle/jsonrpc" }
 dsh-agent-spine = { path = "crates/examples/agent-spine" }
 dsh-webserver = { path = "crates/host/webserver" }
 dsh-apiproxy = { path = "crates/host/apiproxy" }

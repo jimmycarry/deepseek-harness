@@ -117,6 +117,10 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-code-runtime-worker-thread" => provide_marker::<CodeRuntime>(ctx),
         "@deepseek-ai/dsh-headless/startup" => dsh_bundle_headless::apply_startup(ctx, config),
         "@deepseek-ai/dsh-headless" => dsh_bundle_headless::apply_runner(ctx, config),
+        "@deepseek-ai/dsh-acp" => dsh_acp::AcpServer::install(ctx),
+        "@deepseek-ai/dsh-sdk-jsonrpc-server" => {
+            dsh_sdk_server::HarnessSdkJsonRpcServer::install(ctx)
+        }
         _ => Ok(()),
     }
 }

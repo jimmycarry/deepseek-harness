@@ -43,17 +43,33 @@ pub struct BundleLayer {
 
 /// Shipped bundle layers for a named profile.
 ///
-/// `headless` stacks base then the headless runner. Unknown names fail loud.
+/// `headless` stacks base then the headless runner; `acp` and `jsonrpc` stack
+/// base then the respective stdio server. Unknown names fail loud.
 pub fn shipped_bundles(profile: &str) -> Result<Vec<BundleLayer>, LoaderError> {
+    let base = BundleLayer {
+        name: dsh_bundle_base::name().into(),
+        patches: dsh_bundle_base::patches(),
+    };
     match profile {
         "headless" => Ok(vec![
-            BundleLayer {
-                name: dsh_bundle_base::name().into(),
-                patches: dsh_bundle_base::patches(),
-            },
+            base,
             BundleLayer {
                 name: dsh_bundle_headless::name().into(),
                 patches: dsh_bundle_headless::patches(),
+            },
+        ]),
+        "acp" => Ok(vec![
+            base,
+            BundleLayer {
+                name: dsh_bundle_acp::name().into(),
+                patches: dsh_bundle_acp::patches(),
+            },
+        ]),
+        "jsonrpc" => Ok(vec![
+            base,
+            BundleLayer {
+                name: dsh_bundle_jsonrpc::name().into(),
+                patches: dsh_bundle_jsonrpc::patches(),
             },
         ]),
         other => Err(LoaderError::Parse(format!(

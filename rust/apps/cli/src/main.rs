@@ -1,8 +1,6 @@
 //! `dsh` binary. Product path composes the profile tree, then mounts it.
 
-use dsh_app_boot::{
-    compose_profile, dump_config, register_profile_plugins, shipped_bundles,
-};
+use dsh_app_boot::{compose_profile, dump_config, register_profile_plugins, shipped_bundles};
 use dsh_bundle_headless::HeadlessStartup;
 use dsh_cordis::Context;
 use dsh_cordis_loader::{Entry, EntryPatch};
@@ -24,24 +22,36 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     let profile = profile_of(&args).unwrap_or("headless");
-    let task = positional_prompt(&args).ok_or_else(|| {
-        "error: a task is required, for example: dsh --profile headless \"run the tests\""
-            .to_string()
-    })?;
+    // The stdio server profiles take no positional task; they serve stdin.
+    let task = if profile == "acp" || profile == "jsonrpc" {
+        None
+    } else {
+        Some(positional_prompt(&args).ok_or_else(|| {
+            "error: a task is required, for example: dsh --profile headless \"run the tests\""
+                .to_string()
+        })?)
+    };
     let layers = shipped_bundles(profile).map_err(|error| error.to_string())?;
     let overlay = replay_overlay();
-    let entries = compose_profile(&layers, &[], &[], &overlay).map_err(|error| error.to_string())?;
+    let entries =
+        compose_profile(&layers, &[], &[], &overlay).map_err(|error| error.to_string())?;
     let ctx = Context::new();
-    ctx.provide(Arc::new(HeadlessStartup {
-        task: task.to_string(),
-    }))
-    .map_err(|error| error.to_string())?;
+    if let Some(task) = task {
+        ctx.provide(Arc::new(HeadlessStartup {
+            task: task.to_string(),
+        }))
+        .map_err(|error| error.to_string())?;
+    }
     let loader = dsh_cordis_loader::Loader::new();
     register_profile_plugins(&loader);
     loader
         .mount(&ctx, &entries)
         .map_err(|error| error.to_string())?;
-    dsh_bundle_headless::run(&ctx).await
+    match profile {
+        "acp" => dsh_acp::serve_stdio(&ctx).await,
+        "jsonrpc" => dsh_sdk_server::serve_stdio(&ctx).await,
+        _ => dsh_bundle_headless::run(&ctx).await,
+    }
 }
 
 fn replay_overlay() -> Vec<EntryPatch> {
@@ -65,7 +75,7 @@ fn profile_of(args: &[String]) -> Option<&str> {
 fn positional_prompt(args: &[String]) -> Option<&str> {
     args.iter()
         .filter(|arg| !arg.starts_with('-'))
-        .find(|arg| *arg != "headless" && *arg != "web")
+        .find(|arg| *arg != "headless" && *arg != "web" && *arg != "acp" && *arg != "jsonrpc")
         .map(String::as_str)
 }
 

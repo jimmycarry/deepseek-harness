@@ -8,12 +8,15 @@ description = "Profile/bundle boot glue."
 
 [dependencies]
 async-trait.workspace = true
+dsh-acp.workspace = true
 dsh-agent.workspace = true
 dsh-agent-loop.workspace = true
 dsh-bash-local.workspace = true
 dsh-bash-sandbox.workspace = true
+dsh-bundle-acp.workspace = true
 dsh-bundle-base.workspace = true
 dsh-bundle-headless.workspace = true
+dsh-bundle-jsonrpc.workspace = true
 dsh-command-compact.workspace = true
 dsh-command-goal.workspace = true
 dsh-commands.workspace = true
@@ -32,6 +35,7 @@ dsh-llm-replay.workspace = true
 dsh-repeat-tool-reminder.workspace = true
 dsh-sandbox.workspace = true
 dsh-sandbox-local.workspace = true
+dsh-sdk-server.workspace = true
 dsh-attachment-local.workspace = true
 dsh-session.workspace = true
 dsh-session-persistence-jsonl.workspace = true

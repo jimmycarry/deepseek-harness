@@ -11,8 +11,10 @@ name = "dsh"
 path = "src/main.rs"
 
 [dependencies]
+dsh-acp.workspace = true
 dsh-app-boot.workspace = true
 dsh-bundle-headless.workspace = true
+dsh-sdk-server.workspace = true
 dsh-cordis.workspace = true
 dsh-cordis-loader.workspace = true
 serde_json.workspace = true
