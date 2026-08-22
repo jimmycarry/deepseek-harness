@@ -248,7 +248,8 @@ async fn glob_turn_profile_rereads_workspace() {
 
 #[tokio::test]
 async fn str_replace_editor_turn_profile_rereads_file() {
-    let workspace = std::env::temp_dir().join(format!(
+    // `ctx.fs` is confined to the process cwd (the sandbox workspace root).
+    let workspace = std::env::current_dir().unwrap().join("target").join(format!(
         "dsh-wave-e-editor-{}-{}",
         std::process::id(),
         uuid_stamp()
@@ -274,6 +275,17 @@ async fn str_replace_editor_turn_profile_rereads_file() {
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>()
+    );
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("New file created successfully"),
+        "str_replace_editor result: {text}"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-editor");
     let _ = std::fs::remove_dir_all(&workspace);
