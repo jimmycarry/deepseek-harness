@@ -1,16 +1,32 @@
-//! Subagent registry (ctx.subagents).
+//! Subagent registry (`ctx.subagents`).
+
 use dsh_cordis::Service;
+use std::sync::Mutex;
 
-/// Runtime placeholder for `subagents`.
+/// `ctx.subagents`.
 #[derive(Default)]
-pub struct Runtime;
-
-impl Runtime {
-    /// Create the service.
-    pub fn new() -> Self { Self }
+pub struct SubagentRuntime {
+    results: Mutex<Vec<String>>,
 }
 
-impl Service for Runtime {
+impl SubagentRuntime {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one finished child result.
+    pub fn record(&self, result: impl Into<String>) {
+        self.results.lock().expect("subagents").push(result.into());
+    }
+
+    /// Finished child results in record order.
+    pub fn results(&self) -> Vec<String> {
+        self.results.lock().expect("subagents").clone()
+    }
+}
+
+impl Service for SubagentRuntime {
     const KEY: &'static str = "subagents";
 }
 
@@ -21,9 +37,16 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn records_results() {
+        let runtime = SubagentRuntime::new();
+        runtime.record("done");
+        assert_eq!(runtime.results(), vec!["done".to_string()]);
+    }
+
+    #[test]
     fn provide_and_dispose() {
         let ctx = Context::new();
-        ctx.provide(Arc::new(Runtime::new())).unwrap();
+        ctx.provide(Arc::new(SubagentRuntime::new())).unwrap();
         assert!(ctx.has_service("subagents"));
         ctx.dispose();
         assert!(!ctx.has_service("subagents"));

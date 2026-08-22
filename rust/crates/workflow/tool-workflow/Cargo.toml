@@ -12,3 +12,4 @@ dsh-cordis.workspace = true
 dsh-workflow.workspace = true
 dsh-tools.workspace = true
 serde_json.workspace = true
+tokio.workspace = true

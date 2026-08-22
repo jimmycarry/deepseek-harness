@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "JSONL persistence provider."
 
 [dependencies]
+async-trait.workspace = true
 dsh-atomic-write.workspace = true
 dsh-cordis.workspace = true
 dsh-session.workspace = true

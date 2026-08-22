@@ -1,16 +1,43 @@
-//! Web seam (ctx.web).
+//! Web seam (`ctx.web`).
+
+use async_trait::async_trait;
 use dsh_cordis::Service;
+use std::sync::Arc;
+use thiserror::Error;
 
-/// Runtime placeholder for `web`.
-#[derive(Default)]
-pub struct Runtime;
-
-impl Runtime {
-    /// Create the service.
-    pub fn new() -> Self { Self }
+/// Failures from a web fetch.
+#[derive(Debug, Error)]
+pub enum WebError {
+    /// Retrieval or decoding failed.
+    #[error("{0}")]
+    Fetch(String),
 }
 
-impl Service for Runtime {
+/// Provider that retrieves one URL.
+#[async_trait]
+pub trait WebFetcher: Send + Sync {
+    /// Fetch `url` and return the decoded body.
+    async fn fetch(&self, url: &str) -> Result<String, WebError>;
+}
+
+/// `ctx.web`.
+pub struct WebRuntime {
+    fetcher: Arc<dyn WebFetcher>,
+}
+
+impl WebRuntime {
+    /// Wrap a fetch backend.
+    pub fn new(fetcher: Arc<dyn WebFetcher>) -> Self {
+        Self { fetcher }
+    }
+
+    /// Fetch through the registered backend.
+    pub async fn fetch(&self, url: &str) -> Result<String, WebError> {
+        self.fetcher.fetch(url).await
+    }
+}
+
+impl Service for WebRuntime {
     const KEY: &'static str = "web";
 }
 
@@ -18,12 +45,21 @@ impl Service for Runtime {
 mod tests {
     use super::*;
     use dsh_cordis::Context;
-    use std::sync::Arc;
+
+    struct StaticFetcher(&'static str);
+
+    #[async_trait]
+    impl WebFetcher for StaticFetcher {
+        async fn fetch(&self, _url: &str) -> Result<String, WebError> {
+            Ok(self.0.into())
+        }
+    }
 
     #[test]
     fn provide_and_dispose() {
         let ctx = Context::new();
-        ctx.provide(Arc::new(Runtime::new())).unwrap();
+        ctx.provide(Arc::new(WebRuntime::new(Arc::new(StaticFetcher("ok")))))
+            .unwrap();
         assert!(ctx.has_service("web"));
         ctx.dispose();
         assert!(!ctx.has_service("web"));

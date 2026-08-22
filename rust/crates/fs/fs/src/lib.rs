@@ -7,9 +7,12 @@ use thiserror::Error;
 /// Filesystem failures.
 #[derive(Debug, Error)]
 pub enum FsError {
-    /// Path denied or missing.
+    /// Host I/O failure.
     #[error("{0}")]
     Io(String),
+    /// Sandbox policy denied this path.
+    #[error("denied: {0}")]
+    Denied(String),
 }
 
 /// Provider interface.

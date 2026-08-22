@@ -8,3 +8,5 @@ description = "Token measurement (ctx.tokenMeter)."
 
 [dependencies]
 dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true

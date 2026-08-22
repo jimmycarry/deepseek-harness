@@ -8,3 +8,6 @@ description = "API proxy (ctx.apiProxy)."
 
 [dependencies]
 dsh-cordis.workspace = true
+dsh-sdk-protocol.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

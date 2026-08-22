@@ -220,6 +220,99 @@ impl SessionEventData {
     }
 }
 
+/// Wire type name stored on a log event.
+pub fn event_type_name(data: &SessionEventData) -> &str {
+    match data {
+        SessionEventData::TurnStart { .. } => "turn/start",
+        SessionEventData::TurnEnd { .. } => "turn/end",
+        SessionEventData::StepStart { .. } => "step/start",
+        SessionEventData::StepEnd { .. } => "step/end",
+        SessionEventData::UserMessage(_) => "user/message",
+        SessionEventData::AssistantChunk { .. } => "assistant/chunk",
+        SessionEventData::AssistantMessage { .. } => "assistant/message",
+        SessionEventData::ToolCall { .. } => "tool/call",
+        SessionEventData::ToolResult { .. } => "tool/result",
+        SessionEventData::CompactionStart { .. } => "compaction/start",
+        SessionEventData::CompactionSummary { .. } => "compaction/summary",
+        SessionEventData::CompactionEnd { .. } => "compaction/end",
+        SessionEventData::Extension { type_name, .. } => type_name.as_str(),
+    }
+}
+
+/// Event types this build reconstructs without an `ignorable` marker.
+pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
+    "assistant/chunk",
+    "assistant/message",
+    "compaction/end",
+    "compaction/start",
+    "compaction/summary",
+    "step/end",
+    "step/start",
+    "tool/call",
+    "tool/result",
+    "turn/end",
+    "turn/start",
+    "user/message",
+];
+
+/// Whether `type_name` is in [`KNOWN_SESSION_EVENT_TYPES`].
+pub fn is_known_session_event_type(type_name: &str) -> bool {
+    KNOWN_SESSION_EVENT_TYPES.contains(&type_name)
+}
+
+/// Refuse a required-on-read event this build does not know.
+///
+/// Unknown types are accepted only when `ignorable` is true. Silently skipping
+/// a required event would reconstruct a wrong session.
+pub fn refuse_unknown(type_name: &str, ignorable: bool) -> Result<(), SessionError> {
+    if is_known_session_event_type(type_name) || ignorable {
+        Ok(())
+    } else {
+        Err(SessionError::UnknownRequiredEvent(type_name.to_string()))
+    }
+}
+
+/// Decode one logged JSON object, refusing unknown required-on-read types.
+pub fn session_event_from_value(value: Value) -> Result<SessionEvent, SessionError> {
+    let type_name = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ignorable = value
+        .get("ignorable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    refuse_unknown(&type_name, ignorable)?;
+    if !is_known_session_event_type(&type_name) {
+        return Ok(extension_from_value(value, type_name));
+    }
+    serde_json::from_value(value).map_err(|error| {
+        SessionError::UnknownRequiredEvent(format!("malformed {type_name}: {error}"))
+    })
+}
+
+fn extension_from_value(mut value: Value, type_name: String) -> SessionEvent {
+    let seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    let surface_op = value
+        .get("surfaceOp")
+        .and_then(|op| serde_json::from_value(op.clone()).ok());
+    if let Value::Object(map) = &mut value {
+        map.remove("seq");
+        map.remove("surfaceOp");
+        map.remove("ignorable");
+    }
+    SessionEvent {
+        seq,
+        data: SessionEventData::Extension {
+            type_name,
+            data: value,
+        },
+        surface_op,
+        ignorable: true,
+    }
+}
+
 /// Errors from append or fold.
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -232,6 +325,9 @@ pub enum SessionError {
     /// Replace cited a seq that is not on the current surface.
     #[error("replace range is not on the current surface")]
     InvalidReplace,
+    /// Required-on-read event type this build does not know.
+    #[error("unknown required-on-read event type `{0}`")]
+    UnknownRequiredEvent(String),
 }
 
 /// Folded surface: current nodes and how many replacements have landed.
@@ -300,6 +396,43 @@ impl Session {
         data: SessionEventData,
         surface_op: Option<SurfaceOp>,
     ) -> Result<SessionEvent, SessionError> {
+        self.append_inner(data, surface_op, false)
+    }
+
+    /// Append a log-only event that unknown readers may skip.
+    pub fn append_ignorable(&self, data: SessionEventData) -> Result<SessionEvent, SessionError> {
+        self.append_inner(data, None, true)
+    }
+
+    /// Append a previously logged event after refusing unknown required types.
+    pub fn append_logged(&self, event: SessionEvent) -> Result<SessionEvent, SessionError> {
+        refuse_unknown(event_type_name(&event.data), event.ignorable)?;
+        self.append_inner(event.data, event.surface_op, event.ignorable)
+    }
+
+    /// Reconstruct a session by appending each logged event in order.
+    pub fn replay(
+        id: SessionId,
+        events: impl IntoIterator<Item = SessionEvent>,
+    ) -> Result<Self, SessionError> {
+        let session = Self::new(id);
+        for event in events {
+            session.append_logged(event)?;
+        }
+        Ok(session)
+    }
+
+    /// Copy this log into a child session under `child_id`.
+    pub fn fork(&self, child_id: SessionId) -> Result<Self, SessionError> {
+        Self::replay(child_id, self.events())
+    }
+
+    fn append_inner(
+        &self,
+        data: SessionEventData,
+        surface_op: Option<SurfaceOp>,
+        ignorable: bool,
+    ) -> Result<SessionEvent, SessionError> {
         if data.is_surface() && surface_op.is_none() {
             return Err(SessionError::MissingSurfaceOp);
         }
@@ -315,7 +448,7 @@ impl Session {
             seq,
             data,
             surface_op,
-            ignorable: false,
+            ignorable,
         };
         events.push(event.clone());
         Ok(event)
@@ -516,5 +649,39 @@ mod tests {
             _ => panic!("expected user"),
         }
         assert_eq!(session.surface().replace_generation, 1);
+    }
+
+    #[test]
+    fn refuse_unknown_required_event() {
+        let err = refuse_unknown("future/event", false).unwrap_err();
+        assert!(matches!(err, SessionError::UnknownRequiredEvent(name) if name == "future/event"));
+        assert!(refuse_unknown("future/event", true).is_ok());
+        assert!(refuse_unknown("turn/start", false).is_ok());
+    }
+
+    #[test]
+    fn append_logged_replay_and_fork() {
+        let source = Session::new(session_id("src"));
+        source
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let replayed = Session::replay(session_id("replay"), source.events()).unwrap();
+        assert_eq!(replayed.events().len(), 1);
+        let child = source.fork(session_id("child")).unwrap();
+        assert_eq!(child.id().as_str(), "child");
+        assert_eq!(child.events(), source.events());
+        let unknown = SessionEvent {
+            seq: 0,
+            data: SessionEventData::Extension {
+                type_name: "future/event".into(),
+                data: serde_json::json!({}),
+            },
+            surface_op: None,
+            ignorable: false,
+        };
+        let err = Session::new(session_id("bad"))
+            .append_logged(unknown)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::UnknownRequiredEvent(_)));
     }
 }

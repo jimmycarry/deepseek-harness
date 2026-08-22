@@ -10,3 +10,5 @@ description = "tools/execute deadline enforcer."
 dsh-cordis.workspace = true
 dsh-timeout.workspace = true
 dsh-tools.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

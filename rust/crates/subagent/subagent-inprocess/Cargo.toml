@@ -7,6 +7,11 @@ rust-version.workspace = true
 description = "In-process subagent provider."
 
 [dependencies]
-dsh-cordis.workspace = true
-dsh-subagent.workspace = true
 dsh-agent.workspace = true
+dsh-agent-loop.workspace = true
+dsh-agent-spine.workspace = true
+dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+dsh-subagent.workspace = true
+tokio.workspace = true

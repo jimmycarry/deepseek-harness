@@ -7,4 +7,9 @@ rust-version.workspace = true
 description = "Human commands (ctx.commands)."
 
 [dependencies]
+async-trait.workspace = true
+dsh-agent.workspace = true
 dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+tokio.workspace = true

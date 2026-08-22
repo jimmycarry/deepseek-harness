@@ -10,4 +10,8 @@ description = "Local filesystem provider."
 async-trait.workspace = true
 dsh-cordis.workspace = true
 dsh-fs.workspace = true
+dsh-sandbox.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+dsh-sandbox-local.workspace = true

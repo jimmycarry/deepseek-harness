@@ -8,3 +8,6 @@ description = "Tool-result pruner (ctx.toolResultPruner)."
 
 [dependencies]
 dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-tools.workspace = true
+serde_json.workspace = true

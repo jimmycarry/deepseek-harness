@@ -35,6 +35,27 @@ pub struct BundleLayer {
     pub patches: Vec<EntryPatch>,
 }
 
+/// Shipped bundle layers for a named profile.
+///
+/// `headless` stacks base then the headless runner. Unknown names fail loud.
+pub fn shipped_bundles(profile: &str) -> Result<Vec<BundleLayer>, LoaderError> {
+    match profile {
+        "headless" => Ok(vec![
+            BundleLayer {
+                name: dsh_bundle_base::name().into(),
+                patches: dsh_bundle_base::patches(),
+            },
+            BundleLayer {
+                name: dsh_bundle_headless::name().into(),
+                patches: dsh_bundle_headless::patches(),
+            },
+        ]),
+        other => Err(LoaderError::Parse(format!(
+            "unknown shipped profile `{other}`"
+        ))),
+    }
+}
+
 /// Compose an empty list with ordered layers.
 pub fn compose_profile(
     bundles: &[BundleLayer],
@@ -79,5 +100,14 @@ mod tests {
             .find(|profile| profile.name == "headless")
             .unwrap();
         assert_eq!(profile.bundles, ["dsh-base", "dsh-headless"]);
+    }
+
+    #[test]
+    fn dump_config_includes_base_and_headless_ids() {
+        let layers = shipped_bundles("headless").unwrap();
+        let entries = compose_profile(&layers, &[], &[], &[]).unwrap();
+        let dump = dump_config(&entries);
+        assert!(dump.contains("id: llm"));
+        assert!(dump.contains("id: headless-runner"));
     }
 }

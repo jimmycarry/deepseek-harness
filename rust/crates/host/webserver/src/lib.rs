@@ -32,6 +32,10 @@ impl WebServer {
     /// Serve `/health` and `/rpc` on `addr` until the task is cancelled.
     pub async fn serve(self: Arc<Self>, addr: &str) -> Result<(), String> {
         let listener = TcpListener::bind(addr).await.map_err(|error| error.to_string())?;
+        self.serve_listener(listener).await
+    }
+
+    async fn serve_listener(self: Arc<Self>, listener: TcpListener) -> Result<(), String> {
         loop {
             let (mut stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
             let server = Arc::clone(&self);
@@ -55,6 +59,7 @@ impl WebServer {
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
             });
         }
     }
@@ -84,5 +89,29 @@ mod tests {
             ))
             .await;
         assert_eq!(response["result"]["text"], "pong");
+    }
+
+    #[tokio::test]
+    async fn serve_health_over_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Arc::new(WebServer::new(Context::new()));
+        tokio::spawn(async move {
+            let _ = server.serve_listener(listener).await;
+        });
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf);
+        let body = response.split("\r\n\r\n").nth(1).expect("health body");
+        let json: Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(json["ok"], true);
     }
 }

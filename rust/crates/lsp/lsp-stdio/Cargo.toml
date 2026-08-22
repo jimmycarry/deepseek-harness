@@ -9,3 +9,4 @@ description = "Stdio LSP provider."
 [dependencies]
 dsh-cordis.workspace = true
 dsh-lsp.workspace = true
+serde_json.workspace = true

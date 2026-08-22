@@ -8,3 +8,4 @@ description = "Workflow engine (ctx.workflowEngine)."
 
 [dependencies]
 dsh-cordis.workspace = true
+tokio.workspace = true

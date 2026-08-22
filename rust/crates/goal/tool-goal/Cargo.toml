@@ -8,7 +8,10 @@ description = "Model-facing goal tool."
 
 [dependencies]
 async-trait.workspace = true
+dsh-agent.workspace = true
+dsh-commands.workspace = true
 dsh-cordis.workspace = true
 dsh-goal.workspace = true
 dsh-tools.workspace = true
 serde_json.workspace = true
+tokio.workspace = true

@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-22-rust-harness-port.md
+2026-08-22-rust-harness-port.md: 98d1b791ea22b8395b11a9ed62912d7ff928816c
+2026-08-22-rust-harness-port.zh.md: 46c88c5e33d559d69f75768e6c41fc757069dbef

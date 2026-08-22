@@ -84,6 +84,7 @@ impl LoopAgent {
     }
 
     async fn turn(&self, turn: u32) -> Result<bool, AgentError> {
+        self.max_tokens.store(false, Ordering::SeqCst);
         self.session
             .append(SessionEventData::TurnStart { turn }, None)
             .ok();
@@ -139,7 +140,16 @@ impl LoopAgent {
                     .ok();
             }
             let step_end = self.step(turn, step).await;
-            if self.max_tokens.load(Ordering::SeqCst) {
+            if self.cancelled.load(Ordering::SeqCst) {
+                turn_end = Some(TurnEndReason::Aborted {
+                    reason: self
+                        .cancel_reason
+                        .lock()
+                        .expect("cancel")
+                        .clone()
+                        .unwrap_or_else(|| "cancelled".into()),
+                });
+            } else if self.max_tokens.load(Ordering::SeqCst) {
                 turn_end = Some(TurnEndReason::MaxTokens);
             } else if turn_end.is_none() {
                 turn_end = step_end;
@@ -229,6 +239,13 @@ impl LoopAgent {
         let mut assembler = BlockAssembler::default();
         futures::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
+            if let dsh_llm::StreamChunk::Finish {
+                reason: dsh_llm::FinishReason::MaxTokens,
+                ..
+            } = &chunk
+            {
+                self.max_tokens.store(true, Ordering::SeqCst);
+            }
             self.session
                 .append(
                     SessionEventData::AssistantChunk {
@@ -269,10 +286,13 @@ impl LoopAgent {
         }
         let calls = message.tool_calls();
         if calls.is_empty() {
+            if self.max_tokens.load(Ordering::SeqCst) {
+                return Some(TurnEndReason::MaxTokens);
+            }
             return Some(TurnEndReason::Completed);
         }
         if let Some(tools) = self.ctx.get::<ToolRuntime>() {
-            for call in calls {
+            for call in &calls {
                 self.session
                     .append(
                         SessionEventData::ToolCall {
@@ -285,10 +305,19 @@ impl LoopAgent {
                         None,
                     )
                     .ok();
-                let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
-                let outcome = tools
-                    .execute(&self.ctx, &call.name, args)
-                    .await
+            }
+            let scheduled: Vec<(String, serde_json::Value)> = calls
+                .iter()
+                .map(|call| {
+                    let name = call.name.clone();
+                    let args =
+                        serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
+                    (name, args)
+                })
+                .collect();
+            let outcomes = tools.execute_many(&self.ctx, scheduled).await;
+            for (call, outcome) in calls.into_iter().zip(outcomes) {
+                let outcome = outcome
                     .unwrap_or_else(|error| dsh_tools::ToolOutcome::error(error.to_string()));
                 let tool_message = ToolResultMessage {
                     tool_call_id: call_id(call.id.as_str()),
@@ -342,13 +371,9 @@ impl Agent for LoopAgent {
     }
 
     fn cancel(&self, cause: AgentCancelCause) {
-        if self
-            .cancel_reason
-            .lock()
-            .expect("cancel")
-            .replace(cause.kind)
-            .is_none()
-        {
+        let mut slot = self.cancel_reason.lock().expect("cancel");
+        if slot.is_none() {
+            *slot = Some(cause.kind);
             self.cancelled.store(true, Ordering::SeqCst);
         }
     }
@@ -360,6 +385,16 @@ impl Agent for LoopAgent {
             }
             self.idle.notified().await;
         }
+    }
+
+    async fn run_maintenance(&self) -> Result<(), AgentError> {
+        self.set_status(AgentStatus::Maintenance);
+        let _ = self.ctx.serial(
+            "agent/maintenance",
+            serde_json::json!({ "sessionId": self.session.id().as_str() }),
+        );
+        self.set_status(AgentStatus::Idle);
+        Ok(())
     }
 
     async fn run(&self) -> Result<(), AgentError> {
@@ -380,7 +415,9 @@ impl Agent for LoopAgent {
 /// Run one followup to idle. Used by headless and tests.
 pub async fn run_followup(agent: &dyn Agent, message: UserMessage) -> Result<(), AgentError> {
     agent.followup(message);
-    agent.run().await
+    agent.run().await?;
+    agent.when_idle().await;
+    agent.run_maintenance().await
 }
 
 #[cfg(test)]
@@ -487,5 +524,235 @@ mod tests {
             Some("hello")
         );
         assert_eq!(handle.agent.session().derive_messages().len(), 2);
+    }
+
+    struct MaxTokensAdapter;
+
+    #[async_trait]
+    impl LlmAdapter for MaxTokensAdapter {
+        async fn stream(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<futures::stream::BoxStream<'static, StreamChunk>, dsh_llm::LlmError> {
+            Ok(Box::pin(stream::iter([
+                StreamChunk::Text {
+                    text: "cut".into(),
+                },
+                StreamChunk::Finish {
+                    reason: dsh_llm::FinishReason::MaxTokens,
+                    usage: None,
+                },
+            ])))
+        }
+    }
+
+    fn followup_text() -> UserMessage {
+        UserMessage {
+            content: vec![ContentBlock::text("hi")],
+            source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn max_tokens_is_sticky_for_the_turn() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(MaxTokensAdapter))))
+            .unwrap();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        run_followup(handle.agent.as_ref(), followup_text())
+            .await
+            .unwrap();
+        assert!(handle.agent.session().events().iter().any(|event| {
+            matches!(
+                &event.data,
+                SessionEventData::TurnEnd {
+                    reason: TurnEndReason::MaxTokens,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn steer_at_turn_stopping_opens_another_step() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(HelloAdapter))))
+            .unwrap();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+        let id = session.id().clone();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        let steered = std::sync::atomic::AtomicBool::new(false);
+        let lookup = ctx.clone();
+        ctx.on_serial("agent/turn-stopping", move |_| {
+            if steered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            if let Some(agent) = lookup
+                .get::<AgentRegistry>()
+                .and_then(|agents| agents.get(&id))
+            {
+                agent.steer(UserMessage {
+                    content: vec![ContentBlock::text("more")],
+                    source: Some("steer".into()),
+                });
+            }
+            None
+        })
+        .unwrap();
+        run_followup(handle.agent.as_ref(), followup_text())
+            .await
+            .unwrap();
+        let steps = handle
+            .agent
+            .session()
+            .events()
+            .iter()
+            .filter(|event| matches!(event.data, SessionEventData::StepStart { .. }))
+            .count();
+        assert_eq!(steps, 2);
+    }
+
+    struct HoldAdapter {
+        released: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl LlmAdapter for HoldAdapter {
+        async fn stream(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<futures::stream::BoxStream<'static, StreamChunk>, dsh_llm::LlmError> {
+            self.released.notified().await;
+            Ok(Box::pin(stream::iter([StreamChunk::Text {
+                text: "late".into(),
+            }])))
+        }
+    }
+
+    #[tokio::test]
+    async fn first_cancel_reason_wins() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        let released = Arc::new(Notify::new());
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(HoldAdapter {
+            released: Arc::clone(&released),
+        }))))
+        .unwrap();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        let agent = Arc::clone(&handle.agent);
+        let task = tokio::spawn(async move { run_followup(agent.as_ref(), followup_text()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        handle.agent.cancel(AgentCancelCause {
+            kind: "user".into(),
+        });
+        handle.agent.cancel(AgentCancelCause {
+            kind: "disposed".into(),
+        });
+        released.notify_waiters();
+        task.await.unwrap().unwrap();
+        assert!(handle.agent.session().events().iter().any(|event| {
+            matches!(
+                &event.data,
+                SessionEventData::TurnEnd {
+                    reason: TurnEndReason::Aborted { reason },
+                    ..
+                } if reason.as_str() == "user"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn derived_messages_remain_a_prefix_of_the_request() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(HelloAdapter))))
+            .unwrap();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        let seen = Arc::new(Mutex::new(None));
+        let recorded = Arc::clone(&seen);
+        ctx.on_waterfall("agent/request", move |payload, next| {
+            let original: LlmRequest = serde_json::from_value(payload.clone()).unwrap();
+            let mut modified = original.clone();
+            modified.messages.push(dsh_llm::Message::User(UserMessage {
+                content: vec![ContentBlock::text("plugin")],
+                source: Some("plugin".into()),
+            }));
+            *recorded.lock().expect("seen") =
+                Some((original.messages.clone(), modified.messages.clone()));
+            next.call(serde_json::to_value(modified).unwrap())
+        })
+        .unwrap();
+        let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        run_followup(handle.agent.as_ref(), followup_text())
+            .await
+            .unwrap();
+        let (derived, sent) = seen.lock().expect("seen").clone().expect("request");
+        assert!(!derived.is_empty());
+        assert!(sent.starts_with(derived.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn maintenance_serial_runs_after_followup() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(HelloAdapter))))
+            .unwrap();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&hits);
+        ctx.on_serial("agent/maintenance", move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        })
+        .unwrap();
+        let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        run_followup(handle.agent.as_ref(), followup_text())
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -2,10 +2,10 @@
 
 use dsh_agent::AgentRegistry;
 use dsh_agent_loop::run_followup;
-use dsh_agent_spine::{apply, apply_replay};
-use dsh_app_boot::{compose_profile, dump_config, profile_templates, BundleLayer};
+use dsh_agent_spine::{apply, apply_replay, apply_world};
+use dsh_app_boot::{compose_profile, dump_config, shipped_bundles};
+use dsh_commands::CommandRegistry;
 use dsh_cordis::Context;
-use dsh_cordis_loader::{EntryPatch, Loader};
 use dsh_llm::{ContentBlock, UserMessage};
 use dsh_llm_deepseek::DeepSeekAdapter;
 use dsh_session::SessionStore;
@@ -23,7 +23,7 @@ async fn main() {
 
 async fn run(args: Vec<String>) -> Result<(), String> {
     if args.iter().any(|arg| arg == "--dump-config") {
-        print_dump();
+        print_dump(&args)?;
         return Ok(());
     }
     let profile = profile_of(&args).unwrap_or("headless");
@@ -36,7 +36,24 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         let adapter = DeepSeekAdapter::from_env().map_err(|error| error.to_string())?;
         apply(&ctx, Arc::new(adapter)).map_err(|error| error.to_string())?;
     }
+    let workspace = env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".into());
+    apply_world(&ctx, workspace).map_err(|error| error.to_string())?;
     let _ = profile;
+    if let Some(commands) = ctx.get::<CommandRegistry>() {
+        if let Some(result) = commands.dispatch(prompt).await {
+            match result {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        println!("{text}");
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
+    }
     let session = ctx
         .service::<SessionStore>()
         .map_err(|error| error.to_string())?
@@ -79,27 +96,10 @@ fn positional_prompt(args: &[String]) -> Option<&str> {
         .map(String::as_str)
 }
 
-fn print_dump() {
-    let base = BundleLayer {
-        name: "dsh-base".into(),
-        patches: vec![insert("llm", "dsh-llm"), insert("session", "dsh-session")],
-    };
-    let headless = BundleLayer {
-        name: "dsh-headless".into(),
-        patches: vec![insert("runner", "dsh-headless-runner")],
-    };
-    let entries = compose_profile(&[base, headless], &[], &[], &[]).expect("compose");
+fn print_dump(args: &[String]) -> Result<(), String> {
+    let profile = profile_of(args).unwrap_or("headless");
+    let layers = shipped_bundles(profile).map_err(|error| error.to_string())?;
+    let entries = compose_profile(&layers, &[], &[], &[]).map_err(|error| error.to_string())?;
     print!("{}", dump_config(&entries));
-    let _ = Loader::new();
-    let _ = profile_templates();
-}
-
-fn insert(id: &str, name: &str) -> EntryPatch {
-    EntryPatch {
-        id: Some(id.into()),
-        name: Some(name.into()),
-        config: None,
-        disabled: None,
-        insert: true,
-    }
+    Ok(())
 }

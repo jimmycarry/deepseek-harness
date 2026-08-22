@@ -8,3 +8,4 @@ description = "Persistent PTY seam (ctx.terminals)."
 
 [dependencies]
 dsh-cordis.workspace = true
+thiserror.workspace = true

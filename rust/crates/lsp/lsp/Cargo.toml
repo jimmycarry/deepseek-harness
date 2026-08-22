@@ -8,3 +8,4 @@ description = "Language-server seam (ctx.lsp)."
 
 [dependencies]
 dsh-cordis.workspace = true
+serde_json.workspace = true

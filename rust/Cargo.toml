@@ -62,7 +62,11 @@ members = [
   "crates/guard/timeout-policy",
   "crates/session/session-persistence",
   "crates/session/session-persistence-jsonl",
+  "crates/session/session-persistence-sqlite",
   "crates/session/session-projection",
+  "crates/session/session-query",
+  "crates/session/session-storage",
+  "crates/session/session-attachment",
   "crates/interaction/commands",
   "crates/sdk/protocol",
   "crates/sdk/client",
@@ -157,7 +161,11 @@ dsh-tool-workflow = { path = "crates/workflow/tool-workflow" }
 dsh-timeout-policy = { path = "crates/guard/timeout-policy" }
 dsh-session-persistence = { path = "crates/session/session-persistence" }
 dsh-session-persistence-jsonl = { path = "crates/session/session-persistence-jsonl" }
+dsh-session-persistence-sqlite = { path = "crates/session/session-persistence-sqlite" }
 dsh-session-projection = { path = "crates/session/session-projection" }
+dsh-session-query = { path = "crates/session/session-query" }
+dsh-session-storage = { path = "crates/session/session-storage" }
+dsh-session-attachment = { path = "crates/session/session-attachment" }
 dsh-commands = { path = "crates/interaction/commands" }
 dsh-sdk-protocol = { path = "crates/sdk/protocol" }
 dsh-sdk-client = { path = "crates/sdk/client" }

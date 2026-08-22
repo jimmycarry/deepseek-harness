@@ -197,6 +197,14 @@ pub enum StreamChunk {
         /// Raw arguments.
         arguments: String,
     },
+    /// Terminal chunk. Adapters emit usage before this and nothing after.
+    Finish {
+        /// Why the stream ended.
+        reason: FinishReason,
+        /// Token accounting when the adapter reported it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
+    },
 }
 
 /// Token accounting reported by an adapter.
@@ -332,6 +340,7 @@ impl BlockAssembler {
                 name: name.clone(),
                 arguments: arguments.clone(),
             }),
+            StreamChunk::Finish { .. } => {}
         }
     }
 
@@ -376,6 +385,10 @@ mod tests {
             id: call_id("c1"),
             name: "bash".into(),
             arguments: "{}".into(),
+        });
+        assembler.push(&StreamChunk::Finish {
+            reason: FinishReason::Stop,
+            usage: None,
         });
         let message = assembler.finish();
         assert_eq!(message.text(), "hi");

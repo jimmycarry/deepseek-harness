@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "HTTP fetch provider."
 
 [dependencies]
+async-trait.workspace = true
 dsh-cordis.workspace = true
 dsh-web.workspace = true
 tokio.workspace = true

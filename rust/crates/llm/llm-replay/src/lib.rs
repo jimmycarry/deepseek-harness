@@ -14,6 +14,9 @@ pub struct ReplayTurn {
     /// Optional single tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<ReplayToolCall>,
+    /// Terminal finish when the script wants one recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<dsh_llm::FinishReason>,
 }
 
 /// Scripted tool call.
@@ -47,6 +50,7 @@ impl ReplayAdapter {
         Self::new(vec![ReplayTurn {
             text: text.into(),
             tool: None,
+            finish: None,
         }])
     }
 }
@@ -61,6 +65,7 @@ impl LlmAdapter for ReplayAdapter {
         let turn = self.turns.get(index).cloned().unwrap_or(ReplayTurn {
             text: String::new(),
             tool: None,
+            finish: None,
         });
         let mut chunks = Vec::new();
         if !turn.text.is_empty() {
@@ -71,6 +76,12 @@ impl LlmAdapter for ReplayAdapter {
                 id: call_id(tool.id),
                 name: tool.name,
                 arguments: tool.arguments,
+            });
+        }
+        if let Some(reason) = turn.finish {
+            chunks.push(StreamChunk::Finish {
+                reason,
+                usage: None,
             });
         }
         Ok(Box::pin(stream::iter(chunks)))

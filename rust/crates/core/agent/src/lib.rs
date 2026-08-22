@@ -138,6 +138,10 @@ pub trait Agent: Send + Sync {
     async fn when_idle(&self);
     /// Drive until idle (used by the loop implementation).
     async fn run(&self) -> Result<(), AgentError>;
+    /// Run idle-phase maintenance (compaction, title). Default is a no-op.
+    async fn run_maintenance(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
 }
 
 /// Factory registered by the loop.
@@ -220,6 +224,11 @@ impl AgentRegistry {
     /// Look up a live agent.
     pub fn get(&self, id: &SessionId) -> Option<Arc<dyn Agent>> {
         self.live.lock().expect("live").get(id.as_str()).cloned()
+    }
+
+    /// Resume a persisted session under a new live agent.
+    pub fn resume(&self, session: Arc<Session>) -> Result<AgentHandle, AgentError> {
+        self.create(session)
     }
 }
 
