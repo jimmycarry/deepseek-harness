@@ -6,23 +6,61 @@ use dsh_agent_spine::{apply, apply_replay, apply_world};
 use dsh_cordis::Context;
 use dsh_llm::{ContentBlock, UserMessage};
 use dsh_llm_replay::{ReplayAdapter, ReplayToolCall, ReplayTurn};
-use dsh_session::{SessionEventData, SessionStore};
+use dsh_session::{event_type_name, SessionEventData, SessionStore};
 use std::sync::Arc;
 
-fn event_type(data: &SessionEventData) -> String {
-    match data {
-        SessionEventData::TurnStart { .. } => "turn/start".into(),
-        SessionEventData::TurnEnd { .. } => "turn/end".into(),
-        SessionEventData::StepStart { .. } => "step/start".into(),
-        SessionEventData::StepEnd { .. } => "step/end".into(),
-        SessionEventData::UserMessage(_) => "user/message".into(),
-        SessionEventData::AssistantChunk { .. } => "assistant/chunk".into(),
-        SessionEventData::AssistantMessage { .. } => "assistant/message".into(),
-        SessionEventData::ToolCall { .. } => "tool/call".into(),
-        SessionEventData::ToolResult { .. } => "tool/result".into(),
-        other => format!("{other:?}"),
-    }
+fn event_types(session: &dsh_session::Session) -> Vec<String> {
+    session
+        .events()
+        .into_iter()
+        .map(|event| event_type_name(&event.data).to_string())
+        .collect()
 }
+
+const TEXT_TURN_TYPES: &[&str] = &[
+    "agent/inbox/spliced",
+    "turn/start",
+    "agent/inbox/spliced",
+    "step/start",
+    "user/message",
+    "session/title",
+    "request/header",
+    "request/context",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/message",
+    "step/end",
+    "turn/end",
+];
+
+const TOOL_TURN_TYPES: &[&str] = &[
+    "agent/inbox/spliced",
+    "turn/start",
+    "agent/inbox/spliced",
+    "step/start",
+    "user/message",
+    "session/title",
+    "request/header",
+    "request/context",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/message",
+    "tool/call",
+    "tool/result",
+    "step/end",
+    "step/start",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/message",
+    "step/end",
+    "turn/end",
+];
 
 #[tokio::test]
 async fn text_turn_snapshot() {
@@ -32,30 +70,17 @@ async fn text_turn_snapshot() {
     let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
     run_followup(
         handle.agent.as_ref(),
-        UserMessage {
-            content: vec![ContentBlock::text("ping")],
-            source: None,
-        },
+        UserMessage::text("ping"),
     )
     .await
     .unwrap();
-    let types: Vec<String> = handle
-        .agent
-        .session()
-        .events()
-        .into_iter()
-        .map(|event| event_type(&event.data))
-        .collect();
-    let expected = vec![
-        "turn/start",
-        "step/start",
-        "user/message",
-        "assistant/chunk",
-        "assistant/message",
-        "step/end",
-        "turn/end",
-    ];
-    assert_eq!(types, expected);
+    assert_eq!(
+        event_types(handle.agent.session().as_ref()),
+        TEXT_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         handle.agent.session().last_assistant_text().as_deref(),
         Some("pong")
@@ -92,37 +117,16 @@ async fn bash_turn_snapshot() {
     let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
     run_followup(
         handle.agent.as_ref(),
-        UserMessage {
-            content: vec![ContentBlock::text("run echo")],
-            source: None,
-        },
+        UserMessage::text("run echo"),
     )
     .await
     .unwrap();
-    let types: Vec<String> = handle
-        .agent
-        .session()
-        .events()
-        .into_iter()
-        .map(|event| event_type(&event.data))
-        .collect();
     assert_eq!(
-        types,
-        vec![
-            "turn/start",
-            "step/start",
-            "user/message",
-            "assistant/chunk",
-            "assistant/message",
-            "tool/call",
-            "tool/result",
-            "step/end",
-            "step/start",
-            "assistant/chunk",
-            "assistant/message",
-            "step/end",
-            "turn/end",
-        ]
+        event_types(handle.agent.session().as_ref()),
+        TOOL_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         handle.agent.session().last_assistant_text().as_deref(),
@@ -180,37 +184,16 @@ async fn fs_edit_turn_snapshot() {
     let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
     run_followup(
         handle.agent.as_ref(),
-        UserMessage {
-            content: vec![ContentBlock::text("write the note")],
-            source: None,
-        },
+        UserMessage::text("write the note"),
     )
     .await
     .unwrap();
-    let types: Vec<String> = handle
-        .agent
-        .session()
-        .events()
-        .into_iter()
-        .map(|event| event_type(&event.data))
-        .collect();
     assert_eq!(
-        types,
-        vec![
-            "turn/start",
-            "step/start",
-            "user/message",
-            "assistant/chunk",
-            "assistant/message",
-            "tool/call",
-            "tool/result",
-            "step/end",
-            "step/start",
-            "assistant/chunk",
-            "assistant/message",
-            "step/end",
-            "turn/end",
-        ]
+        event_types(handle.agent.session().as_ref()),
+        TOOL_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-agent");
     assert_eq!(

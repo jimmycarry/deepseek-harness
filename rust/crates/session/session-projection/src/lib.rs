@@ -28,7 +28,7 @@ impl Service for SessionProjection {
 mod tests {
     use super::*;
     use dsh_cordis::Context;
-    use dsh_llm::{ContentBlock, UserMessage};
+    use dsh_llm::UserMessage;
     use dsh_session::{session_id, SessionEventData, SurfaceOp};
     use std::sync::Arc;
 
@@ -40,10 +40,7 @@ mod tests {
         let session = Session::new(session_id("s"));
         session
             .append(
-                SessionEventData::UserMessage(UserMessage {
-                    content: vec![ContentBlock::text("hi")],
-                    source: None,
-                }),
+                SessionEventData::UserMessage(UserMessage::text("hi")),
                 Some(SurfaceOp::append()),
             )
             .unwrap();

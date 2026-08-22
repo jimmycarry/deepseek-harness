@@ -3,7 +3,7 @@
 use dsh_agent::AgentRegistry;
 use dsh_agent_loop::run_followup;
 use dsh_cordis::Context;
-use dsh_llm::{ContentBlock, UserMessage};
+use dsh_llm::UserMessage;
 use dsh_sdk_protocol::{methods, JsonRpcRequest, JsonRpcResponse};
 use dsh_session::SessionStore;
 use serde_json::Value;
@@ -37,10 +37,7 @@ pub async fn handle(ctx: &Context, request: JsonRpcRequest) -> JsonRpcResponse {
             };
             let _ = run_followup(
                 handle.agent.as_ref(),
-                UserMessage {
-                    content: vec![ContentBlock::text(text)],
-                    source: None,
-                },
+                UserMessage::text(text),
             )
             .await;
             JsonRpcResponse::result(

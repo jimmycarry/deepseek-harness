@@ -95,6 +95,8 @@ impl Service for CodeRuntime {
 pub struct SandboxPolicyService {
     /// Permission mode (`workspace-write`, `read-only`, `danger-full-access`).
     pub mode: String,
+    /// Workspace root used in the workspace-write snapshot sentence.
+    pub workspace_root: String,
 }
 
 impl Service for SandboxPolicyService {
@@ -112,7 +114,10 @@ impl Service for ApprovalService {
 }
 
 /// `ctx.permission`.
-pub struct PermissionService;
+pub struct PermissionService {
+    /// Active preset name.
+    pub preset: String,
+}
 impl Service for PermissionService {
     const KEY: &'static str = "permission";
 }
@@ -225,9 +230,12 @@ fn apply_sandbox_policy(ctx: &Context, config: Option<Value>) -> Result<()> {
                 .unwrap_or_else(|_| ".".into())
         });
     if !ctx.has_service(SandboxRuntime::KEY) {
-        dsh_sandbox_local::install(ctx, root)?;
+        dsh_sandbox_local::install(ctx, root.clone())?;
     }
-    ctx.provide(Arc::new(SandboxPolicyService { mode }))
+    ctx.provide(Arc::new(SandboxPolicyService {
+        mode,
+        workspace_root: root,
+    }))
 }
 
 fn apply_approval(ctx: &Context, config: Option<Value>) -> Result<()> {
@@ -240,8 +248,38 @@ fn apply_approval(ctx: &Context, config: Option<Value>) -> Result<()> {
     ctx.provide(Arc::new(ApprovalService { policy }))
 }
 
+fn sandbox_policy_text(mode: &str, workspace_root: &str) -> String {
+    match mode {
+        "read-only" => {
+            "Current DSH file policy: read-only. Any available operation enforced by the DSH file sandbox cannot modify files in the standing mode. Do not refuse a required modification from this policy alone: try an available tool normally and follow any denial and escalation guidance it returns."
+                .into()
+        }
+        "danger-full-access" => {
+            "Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations."
+                .into()
+        }
+        _ => format!(
+            "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: {}. Some platform temporary areas may also be writable.",
+            serde_json::to_string(workspace_root).unwrap_or_else(|_| format!("\"{workspace_root}\""))
+        ),
+    }
+}
+
+fn approval_policy_text(policy: &str) -> String {
+    if policy == "never" {
+        "Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`)."
+            .into()
+    } else {
+        String::new()
+    }
+}
+
 fn apply_permission(ctx: &Context, _config: Option<Value>) -> Result<()> {
-    ctx.provide(Arc::new(PermissionService))
+    let preset = ctx
+        .get::<SandboxPolicyService>()
+        .map(|policy| policy.mode.clone())
+        .unwrap_or_else(|| "workspace-write".into());
+    ctx.provide(Arc::new(PermissionService { preset }))
 }
 
 fn apply_shell(ctx: &Context) -> Result<()> {
@@ -292,6 +330,20 @@ fn apply_system_prompt(ctx: &Context, config: Option<Value>) -> Result<()> {
     {
         prompt.set_persona(persona);
     }
+    if let Some(policy) = ctx.get::<SandboxPolicyService>() {
+        prompt.register_context(dsh_system_prompt::PromptContext {
+            name: "sandbox:policy".into(),
+            text: sandbox_policy_text(&policy.mode, &policy.workspace_root),
+            order: 10,
+        });
+    }
+    if let Some(approval) = ctx.get::<ApprovalService>() {
+        prompt.register_context(dsh_system_prompt::PromptContext {
+            name: "approval:policy".into(),
+            text: approval_policy_text(&approval.policy),
+            order: 20,
+        });
+    }
     ctx.provide(Arc::new(prompt))
 }
 
@@ -303,6 +355,14 @@ fn apply_llm_deepseek(ctx: &Context) -> Result<()> {
 }
 
 fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if let Some(turns) = config
+        .as_ref()
+        .and_then(|value| value.get("turns"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<dsh_llm_replay::ReplayTurn>>(value).ok())
+    {
+        return ctx.provide(Arc::new(LlmRuntime::new(Arc::new(ReplayAdapter::new(turns)))));
+    }
     let text = config
         .as_ref()
         .and_then(|value| value.get("text"))

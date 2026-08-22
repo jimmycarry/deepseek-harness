@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use dsh_cordis::Service;
 use dsh_llm::UserMessage;
-use dsh_session::{Session, SessionId};
+use dsh_session::{Session, SessionEventData, SessionId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -15,6 +15,16 @@ pub enum InboxTarget {
     NextTurn,
     /// Continues the current turn at the next step.
     NextStep,
+}
+
+impl InboxTarget {
+    /// Durable splice target name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NextTurn => "next-turn",
+            Self::NextStep => "next-step",
+        }
+    }
 }
 
 /// Live agent status mirrored on `agent/status`.
@@ -60,13 +70,52 @@ pub struct InboxEntry {
 /// Agent-owned pending work.
 #[derive(Default)]
 pub struct Inbox {
+    session: Option<Arc<Session>>,
     next_turn: Mutex<VecDeque<InboxEntry>>,
     next_step: Mutex<VecDeque<InboxEntry>>,
 }
 
 impl Inbox {
+    /// Inbox that records `agent/inbox/spliced` on the owning session.
+    pub fn for_session(session: Arc<Session>) -> Self {
+        Self {
+            session: Some(session),
+            ..Self::default()
+        }
+    }
+
+    fn queue_len(&self, target: InboxTarget) -> usize {
+        match target {
+            InboxTarget::NextTurn => self.next_turn.lock().expect("inbox").len(),
+            InboxTarget::NextStep => self.next_step.lock().expect("inbox").len(),
+        }
+    }
+
+    fn log_splice(
+        &self,
+        target: InboxTarget,
+        start: u64,
+        removed_count: Option<u32>,
+        inserted: Vec<UserMessage>,
+    ) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let _ = session.append(
+            SessionEventData::AgentInboxSpliced {
+                target: target.as_str().into(),
+                start,
+                removed_count,
+                inserted,
+            },
+            None,
+        );
+    }
+
     /// Push one entry.
     pub fn push(&self, entry: InboxEntry) {
+        let start = self.queue_len(entry.target) as u64;
+        self.log_splice(entry.target, start, None, vec![entry.message.clone()]);
         match entry.target {
             InboxTarget::NextTurn => self.next_turn.lock().expect("inbox").push_back(entry),
             InboxTarget::NextStep => self.next_step.lock().expect("inbox").push_back(entry),
@@ -75,6 +124,15 @@ impl Inbox {
 
     /// Claim pending next-step input plus one queued next-turn message.
     pub fn claim(&self, prefer: InboxTarget) -> Vec<UserMessage> {
+        let step_len = self.queue_len(InboxTarget::NextStep);
+        if step_len > 0 {
+            self.log_splice(
+                InboxTarget::NextStep,
+                0,
+                Some(step_len as u32),
+                Vec::new(),
+            );
+        }
         let mut claimed = Vec::new();
         {
             let mut next_step = self.next_step.lock().expect("inbox");
@@ -83,6 +141,9 @@ impl Inbox {
             }
         }
         if prefer == InboxTarget::NextTurn || claimed.is_empty() {
+            if self.queue_len(InboxTarget::NextTurn) > 0 {
+                self.log_splice(InboxTarget::NextTurn, 0, Some(1), Vec::new());
+            }
             if let Some(entry) = self.next_turn.lock().expect("inbox").pop_front() {
                 claimed.push(entry.message);
             }
@@ -268,7 +329,7 @@ mod tests {
         inbox.push(InboxEntry {
             message: UserMessage {
                 content: vec![],
-                source: Some("inject".into()),
+                source: dsh_llm::MessageSource::plugin("inject"),
             },
             target: InboxTarget::NextStep,
             wakeup: false,

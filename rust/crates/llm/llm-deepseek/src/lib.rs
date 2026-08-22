@@ -70,7 +70,7 @@ impl LlmAdapter for DeepSeekAdapter {
                 status: None,
             })
         })?;
-        Ok(Box::pin(stream::iter([StreamChunk::Text { text: content }])))
+        Ok(Box::pin(stream::iter(StreamChunk::text_stream(content))))
     }
 }
 
@@ -237,7 +237,7 @@ fn split_http_body(raw: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_llm::{ContentBlock, LlmCallConfig, UserMessage};
+    use dsh_llm::{LlmCallConfig, UserMessage};
     use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -274,26 +274,21 @@ mod tests {
             base_url: format!("http://{addr}"),
             model: "deepseek-chat".into(),
         };
-        let mut stream = adapter
+        let stream = adapter
             .stream(LlmRequest {
                 config: LlmCallConfig::default(),
                 system: None,
-                messages: vec![Message::User(UserMessage {
-                    content: vec![ContentBlock::text("ping")],
-                    source: None,
-                })],
+                messages: vec![Message::User(UserMessage::text("ping"))],
                 tools: vec![],
                 purpose: None,
             })
             .await
             .unwrap();
-        let chunk = stream.next().await.unwrap();
-        assert_eq!(
+        let chunks: Vec<_> = stream.collect().await;
+        assert!(chunks.iter().any(|chunk| matches!(
             chunk,
-            StreamChunk::Text {
-                text: "pong".into()
-            }
-        );
+            StreamChunk::TextDelta { text, .. } if text == "pong"
+        )));
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /chat/completions HTTP/1.1"));
         assert!(request.contains("Authorization: Bearer test-key"));

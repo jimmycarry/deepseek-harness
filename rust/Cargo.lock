@@ -467,6 +467,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-rust-snapshots"
+version = "0.1.1-rc.2"
+dependencies = [
+ "dsh-app-boot",
+ "dsh-bundle-headless",
+ "dsh-cordis",
+ "dsh-cordis-loader",
+ "dsh-llm",
+ "dsh-session",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dsh-sandbox"
 version = "0.1.1-rc.2"
 dependencies = [

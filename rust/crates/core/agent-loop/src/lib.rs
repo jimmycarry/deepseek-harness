@@ -2,13 +2,13 @@
 
 use async_trait::async_trait;
 use dsh_agent::{
-    Agent, AgentCancelCause, AgentError, AgentFactory, AgentRegistry, AgentStatus, Inbox,
-    InboxEntry, InboxTarget,
+    Agent, AgentCancelCause, AgentDefaultModel, AgentError, AgentFactory, AgentRegistry,
+    AgentStatus, Inbox, InboxEntry, InboxTarget,
 };
 use dsh_cordis::{Context, Service};
 use dsh_llm::{
-    call_id, AssistantMessage, BlockAssembler, LlmRequest, LlmRuntime, ToolResultMessage,
-    UserMessage,
+    call_id, BlockAssembler, LlmCallConfig, LlmRequest, LlmRuntime,
+    MessageSource, ToolResultMessage, UserMessage,
 };
 use dsh_session::{
     Session, SessionEventData, SessionId, SurfaceOp, TurnEndReason,
@@ -56,19 +56,27 @@ struct LoopAgent {
     cancel_reason: Mutex<Option<String>>,
     idle: Notify,
     max_tokens: AtomicBool,
+    titled: AtomicBool,
+    last_context: Mutex<Option<String>>,
+    last_header: Mutex<Option<serde_json::Value>>,
+    last_request_context: Mutex<Option<(String, String)>>,
 }
 
 impl LoopAgent {
     fn new(ctx: Context, session: Arc<Session>) -> Self {
         Self {
             ctx,
+            inbox: Arc::new(Inbox::for_session(Arc::clone(&session))),
             session,
-            inbox: Arc::new(Inbox::default()),
             status: Mutex::new(AgentStatus::Idle),
             cancelled: AtomicBool::new(false),
             cancel_reason: Mutex::new(None),
             idle: Notify::new(),
             max_tokens: AtomicBool::new(false),
+            titled: AtomicBool::new(false),
+            last_context: Mutex::new(None),
+            last_header: Mutex::new(None),
+            last_request_context: Mutex::new(None),
         }
     }
 
@@ -123,6 +131,10 @@ impl LoopAgent {
                     .unwrap_or(claimed),
                 Err(_) => claimed,
             };
+            let mut messages = messages;
+            if let Some(snapshot) = self.runtime_context_message() {
+                messages.push(snapshot);
+            }
             if step == 0 && messages.is_empty() {
                 turn_end = Some(TurnEndReason::Completed);
                 break;
@@ -135,9 +147,28 @@ impl LoopAgent {
                 .append(SessionEventData::StepStart { turn, step }, None)
                 .ok();
             for message in &messages {
-                self.session
+                let event = self.session
                     .append(SessionEventData::UserMessage(message.clone()), Some(SurfaceOp::append()))
                     .ok();
+                if matches!(message.source, MessageSource::User) && !self.titled.load(Ordering::SeqCst)
+                {
+                    if let Some(event) = event {
+                        let title = fallback_title(&user_text(message));
+                        if !title.is_empty() {
+                            self.session
+                                .append(
+                                    SessionEventData::SessionTitle {
+                                        title,
+                                        message_seqs: vec![event.seq],
+                                        source: serde_json::json!({ "kind": "fallback" }),
+                                    },
+                                    None,
+                                )
+                                .ok();
+                            self.titled.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
             }
             let step_end = self.step(turn, step).await;
             if self.cancelled.load(Ordering::SeqCst) {
@@ -189,8 +220,16 @@ impl LoopAgent {
             .map(|prompt| prompt.assemble(tools.clone()))
             .unwrap_or_default();
         let system = render_prompt(&assembly);
+        let config = self
+            .ctx
+            .get::<AgentDefaultModel>()
+            .map(|model| LlmCallConfig {
+                provider: model.provider.clone(),
+                model: model.model.clone(),
+            })
+            .unwrap_or_default();
         let request = LlmRequest {
-            config: dsh_llm::LlmCallConfig::default(),
+            config,
             system: if system.is_empty() { None } else { Some(system) },
             messages: self.session.derive_messages(),
             tools: assembly.tools,
@@ -205,6 +244,7 @@ impl LoopAgent {
             .ok()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or(request);
+        self.log_request(&request);
 
         let Some(llm) = self.ctx.get::<LlmRuntime>() else {
             return Some(TurnEndReason::Error {
@@ -258,32 +298,19 @@ impl LoopAgent {
                 .ok();
             assembler.push(&chunk);
         }
+        let usage = assembler.take_usage();
         let message = assembler.finish();
-        if message.content.is_empty() {
-            self.session
-                .append(
-                    SessionEventData::AssistantMessage {
-                        turn,
-                        step,
-                        message: AssistantMessage::default(),
-                        usage: None,
-                    },
-                    Some(SurfaceOp::append()),
-                )
-                .ok();
-        } else {
-            self.session
-                .append(
-                    SessionEventData::AssistantMessage {
-                        turn,
-                        step,
-                        message: message.clone(),
-                        usage: None,
-                    },
-                    Some(SurfaceOp::append()),
-                )
-                .ok();
-        }
+        self.session
+            .append(
+                SessionEventData::AssistantMessage {
+                    turn,
+                    step,
+                    message: message.clone(),
+                    usage,
+                },
+                Some(SurfaceOp::append()),
+            )
+            .ok();
         let calls = message.tool_calls();
         if calls.is_empty() {
             if self.max_tokens.load(Ordering::SeqCst) {
@@ -339,6 +366,86 @@ impl LoopAgent {
         return None;
       }
     }
+
+    fn runtime_context_message(&self) -> Option<UserMessage> {
+        let prompt = self.ctx.get::<SystemPrompt>()?;
+        let sections = prompt.context_sections();
+        let text = prompt.render_context_snapshot();
+        if text.is_empty() {
+            return None;
+        }
+        let mut last = self.last_context.lock().expect("context");
+        if last.as_deref() == Some(text.as_str()) {
+            return None;
+        }
+        *last = Some(text.clone());
+        Some(UserMessage {
+            content: vec![dsh_llm::ContentBlock::text(text)],
+            source: MessageSource::snapshot("@deepseek-ai/dsh-system-prompt", sections),
+        })
+    }
+
+    fn log_request(&self, request: &LlmRequest) {
+        let header = serde_json::json!({
+            "config": request.config,
+            "system": request.system,
+            "tools": request.tools,
+        });
+        let reason = {
+            let mut last = self.last_header.lock().expect("header");
+            if last.is_none() {
+                *last = Some(header.clone());
+                "initial"
+            } else if last.as_ref() != Some(&header) {
+                *last = Some(header.clone());
+                "change"
+            } else {
+                ""
+            }
+        };
+        if !reason.is_empty() {
+            self.session
+                .append(
+                    SessionEventData::RequestHeader {
+                        header,
+                        reason: reason.into(),
+                    },
+                    None,
+                )
+                .ok();
+        }
+        let key = (request.config.provider.clone(), request.config.model.clone());
+        let mut last = self.last_request_context.lock().expect("request-context");
+        if last.as_ref() != Some(&key) {
+            *last = Some(key.clone());
+            self.session
+                .append(
+                    SessionEventData::RequestContext {
+                        provider: key.0,
+                        model: key.1,
+                        context_window: None,
+                    },
+                    None,
+                )
+                .ok();
+        }
+    }
+}
+
+fn user_text(message: &UserMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            dsh_llm::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn fallback_title(text: &str) -> String {
+    text.split_whitespace().take(5).collect::<Vec<_>>().join(" ")
 }
 
 #[async_trait]
@@ -423,7 +530,7 @@ pub async fn run_followup(agent: &dyn Agent, message: UserMessage) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_llm::{ContentBlock, LlmAdapter, StreamChunk};
+    use dsh_llm::{ContentBlock, LlmAdapter, MessageSource, StreamChunk};
     use dsh_session::SessionStore;
     use futures::stream;
 
@@ -435,9 +542,7 @@ mod tests {
             &self,
             _request: LlmRequest,
         ) -> Result<futures::stream::BoxStream<'static, StreamChunk>, dsh_llm::LlmError> {
-            Ok(Box::pin(stream::iter([StreamChunk::Text {
-                text: "hello".into(),
-            }])))
+            Ok(Box::pin(stream::iter(StreamChunk::text_stream("hello"))))
         }
     }
 
@@ -457,10 +562,7 @@ mod tests {
         let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
         run_followup(
             handle.agent.as_ref(),
-            UserMessage {
-                content: vec![ContentBlock::text("hi")],
-                source: None,
-            },
+            UserMessage::text("hi"),
         )
         .await
         .unwrap();
@@ -512,10 +614,7 @@ mod tests {
         let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
         run_followup(
             handle.agent.as_ref(),
-            UserMessage {
-                content: vec![ContentBlock::text("hi")],
-                source: None,
-            },
+            UserMessage::text("hi"),
         )
         .await
         .unwrap();
@@ -534,23 +633,17 @@ mod tests {
             &self,
             _request: LlmRequest,
         ) -> Result<futures::stream::BoxStream<'static, StreamChunk>, dsh_llm::LlmError> {
-            Ok(Box::pin(stream::iter([
-                StreamChunk::Text {
-                    text: "cut".into(),
-                },
-                StreamChunk::Finish {
-                    reason: dsh_llm::FinishReason::MaxTokens,
-                    usage: None,
-                },
-            ])))
+            let mut chunks = dsh_llm::text_block(0, "cut");
+            chunks.push(StreamChunk::Finish {
+                reason: dsh_llm::FinishReason::MaxTokens,
+                replay_state: None,
+            });
+            Ok(Box::pin(stream::iter(chunks)))
         }
     }
 
     fn followup_text() -> UserMessage {
-        UserMessage {
-            content: vec![ContentBlock::text("hi")],
-            source: None,
-        }
+        UserMessage::text("hi")
     }
 
     #[tokio::test]
@@ -612,7 +705,7 @@ mod tests {
             {
                 agent.steer(UserMessage {
                     content: vec![ContentBlock::text("more")],
-                    source: Some("steer".into()),
+                    source: MessageSource::plugin("steer"),
                 });
             }
             None
@@ -642,9 +735,7 @@ mod tests {
             _request: LlmRequest,
         ) -> Result<futures::stream::BoxStream<'static, StreamChunk>, dsh_llm::LlmError> {
             self.released.notified().await;
-            Ok(Box::pin(stream::iter([StreamChunk::Text {
-                text: "late".into(),
-            }])))
+            Ok(Box::pin(stream::iter(StreamChunk::text_stream("late"))))
         }
     }
 
@@ -706,7 +797,7 @@ mod tests {
             let mut modified = original.clone();
             modified.messages.push(dsh_llm::Message::User(UserMessage {
                 content: vec![ContentBlock::text("plugin")],
-                source: Some("plugin".into()),
+                source: MessageSource::plugin("plugin"),
             }));
             *recorded.lock().expect("seen") =
                 Some((original.messages.clone(), modified.messages.clone()));

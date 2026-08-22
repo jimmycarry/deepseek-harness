@@ -3,7 +3,7 @@
 use dsh_brand::Branded;
 use dsh_cordis::Service;
 use dsh_llm::{AssistantMessage, Message, StreamChunk, TokenUsage, ToolResultMessage, UserMessage};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -50,10 +50,9 @@ pub enum TurnEndReason {
 }
 
 /// How a surface event enters the ordered surface.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SurfaceOp {
-    /// Tail append.
+    /// Tail append. Serialized as the string `"append"`.
     Append,
     /// Replace inclusive surface positions `[start, end]`.
     Replace {
@@ -71,9 +70,44 @@ impl SurfaceOp {
     }
 }
 
-/// Merge-extensible session event.
+impl Serialize for SurfaceOp {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Append => serializer.serialize_str("append"),
+            Self::Replace { start, end } => {
+                #[derive(Serialize)]
+                struct ReplaceOp {
+                    start: u64,
+                    end: u64,
+                }
+                ReplaceOp {
+                    start: *start,
+                    end: *end,
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SurfaceOp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if value.as_str() == Some("append") {
+            return Ok(Self::Append);
+        }
+        let start = value.get("start").and_then(Value::as_u64);
+        let end = value.get("end").and_then(Value::as_u64);
+        match (start, end) {
+            (Some(start), Some(end)) => Ok(Self::Replace { start, end }),
+            _ => Err(serde::de::Error::custom("invalid surfaceOp")),
+        }
+    }
+}
+
+/// Merge-extensible session event. Known members serialize as `{type, data}` like TypeScript.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
+#[serde(tag = "type", content = "data")]
 pub enum SessionEventData {
     /// Opens a turn before the first claim.
     #[serde(rename = "turn/start")]
@@ -156,6 +190,67 @@ pub enum SessionEventData {
         /// Result message.
         message: ToolResultMessage,
     },
+    /// Permission preset selected for this session.
+    #[serde(rename = "permission/preset")]
+    PermissionPreset {
+        /// Preset name (`danger-full-access`, `workspace-write`, `read-only`).
+        preset: String,
+    },
+    /// File-sandbox mode written by the permission preset or an override.
+    #[serde(rename = "sandbox/mode")]
+    SandboxMode {
+        /// Mode name.
+        mode: String,
+    },
+    /// Approval policy written by the permission preset or an override.
+    #[serde(rename = "approval/policy")]
+    ApprovalPolicy {
+        /// Policy name (`ask` or `never`).
+        policy: String,
+    },
+    /// One normalized mutation of an agent's pending-message lists.
+    #[serde(rename = "agent/inbox/spliced")]
+    AgentInboxSpliced {
+        /// Pending list (`next-turn` or `next-step`).
+        target: String,
+        /// Splice start index.
+        start: u64,
+        /// Messages removed at `start`. Omitted when the splice only inserts.
+        #[serde(rename = "removedCount", skip_serializing_if = "Option::is_none")]
+        removed_count: Option<u32>,
+        /// Messages inserted at `start`.
+        inserted: Vec<UserMessage>,
+    },
+    /// Frozen model-request header for one dispatch.
+    #[serde(rename = "request/header")]
+    RequestHeader {
+        /// Effective call config, system prompt, and tools.
+        header: Value,
+        /// `initial`, `resume`, or `change`.
+        reason: String,
+    },
+    /// Provider/model (and optional context window) for the last request.
+    #[serde(rename = "request/context")]
+    RequestContext {
+        /// Provider route.
+        provider: String,
+        /// Model id.
+        model: String,
+        /// Context window in tokens, when the adapter reported one.
+        #[serde(rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+        context_window: Option<u32>,
+    },
+    /// Session title. Fallback writes this before an optional LLM title provider.
+    #[serde(rename = "session/title")]
+    SessionTitle {
+        /// Title text.
+        title: String,
+        /// Surface seqs of the human messages that produced the title.
+        #[serde(rename = "messageSeqs")]
+        message_seqs: Vec<u64>,
+        /// Title source (`fallback`, `user`, or `provider`).
+        source: Value,
+    },
     /// Compaction lock start.
     #[serde(rename = "compaction/start")]
     CompactionStart {
@@ -232,6 +327,13 @@ pub fn event_type_name(data: &SessionEventData) -> &str {
         SessionEventData::AssistantMessage { .. } => "assistant/message",
         SessionEventData::ToolCall { .. } => "tool/call",
         SessionEventData::ToolResult { .. } => "tool/result",
+        SessionEventData::PermissionPreset { .. } => "permission/preset",
+        SessionEventData::SandboxMode { .. } => "sandbox/mode",
+        SessionEventData::ApprovalPolicy { .. } => "approval/policy",
+        SessionEventData::AgentInboxSpliced { .. } => "agent/inbox/spliced",
+        SessionEventData::RequestHeader { .. } => "request/header",
+        SessionEventData::RequestContext { .. } => "request/context",
+        SessionEventData::SessionTitle { .. } => "session/title",
         SessionEventData::CompactionStart { .. } => "compaction/start",
         SessionEventData::CompactionSummary { .. } => "compaction/summary",
         SessionEventData::CompactionEnd { .. } => "compaction/end",
@@ -241,11 +343,18 @@ pub fn event_type_name(data: &SessionEventData) -> &str {
 
 /// Event types this build reconstructs without an `ignorable` marker.
 pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
+    "agent/inbox/spliced",
+    "approval/policy",
     "assistant/chunk",
     "assistant/message",
     "compaction/end",
     "compaction/start",
     "compaction/summary",
+    "permission/preset",
+    "request/context",
+    "request/header",
+    "sandbox/mode",
+    "session/title",
     "step/end",
     "step/start",
     "tool/call",
@@ -579,10 +688,7 @@ mod tests {
         let session = Session::new(session_id("s"));
         let err = session
             .append(
-                SessionEventData::UserMessage(UserMessage {
-                    content: vec![ContentBlock::text("hi")],
-                    source: None,
-                }),
+                SessionEventData::UserMessage(UserMessage::text("hi")),
                 None,
             )
             .unwrap_err();
@@ -611,19 +717,13 @@ mod tests {
         let session = Session::new(session_id("s"));
         let a = session
             .append(
-                SessionEventData::UserMessage(UserMessage {
-                    content: vec![ContentBlock::text("old")],
-                    source: None,
-                }),
+                SessionEventData::UserMessage(UserMessage::text("old")),
                 Some(SurfaceOp::append()),
             )
             .unwrap();
         session
             .append(
-                SessionEventData::UserMessage(UserMessage {
-                    content: vec![ContentBlock::text("keep")],
-                    source: None,
-                }),
+                SessionEventData::UserMessage(UserMessage::text("keep")),
                 Some(SurfaceOp::append()),
             )
             .unwrap();
@@ -631,7 +731,7 @@ mod tests {
             .append(
                 SessionEventData::UserMessage(UserMessage {
                     content: vec![ContentBlock::text("summary")],
-                    source: Some("compaction".into()),
+                    source: dsh_llm::MessageSource::plugin("compaction"),
                 }),
                 Some(SurfaceOp::Replace {
                     start: a.seq,
@@ -684,4 +784,57 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SessionError::UnknownRequiredEvent(_)));
     }
+
+    #[test]
+    fn known_events_serialize_with_data_wrapper() {
+        let session = Session::new(session_id("s"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text("hi")),
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+        let events = session.events();
+        assert_eq!(
+            serde_json::to_value(&events[0]).unwrap(),
+            serde_json::json!({"seq":0,"type":"turn/start","data":{"turn":1}})
+        );
+        assert_eq!(
+            serde_json::to_value(&events[1]).unwrap()["surfaceOp"],
+            serde_json::json!("append")
+        );
+        assert_eq!(
+            serde_json::to_value(&events[1]).unwrap()["data"]["source"],
+            serde_json::json!({"kind":"user"})
+        );
+    }
+}
+
+/// Write the three permission knob events a session starts with.
+pub fn append_session_knobs(
+    session: &Session,
+    preset: impl Into<String>,
+    mode: impl Into<String>,
+    policy: impl Into<String>,
+) -> Result<(), SessionError> {
+    session.append(
+        SessionEventData::PermissionPreset {
+            preset: preset.into(),
+        },
+        None,
+    )?;
+    session.append(
+        SessionEventData::SandboxMode { mode: mode.into() },
+        None,
+    )?;
+    session.append(
+        SessionEventData::ApprovalPolicy {
+            policy: policy.into(),
+        },
+        None,
+    )?;
+    Ok(())
 }

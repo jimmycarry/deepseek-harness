@@ -3,7 +3,7 @@
 use dsh_agent::AgentRegistry;
 use dsh_agent_loop::run_followup;
 use dsh_cordis::Context;
-use dsh_llm::{ContentBlock, UserMessage};
+use dsh_llm::UserMessage;
 use dsh_session::SessionStore;
 use serde_json::Value;
 
@@ -15,10 +15,7 @@ pub async fn prompt(ctx: &Context, text: &str) -> Result<Value, String> {
     let handle = agents.create(session).map_err(|error| error.to_string())?;
     run_followup(
         handle.agent.as_ref(),
-        UserMessage {
-            content: vec![ContentBlock::text(text)],
-            source: None,
-        },
+        UserMessage::text(text),
     )
     .await
     .map_err(|error| error.to_string())?;

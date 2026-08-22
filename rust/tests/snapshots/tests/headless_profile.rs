@@ -1,0 +1,224 @@
+//! Profile-path snapshots: compose + mount + runner, then compare type sequence
+//! and key payloads to the TypeScript headless-profile fixture vocabulary.
+
+use dsh_app_boot::{compose_profile, register_profile_plugins, shipped_bundles};
+use dsh_bundle_headless::HeadlessStartup;
+use dsh_cordis::Context;
+use dsh_cordis_loader::{Entry, EntryPatch, Loader};
+use dsh_llm::{FinishReason, StreamChunk};
+use dsh_session::{event_type_name, SessionEventData};
+use serde_json::Value;
+use std::sync::Arc;
+
+fn replay_text_overlay(text: &str) -> Vec<EntryPatch> {
+    let mut disable = EntryPatch::replace("llm-deepseek");
+    disable.disabled = Some(Value::Bool(true));
+    let mut replay = Entry::new("llm-replay", "@deepseek-ai/dsh-llm-replay");
+    replay.config = Some(serde_json::json!({ "text": text }));
+    vec![disable, EntryPatch::insert_row(replay)]
+}
+
+fn replay_turns_overlay(turns: Value) -> Vec<EntryPatch> {
+    let mut disable = EntryPatch::replace("llm-deepseek");
+    disable.disabled = Some(Value::Bool(true));
+    let mut replay = Entry::new("llm-replay", "@deepseek-ai/dsh-llm-replay");
+    replay.config = Some(serde_json::json!({ "turns": turns }));
+    vec![disable, EntryPatch::insert_row(replay)]
+}
+
+async fn run_profile(task: &str, overlay: Vec<EntryPatch>) -> Vec<Value> {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-d-{}-{}",
+        std::process::id(),
+        task.len()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("DSH_HOME", &dir);
+    std::env::set_var("DSH_PERMISSION_MODE", "danger-full-access");
+    let layers = shipped_bundles("headless").unwrap();
+    let entries = compose_profile(&layers, &[], &[], &overlay).unwrap();
+    let ctx = Context::new();
+    ctx.provide(Arc::new(HeadlessStartup {
+        task: task.into(),
+    }))
+    .unwrap();
+    let loader = Loader::new();
+    register_profile_plugins(&loader);
+    loader.mount(&ctx, &entries).unwrap();
+    dsh_bundle_headless::run(&ctx).await.unwrap();
+    let sessions = dir.join("sessions");
+    let path = std::fs::read_dir(&sessions)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .expect("session jsonl");
+    let body = std::fs::read_to_string(path).unwrap();
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .skip(1)
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn types_of(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| event.get("type").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+const TEXT_TURN_TYPES: &[&str] = &[
+    "permission/preset",
+    "sandbox/mode",
+    "approval/policy",
+    "agent/inbox/spliced",
+    "turn/start",
+    "agent/inbox/spliced",
+    "step/start",
+    "user/message",
+    "user/message",
+    "session/title",
+    "request/header",
+    "request/context",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/message",
+    "step/end",
+    "turn/end",
+];
+
+const BASH_TURN_TYPES: &[&str] = &[
+    "permission/preset",
+    "sandbox/mode",
+    "approval/policy",
+    "agent/inbox/spliced",
+    "turn/start",
+    "agent/inbox/spliced",
+    "step/start",
+    "user/message",
+    "user/message",
+    "session/title",
+    "request/header",
+    "request/context",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/message",
+    "tool/call",
+    "tool/result",
+    "step/end",
+    "step/start",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/chunk",
+    "assistant/message",
+    "step/end",
+    "turn/end",
+];
+
+#[tokio::test]
+async fn text_turn_profile_types_and_payloads() {
+    let events = run_profile("ping the product path", replay_text_overlay("pong")).await;
+    assert_eq!(
+        types_of(&events),
+        TEXT_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(events[0]["data"]["preset"], "danger-full-access");
+    assert_eq!(events[1]["data"]["mode"], "danger-full-access");
+    assert_eq!(events[2]["data"]["policy"], "never");
+    assert_eq!(events[7]["data"]["source"]["kind"], "user");
+    assert_eq!(events[8]["data"]["source"]["kind"], "plugin");
+    assert_eq!(
+        events[8]["data"]["source"]["plugin"],
+        "@deepseek-ai/dsh-system-prompt"
+    );
+    assert_eq!(events[9]["data"]["source"]["kind"], "fallback");
+    assert_eq!(events[9]["data"]["title"], "ping the product path");
+    assert_eq!(events[10]["data"]["reason"], "initial");
+    let chunks: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "assistant/chunk")
+        .filter_map(|event| event["data"]["chunk"]["type"].as_str())
+        .collect();
+    assert_eq!(chunks, ["block-start", "text-delta", "block-end", "finish"]);
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event["type"] == "assistant/chunk"
+                && event["data"]["chunk"]["type"] == "finish")
+            .and_then(|event| event["data"]["chunk"]["reason"]["kind"].as_str()),
+        Some("stop")
+    );
+}
+
+#[tokio::test]
+async fn bash_turn_profile_types_and_payloads() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hello\"}"
+            }
+        },
+        { "text": "done" }
+    ]);
+    let events = run_profile("run echo", replay_turns_overlay(turns)).await;
+    assert_eq!(
+        types_of(&events),
+        BASH_TURN_TYPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    );
+    let finish = events
+        .iter()
+        .find(|event| {
+            event["type"] == "assistant/chunk" && event["data"]["chunk"]["type"] == "finish"
+        })
+        .expect("first finish");
+    let reason: FinishReason =
+        serde_json::from_value(finish["data"]["chunk"]["reason"].clone()).unwrap();
+    assert_eq!(reason, FinishReason::ToolCalls);
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(text.trim(), "hello");
+}
+
+#[test]
+fn typescript_headless_profile_types_are_known() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../examples/headless-agent/tests/snapshots/headless-profile/session.expected.jsonl"
+    );
+    let body = std::fs::read_to_string(path).expect("typescript fixture");
+    let deferred = ["session", "session/title-llm-request"];
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let value: Value = serde_json::from_str(line).unwrap();
+        let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if deferred.contains(&type_name) {
+            continue;
+        }
+        assert!(
+            dsh_session::is_known_session_event_type(type_name),
+            "TypeScript fixture type `{type_name}` is missing from KNOWN_SESSION_EVENT_TYPES"
+        );
+        let _ = event_type_name(&SessionEventData::TurnStart { turn: 1 });
+    }
+    let _ = StreamChunk::text_stream("x");
+}

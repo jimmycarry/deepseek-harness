@@ -80,6 +80,7 @@ members = [
   "crates/host/apiproxy",
   "apps/cli",
   "examples/cordis-smoke",
+  "tests/snapshots",
 ]
 
 [workspace.package]

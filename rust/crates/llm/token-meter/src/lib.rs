@@ -88,7 +88,7 @@ impl Service for TokenMeter {
 mod tests {
     use super::*;
     use dsh_cordis::Context;
-    use dsh_llm::{ContentBlock, UserMessage};
+    use dsh_llm::UserMessage;
     use dsh_session::{session_id, Session, SessionEventData, SurfaceOp};
     use std::sync::Arc;
 
@@ -104,10 +104,7 @@ mod tests {
     #[test]
     fn estimate_messages_uses_chars_per_token() {
         let meter = TokenMeter::new(4);
-        let messages = [Message::User(UserMessage {
-            content: vec![ContentBlock::text("abcd")],
-            source: None,
-        })];
+        let messages = [Message::User(UserMessage::text("abcd"))];
         assert_eq!(
             meter.estimate_messages(&messages),
             1 + BLOCK_OVERHEAD + ROLE_OVERHEAD
@@ -119,10 +116,7 @@ mod tests {
         let session = Session::new(session_id("m"));
         session
             .append(
-                SessionEventData::UserMessage(UserMessage {
-                    content: vec![ContentBlock::text("abcd")],
-                    source: None,
-                }),
+                SessionEventData::UserMessage(UserMessage::text("abcd")),
                 Some(SurfaceOp::append()),
             )
             .unwrap();

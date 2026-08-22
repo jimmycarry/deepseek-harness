@@ -1,7 +1,7 @@
 //! Prompt-section and tool-schema assembly (`ctx.systemPrompt`).
 
 use dsh_cordis::Service;
-use dsh_llm::ToolSchema;
+use dsh_llm::{SnapshotSection, ToolSchema};
 use std::sync::Mutex;
 
 /// One prompt section contributed by a plugin.
@@ -24,10 +24,22 @@ pub struct PromptAssembly {
     pub tools: Vec<ToolSchema>,
 }
 
+/// Dynamic runtime-context contribution materialized as a user-role snapshot.
+#[derive(Debug, Clone)]
+pub struct PromptContext {
+    /// Unique name (`sandbox:policy`, `approval:policy`).
+    pub name: String,
+    /// Model-facing text. Empty text contributes nothing.
+    pub text: String,
+    /// Sort key; lower first.
+    pub order: i32,
+}
+
 /// `ctx.systemPrompt`.
 #[derive(Default)]
 pub struct SystemPrompt {
     sections: Mutex<Vec<PromptSection>>,
+    contexts: Mutex<Vec<PromptContext>>,
     persona: Mutex<String>,
 }
 
@@ -40,6 +52,35 @@ impl SystemPrompt {
     /// Set the persona section (id `persona`).
     pub fn set_persona(&self, text: impl Into<String>) {
         *self.persona.lock().expect("persona") = text.into();
+    }
+
+    /// Register a runtime-context contribution. Later registrations with the same name replace.
+    pub fn register_context(&self, context: PromptContext) {
+        let mut contexts = self.contexts.lock().expect("contexts");
+        if let Some(existing) = contexts.iter_mut().find(|item| item.name == context.name) {
+            *existing = context;
+        } else {
+            contexts.push(context);
+        }
+    }
+
+    /// Named snapshot sections with non-empty text, in order.
+    pub fn context_sections(&self) -> Vec<SnapshotSection> {
+        let mut contexts = self.contexts.lock().expect("contexts").clone();
+        contexts.sort_by_key(|context| context.order);
+        contexts
+            .into_iter()
+            .filter(|context| !context.text.is_empty())
+            .map(|context| SnapshotSection {
+                name: context.name,
+                text: context.text,
+            })
+            .collect()
+    }
+
+    /// Full snapshot text, or empty when no context is active.
+    pub fn render_context_snapshot(&self) -> String {
+        join_context_sections(&self.context_sections())
     }
 
     /// Register a section. Later registrations with the same id replace.
@@ -80,6 +121,22 @@ impl Service for SystemPrompt {
 /// Render an assembly to the system string the loop sends.
 pub fn render_prompt(assembly: &PromptAssembly) -> String {
     assembly.system.clone()
+}
+
+/// Join named snapshot sections with the TypeScript runtime-context prefix.
+pub fn join_context_sections(sections: &[SnapshotSection]) -> String {
+    let body = sections
+        .iter()
+        .map(|section| section.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n{body}"
+        )
+    }
 }
 
 #[cfg(test)]

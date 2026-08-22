@@ -1,7 +1,10 @@
 //! Scripted LLM adapter. Mock only this boundary; keep the rest of the tree real.
 
 use async_trait::async_trait;
-use dsh_llm::{call_id, ContentBlock, LlmAdapter, LlmError, LlmRequest, StreamChunk};
+use dsh_llm::{
+    text_block, tool_block, ContentBlock, FinishReason, LlmAdapter, LlmError, LlmRequest,
+    StreamChunk,
+};
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 
@@ -68,22 +71,24 @@ impl LlmAdapter for ReplayAdapter {
             finish: None,
         });
         let mut chunks = Vec::new();
+        let mut index = 0u32;
         if !turn.text.is_empty() {
-            chunks.push(StreamChunk::Text { text: turn.text });
+            chunks.extend(text_block(index, turn.text));
+            index += 1;
         }
+        let has_tool = turn.tool.is_some();
         if let Some(tool) = turn.tool {
-            chunks.push(StreamChunk::ToolCall {
-                id: call_id(tool.id),
-                name: tool.name,
-                arguments: tool.arguments,
-            });
+            chunks.extend(tool_block(index, tool.id, tool.name, tool.arguments));
         }
-        if let Some(reason) = turn.finish {
-            chunks.push(StreamChunk::Finish {
-                reason,
-                usage: None,
-            });
-        }
+        let reason = turn.finish.unwrap_or(if has_tool {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::Stop
+        });
+        chunks.push(StreamChunk::Finish {
+            reason,
+            replay_state: None,
+        });
         Ok(Box::pin(stream::iter(chunks)))
     }
 }
@@ -108,7 +113,7 @@ mod tests {
     #[tokio::test]
     async fn replays_scripted_text() {
         let adapter = ReplayAdapter::text("pong");
-        let mut stream = adapter
+        let stream = adapter
             .stream(LlmRequest {
                 config: dsh_llm::LlmCallConfig::default(),
                 system: None,
@@ -118,12 +123,24 @@ mod tests {
             })
             .await
             .unwrap();
-        let chunk = stream.next().await.unwrap();
-        assert_eq!(
+        let chunks: Vec<_> = stream.collect().await;
+        assert!(matches!(
+            chunks.first(),
+            Some(StreamChunk::BlockStart {
+                block_type,
+                ..
+            }) if block_type == "text"
+        ));
+        assert!(chunks.iter().any(|chunk| matches!(
             chunk,
-            StreamChunk::Text {
-                text: "pong".into()
-            }
+            StreamChunk::TextDelta { text, .. } if text == "pong"
+        )));
+        assert_eq!(
+            chunks.last(),
+            Some(&StreamChunk::Finish {
+                reason: FinishReason::Stop,
+                replay_state: None,
+            })
         );
     }
 }

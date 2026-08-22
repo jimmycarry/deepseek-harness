@@ -145,7 +145,7 @@ impl BasicCompactionEngine {
             .append(
                 SessionEventData::UserMessage(dsh_llm::UserMessage {
                     content: summary.clone(),
-                    source: Some("compaction".into()),
+                    source: dsh_llm::MessageSource::plugin("compaction"),
                 }),
                 Some(SurfaceOp::Replace { start, end }),
             )
@@ -221,10 +221,7 @@ mod tests {
     fn append_user(session: &Session, text: &str) {
         session
             .append(
-                SessionEventData::UserMessage(dsh_llm::UserMessage {
-                    content: vec![ContentBlock::text(text)],
-                    source: None,
-                }),
+                SessionEventData::UserMessage(dsh_llm::UserMessage::text(text)),
                 Some(SurfaceOp::append()),
             )
             .unwrap();

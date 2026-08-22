@@ -63,7 +63,7 @@ mod tests {
     use super::*;
     use dsh_agent::AgentRegistry;
     use dsh_agent_loop::run_followup;
-    use dsh_llm::{ContentBlock, UserMessage};
+    use dsh_llm::UserMessage;
     use dsh_session::SessionStore;
 
     #[tokio::test]
@@ -74,10 +74,7 @@ mod tests {
         let handle = ctx.service::<AgentRegistry>().unwrap().create(session).unwrap();
         run_followup(
             handle.agent.as_ref(),
-            UserMessage {
-                content: vec![ContentBlock::text("ping")],
-                source: None,
-            },
+            UserMessage::text("ping"),
         )
         .await
         .unwrap();

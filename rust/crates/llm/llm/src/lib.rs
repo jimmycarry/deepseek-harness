@@ -20,7 +20,7 @@ pub fn call_id(value: impl Into<String>) -> CallId {
 }
 
 /// Serializable provider or transport failure facts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmFailure {
     /// Human-readable provider or transport failure.
     pub message: String,
@@ -100,14 +100,93 @@ impl ContentBlock {
     }
 }
 
+/// Named contribution inside a `snapshot` plugin source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotSection {
+    /// Contributing subsystem name.
+    pub name: String,
+    /// Model-facing text for this contribution.
+    pub text: String,
+}
+
+/// Who produced a message. Discriminated by `kind`, same as TypeScript `MessageSource`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind")]
+pub enum MessageSource {
+    /// Human prompt.
+    #[serde(rename = "user")]
+    User,
+    /// Plugin-produced context or steer/inject.
+    #[serde(rename = "plugin")]
+    Plugin {
+        /// Plugin name that produced the message.
+        plugin: String,
+        /// Semantic form (`snapshot`, `notice`, …) when the producer declared one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<String>,
+        /// Snapshot contributions, required when `form` is `snapshot`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sections: Vec<SnapshotSection>,
+    },
+    /// Assistant output from a routed model.
+    #[serde(rename = "model")]
+    Model {
+        /// Provider route.
+        provider: String,
+        /// Model id.
+        model: String,
+    },
+    /// Tool-result provenance.
+    #[serde(rename = "tool")]
+    Tool {
+        /// Matching tool-call id.
+        #[serde(rename = "callId")]
+        call_id: String,
+    },
+}
+
+impl MessageSource {
+    /// Human prompt source.
+    pub fn user() -> Self {
+        Self::User
+    }
+
+    /// Plugin source without a declared form.
+    pub fn plugin(plugin: impl Into<String>) -> Self {
+        Self::Plugin {
+            plugin: plugin.into(),
+            form: None,
+            sections: Vec::new(),
+        }
+    }
+
+    /// Plugin snapshot source with named sections.
+    pub fn snapshot(plugin: impl Into<String>, sections: Vec<SnapshotSection>) -> Self {
+        Self::Plugin {
+            plugin: plugin.into(),
+            form: Some("snapshot".into()),
+            sections,
+        }
+    }
+}
+
 /// User-role message on the model-visible surface.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserMessage {
     /// Message content blocks.
     pub content: Vec<ContentBlock>,
     /// Distinguishes a human prompt from inject/steer sources.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: MessageSource,
+}
+
+impl UserMessage {
+    /// Human text prompt.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![ContentBlock::text(text)],
+            source: MessageSource::User,
+        }
+    }
 }
 
 /// Assembled assistant message for one step.
@@ -174,60 +253,185 @@ pub enum Message {
     Tool(ToolResultMessage),
 }
 
-/// One streamed fragment from an adapter.
+/// One streamed fragment from an adapter. Wire tag is `type`, matching TypeScript `StreamChunk`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum StreamChunk {
+    /// Opens a content block. `index` correlates later deltas and the matching `block-end`.
+    BlockStart {
+        /// Block index in first-seen stream order.
+        index: u32,
+        /// Content-block type (`text`, `reasoning`, `tool-call`).
+        #[serde(rename = "blockType")]
+        block_type: String,
+    },
     /// Incremental visible text.
-    Text {
+    TextDelta {
+        /// Owning block index.
+        index: u32,
         /// Text delta.
         text: String,
     },
     /// Incremental reasoning.
-    Reasoning {
+    ReasoningDelta {
+        /// Owning block index.
+        index: u32,
         /// Reasoning delta.
         text: String,
     },
-    /// A completed tool call in the stream.
-    ToolCall {
-        /// Call id.
+    /// Incremental tool-call arguments. `name` is set on the first delta.
+    ToolCallDelta {
+        /// Owning block index.
+        index: u32,
+        /// Provider-issued call id.
         id: CallId,
-        /// Tool name.
-        name: String,
-        /// Raw arguments.
-        arguments: String,
+        /// Tool name, present on the first delta.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Raw JSON argument fragment.
+        #[serde(rename = "argumentsDelta")]
+        arguments_delta: String,
     },
-    /// Terminal chunk. Adapters emit usage before this and nothing after.
+    /// Closes a block and carries the assembled content.
+    BlockEnd {
+        /// Owning block index.
+        index: u32,
+        /// Assembled block.
+        block: ContentBlock,
+    },
+    /// Token accounting. Adapters emit this before the terminal `finish`.
+    Usage {
+        /// Token counts for this request.
+        usage: TokenUsage,
+    },
+    /// Terminal chunk. Adapters emit nothing afterward.
     Finish {
         /// Why the stream ended.
         reason: FinishReason,
-        /// Token accounting when the adapter reported it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<TokenUsage>,
+        /// Adapter-private replay metadata for a successful response.
+        #[serde(rename = "replayState", default, skip_serializing_if = "Option::is_none")]
+        replay_state: Option<Value>,
     },
 }
 
-/// Token accounting reported by an adapter.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TokenUsage {
-    /// Prompt tokens.
-    #[serde(default)]
-    pub prompt_tokens: u32,
-    /// Completion tokens.
-    #[serde(default)]
-    pub completion_tokens: u32,
+impl StreamChunk {
+    /// One text block plus a `stop` finish. Adapters that only have a complete string use this.
+    pub fn text_stream(text: impl Into<String>) -> Vec<Self> {
+        let text = text.into();
+        let mut chunks = text_block(0, text);
+        chunks.push(Self::Finish {
+            reason: FinishReason::Stop,
+            replay_state: None,
+        });
+        chunks
+    }
+
+    /// One tool-call block plus a `tool-calls` finish.
+    pub fn tool_stream(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Vec<Self> {
+        let mut chunks = tool_block(0, id, name, arguments);
+        chunks.push(Self::Finish {
+            reason: FinishReason::ToolCalls,
+            replay_state: None,
+        });
+        chunks
+    }
 }
 
-/// Why a stream ended.
+/// Start, delta, and end for one text block. The caller appends `usage` / `finish`.
+pub fn text_block(index: u32, text: impl Into<String>) -> Vec<StreamChunk> {
+    let text = text.into();
+    vec![
+        StreamChunk::BlockStart {
+            index,
+            block_type: "text".into(),
+        },
+        StreamChunk::TextDelta {
+            index,
+            text: text.clone(),
+        },
+        StreamChunk::BlockEnd {
+            index,
+            block: ContentBlock::text(text),
+        },
+    ]
+}
+
+/// Start, delta, and end for one tool-call block. The caller appends `usage` / `finish`.
+pub fn tool_block(
+    index: u32,
+    id: impl Into<String>,
+    name: impl Into<String>,
+    arguments: impl Into<String>,
+) -> Vec<StreamChunk> {
+    let id = call_id(id);
+    let name = name.into();
+    let arguments = arguments.into();
+    vec![
+        StreamChunk::BlockStart {
+            index,
+            block_type: "tool-call".into(),
+        },
+        StreamChunk::ToolCallDelta {
+            index,
+            id: id.clone(),
+            name: Some(name.clone()),
+            arguments_delta: arguments.clone(),
+        },
+        StreamChunk::BlockEnd {
+            index,
+            block: ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            },
+        },
+    ]
+}
+
+/// Token accounting reported by an adapter. Counts are disjoint: `input_tokens` is uncached input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TokenUsage {
+    /// Uncached input tokens.
+    #[serde(rename = "inputTokens", default)]
+    pub input_tokens: u32,
+    /// Output tokens.
+    #[serde(rename = "outputTokens", default)]
+    pub output_tokens: u32,
+    /// Cached input tokens read.
+    #[serde(rename = "cacheReadTokens", default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    /// Cached input tokens written.
+    #[serde(rename = "cacheWriteTokens", default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
+    /// Reasoning tokens when the provider reports them separately.
+    #[serde(rename = "reasoningTokens", default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+}
+
+/// Why a stream ended. Wire tag is `kind`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum FinishReason {
     /// Natural stop.
     Stop,
-    /// Token ceiling.
-    MaxTokens,
     /// Tool calls pending.
     ToolCalls,
+    /// Token ceiling.
+    MaxTokens,
+    /// Caller or runtime abort.
+    Aborted {
+        /// Failure facts.
+        failure: LlmFailure,
+    },
+    /// Provider or transport failure.
+    Error {
+        /// Failure facts.
+        failure: LlmFailure,
+    },
 }
 
 /// Tool schema advertised to the model.
@@ -317,50 +521,144 @@ pub trait LlmAdapter: Send + Sync {
     async fn stream(&self, request: LlmRequest) -> Result<BoxStream<'static, StreamChunk>, LlmError>;
 }
 
+/// In-progress block keyed by stream index.
+enum Assembling {
+    Text(String),
+    Reasoning(String),
+    ToolCall {
+        id: Option<CallId>,
+        name: Option<String>,
+        arguments: String,
+    },
+    Done(ContentBlock),
+}
+
 /// Assemble stream chunks into one assistant message.
 #[derive(Default)]
 pub struct BlockAssembler {
-    text: String,
-    reasoning: String,
-    tool_calls: Vec<ToolCallBlock>,
+    blocks: std::collections::BTreeMap<u32, Assembling>,
+    order: Vec<u32>,
+    usage: Option<TokenUsage>,
 }
 
 impl BlockAssembler {
+    fn touch(&mut self, index: u32) {
+        if !self.order.contains(&index) {
+            self.order.push(index);
+        }
+    }
+
     /// Push one chunk.
     pub fn push(&mut self, chunk: &StreamChunk) {
         match chunk {
-            StreamChunk::Text { text } => self.text.push_str(text),
-            StreamChunk::Reasoning { text } => self.reasoning.push_str(text),
-            StreamChunk::ToolCall {
+            StreamChunk::BlockStart { index, block_type } => {
+                self.touch(*index);
+                self.blocks.insert(
+                    *index,
+                    match block_type.as_str() {
+                        "reasoning" => Assembling::Reasoning(String::new()),
+                        "tool-call" => Assembling::ToolCall {
+                            id: None,
+                            name: None,
+                            arguments: String::new(),
+                        },
+                        _ => Assembling::Text(String::new()),
+                    },
+                );
+            }
+            StreamChunk::TextDelta { index, text } => {
+                self.touch(*index);
+                match self.blocks.get_mut(index) {
+                    Some(Assembling::Text(body)) => body.push_str(text),
+                    None => {
+                        self.blocks.insert(*index, Assembling::Text(text.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            StreamChunk::ReasoningDelta { index, text } => {
+                self.touch(*index);
+                match self.blocks.get_mut(index) {
+                    Some(Assembling::Reasoning(body)) => body.push_str(text),
+                    None => {
+                        self.blocks
+                            .insert(*index, Assembling::Reasoning(text.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            StreamChunk::ToolCallDelta {
+                index,
                 id,
                 name,
-                arguments,
-            } => self.tool_calls.push(ToolCallBlock {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-            }),
+                arguments_delta,
+            } => {
+                self.touch(*index);
+                match self.blocks.get_mut(index) {
+                    Some(Assembling::ToolCall {
+                        id: slot_id,
+                        name: slot_name,
+                        arguments,
+                    }) => {
+                        *slot_id = Some(id.clone());
+                        if let Some(name) = name {
+                            *slot_name = Some(name.clone());
+                        }
+                        arguments.push_str(arguments_delta);
+                    }
+                    None => {
+                        self.blocks.insert(
+                            *index,
+                            Assembling::ToolCall {
+                                id: Some(id.clone()),
+                                name: name.clone(),
+                                arguments: arguments_delta.clone(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            StreamChunk::BlockEnd { index, block } => {
+                self.touch(*index);
+                self.blocks.insert(*index, Assembling::Done(block.clone()));
+            }
+            StreamChunk::Usage { usage } => self.usage = Some(usage.clone()),
             StreamChunk::Finish { .. } => {}
         }
+    }
+
+    /// Token usage reported by a `usage` chunk, if any.
+    pub fn take_usage(&mut self) -> Option<TokenUsage> {
+        self.usage.take()
     }
 
     /// Finish the assembled message.
     pub fn finish(self) -> AssistantMessage {
         let mut content = Vec::new();
-        if !self.reasoning.is_empty() {
-            content.push(ContentBlock::Reasoning {
-                text: self.reasoning,
-            });
-        }
-        if !self.text.is_empty() {
-            content.push(ContentBlock::Text { text: self.text });
-        }
-        for call in self.tool_calls {
-            content.push(ContentBlock::ToolCall {
-                id: call.id,
-                name: call.name,
-                arguments: call.arguments,
-            });
+        for index in self.order {
+            let Some(block) = self.blocks.get(&index) else {
+                continue;
+            };
+            match block {
+                Assembling::Done(block) => content.push(block.clone()),
+                Assembling::Text(text) if !text.is_empty() => {
+                    content.push(ContentBlock::Text { text: text.clone() });
+                }
+                Assembling::Reasoning(text) if !text.is_empty() => {
+                    content.push(ContentBlock::Reasoning { text: text.clone() });
+                }
+                Assembling::ToolCall {
+                    id: Some(id),
+                    name: Some(name),
+                    arguments,
+                } => content.push(ContentBlock::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+                _ => {}
+            }
         }
         AssistantMessage { content }
     }
@@ -378,20 +676,44 @@ mod tests {
     #[test]
     fn assembler_joins_text_and_tool_calls() {
         let mut assembler = BlockAssembler::default();
-        assembler.push(&StreamChunk::Text {
-            text: "hi".into(),
-        });
-        assembler.push(&StreamChunk::ToolCall {
-            id: call_id("c1"),
-            name: "bash".into(),
-            arguments: "{}".into(),
-        });
+        for chunk in StreamChunk::text_stream("hi")
+            .into_iter()
+            .filter(|chunk| !matches!(chunk, StreamChunk::Finish { .. }))
+        {
+            assembler.push(&chunk);
+        }
+        for chunk in tool_block(1, "c1", "bash", "{}") {
+            assembler.push(&chunk);
+        }
         assembler.push(&StreamChunk::Finish {
             reason: FinishReason::Stop,
-            usage: None,
+            replay_state: None,
         });
         let message = assembler.finish();
         assert_eq!(message.text(), "hi");
         assert_eq!(message.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn stream_chunk_wire_uses_type_and_finish_kind_object() {
+        let chunk = StreamChunk::Finish {
+            reason: FinishReason::ToolCalls,
+            replay_state: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&chunk).unwrap(),
+            serde_json::json!({"type":"finish","reason":{"kind":"tool-calls"}})
+        );
+        let usage = TokenUsage {
+            input_tokens: 11,
+            output_tokens: 3,
+            cache_read_tokens: Some(2),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({"inputTokens":11,"outputTokens":3,"cacheReadTokens":2})
+        );
     }
 }

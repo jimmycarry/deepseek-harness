@@ -4,7 +4,7 @@ use dsh_agent::AgentRegistry;
 use dsh_agent_loop::run_followup;
 use dsh_agent_spine::apply_replay;
 use dsh_cordis::{Context, CordisError, Result};
-use dsh_llm::{ContentBlock, UserMessage};
+use dsh_llm::UserMessage;
 use dsh_session::SessionStore;
 use dsh_subagent::SubagentRuntime;
 
@@ -23,10 +23,7 @@ pub async fn delegate(
         .map_err(map_agent)?;
     run_followup(
         handle.agent.as_ref(),
-        UserMessage {
-            content: vec![ContentBlock::text(prompt)],
-            source: None,
-        },
+        UserMessage::text(prompt),
     )
     .await
     .map_err(map_agent)?;

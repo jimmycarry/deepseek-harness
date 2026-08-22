@@ -4,8 +4,8 @@ use dsh_agent::AgentRegistry;
 use dsh_agent_loop::run_followup;
 use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_cordis_loader::{parse_patch_list, EntryPatch};
-use dsh_llm::{ContentBlock, UserMessage};
-use dsh_session::SessionStore;
+use dsh_llm::UserMessage;
+use dsh_session::{append_session_knobs, SessionStore};
 use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
 use std::sync::Arc;
@@ -78,12 +78,17 @@ pub async fn run(ctx: &Context) -> std::result::Result<(), String> {
         .map_err(|error| error.to_string())?
         .create(session)
         .map_err(|error| error.to_string())?;
+    let mode = std::env::var("DSH_PERMISSION_MODE").unwrap_or_else(|_| "workspace-write".into());
+    let policy = if mode == "danger-full-access" {
+        "never"
+    } else {
+        "ask"
+    };
+    append_session_knobs(handle.agent.session().as_ref(), &mode, &mode, policy)
+        .map_err(|error| error.to_string())?;
     run_followup(
         handle.agent.as_ref(),
-        UserMessage {
-            content: vec![ContentBlock::text(task)],
-            source: None,
-        },
+        UserMessage::text(task),
     )
     .await
     .map_err(|error| error.to_string())?;
