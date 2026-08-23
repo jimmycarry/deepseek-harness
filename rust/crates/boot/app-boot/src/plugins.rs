@@ -68,6 +68,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-tool-bash" => apply_tool_bash(ctx, config),
         "@deepseek-ai/dsh-tool-jobs" => apply_tool_jobs(ctx, config),
         "@deepseek-ai/dsh-tool-fs" => apply_tool_fs(ctx),
+        "@deepseek-ai/dsh-fs-observation-policy" => dsh_fs_observation_policy::install(ctx),
         "@deepseek-ai/dsh-tool-fs-search" => apply_tool_fs_search(ctx, config),
         "@deepseek-ai/dsh-tool-str-replace-editor" => apply_tool_str_replace_editor(ctx, config),
         "@deepseek-ai/dsh-tools" => {
@@ -514,8 +515,8 @@ fn apply_tool_fs(ctx: &Context) -> Result<()> {
     }
     let tools = ensure_tools(ctx)?;
     let fs = ctx.service::<FsRuntime>()?;
-    tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs))));
-    tools.insert(Arc::new(WriteFileTool::new(fs)));
+    tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs), ctx.clone())));
+    tools.insert(Arc::new(WriteFileTool::new(fs, ctx.clone())));
     Ok(())
 }
 

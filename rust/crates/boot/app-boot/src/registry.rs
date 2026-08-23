@@ -104,6 +104,14 @@ mod tests {
             commands.get("feedback").is_some(),
             "dsh-command-feedback must register /feedback"
         );
+        assert_eq!(
+            dsh_fs_observation_policy::write_intent(
+                &ctx,
+                &dsh_fs::FsTarget::new("a.txt", "a.txt"),
+                &dsh_fs::FsObservationActor::from_agent_id(Some("s")),
+            ),
+            Some(dsh_fs::FsWriteIntent::CreateIfAbsent)
+        );
     }
 
     #[test]

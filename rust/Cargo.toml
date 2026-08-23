@@ -28,6 +28,7 @@ members = [
   "crates/shell/tool-bash",
   "crates/fs/fs",
   "crates/fs/fs-local",
+  "crates/fs/fs-observation-policy",
   "crates/fs/tool-fs",
   "crates/fs/tool-fs-search",
   "crates/fs/tool-str-replace-editor",
@@ -156,6 +157,7 @@ dsh-bash-sandbox = { path = "crates/shell/bash-sandbox" }
 dsh-tool-bash = { path = "crates/shell/tool-bash" }
 dsh-fs = { path = "crates/fs/fs" }
 dsh-fs-local = { path = "crates/fs/fs-local" }
+dsh-fs-observation-policy = { path = "crates/fs/fs-observation-policy" }
 dsh-tool-fs = { path = "crates/fs/tool-fs" }
 dsh-tool-fs-search = { path = "crates/fs/tool-fs-search" }
 dsh-tool-str-replace-editor = { path = "crates/fs/tool-str-replace-editor" }

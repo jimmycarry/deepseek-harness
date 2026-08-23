@@ -303,6 +303,7 @@ dependencies = [
  "dsh-credentials-local",
  "dsh-fs",
  "dsh-fs-local",
+ "dsh-fs-observation-policy",
  "dsh-goal",
  "dsh-goal-round-driver",
  "dsh-jobs",
@@ -608,6 +609,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
  "dsh-cordis",
+ "serde_json",
  "thiserror",
 ]
 
@@ -620,6 +622,16 @@ dependencies = [
  "dsh-fs",
  "dsh-sandbox",
  "dsh-sandbox-local",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-fs-observation-policy"
+version = "0.1.1-rc.2"
+dependencies = [
+ "dsh-cordis",
+ "dsh-fs",
+ "serde_json",
  "tokio",
 ]
 

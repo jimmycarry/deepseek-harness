@@ -2,8 +2,11 @@
 
 use async_trait::async_trait;
 use dsh_cordis::Context;
-use dsh_fs::{FsError, FsKind, FsRuntime};
-use dsh_tools::{Tool, ToolError, ToolOutcome, ToolRuntime};
+use dsh_fs::{
+    error_from_event, fs_event_payload, FsError, FsKind, FsObservation, FsObservationActor,
+    FsRuntime, FsWriteIntent, FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
+};
+use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome, ToolRuntime};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -215,12 +218,53 @@ fn format_file_view(
 pub struct StrReplaceEditorTool {
     fs: Arc<FsRuntime>,
     config: Config,
+    ctx: Context,
 }
 
 impl StrReplaceEditorTool {
-    /// Bind to `ctx.fs`.
-    pub fn new(fs: Arc<FsRuntime>, config: Config) -> Self {
-        Self { fs, config }
+    /// Bind to `ctx.fs` and the plugin context used for `fs/*` events.
+    pub fn new(fs: Arc<FsRuntime>, config: Config, ctx: Context) -> Self {
+        Self { fs, config, ctx }
+    }
+
+    fn observe(&self, target: &dsh_fs::FsTarget, observation: FsObservation, actor: &FsObservationActor) {
+        self.ctx.emit(
+            FS_OBSERVED,
+            fs_event_payload(target, actor, Some(&observation)),
+        );
+    }
+
+    fn write_intent(&self, target: &dsh_fs::FsTarget, actor: &FsObservationActor) -> Option<FsWriteIntent> {
+        self.ctx
+            .waterfall(
+                FS_WRITE_INTENT,
+                fs_event_payload(target, actor, None),
+                |_| serde_json::json!(null),
+            )
+            .ok()
+            .and_then(|value| FsWriteIntent::from_value(&value))
+    }
+
+    fn edit_intent(
+        &self,
+        target: &dsh_fs::FsTarget,
+        actor: &FsObservationActor,
+    ) -> Result<Option<String>, String> {
+        let value = self
+            .ctx
+            .waterfall(
+                FS_EDIT_INTENT,
+                fs_event_payload(target, actor, None),
+                |_| serde_json::json!(null),
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(error) = error_from_event(&value) {
+            return Err(error.remediate().to_string());
+        }
+        Ok(value
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string))
     }
 
     async fn list_directory(&self, path: &str) -> Result<String, String> {
@@ -266,11 +310,25 @@ impl StrReplaceEditorTool {
         ))
     }
 
-    async fn view(&self, path: &str, view_range: Option<Vec<i64>>) -> Result<String, String> {
+    async fn view(
+        &self,
+        path: &str,
+        view_range: Option<Vec<i64>>,
+        actor: &FsObservationActor,
+    ) -> Result<String, String> {
         require_absolute(path)?;
-        let info = self.fs.stat(path).await.map_err(map_fs)?.ok_or_else(|| {
-            format!("The path {path} does not exist. Please provide a valid path.")
-        })?;
+        let target = self.fs.resolve(path).await.map_err(map_fs)?;
+        let info = self
+            .fs
+            .stat(&target.target_key)
+            .await
+            .map_err(map_fs)?;
+        let Some(info) = info else {
+            self.observe(&target, FsObservation::Absent, actor);
+            return Err(format!(
+                "The path {path} does not exist. Please provide a valid path."
+            ));
+        };
         match info.kind {
             FsKind::Directory => {
                 if view_range.is_some() {
@@ -279,10 +337,17 @@ impl StrReplaceEditorTool {
                             .into(),
                     );
                 }
-                self.list_directory(path).await
+                self.list_directory(&target.target_key).await
             }
             FsKind::File => {
-                let content = self.fs.read_text(path).await.map_err(map_fs)?;
+                let content = self
+                    .fs
+                    .read_text(&target.target_key)
+                    .await
+                    .map_err(map_fs)?;
+                if let Ok(Some(version)) = self.fs.version_of(&target).await {
+                    self.observe(&target, FsObservation::Present { version }, actor);
+                }
                 format_file_view(
                     path,
                     &content,
@@ -296,15 +361,39 @@ impl StrReplaceEditorTool {
         }
     }
 
-    async fn create(&self, path: &str, file_text: Option<&str>) -> Result<String, String> {
+    async fn create(
+        &self,
+        path: &str,
+        file_text: Option<&str>,
+        actor: &FsObservationActor,
+    ) -> Result<String, String> {
         require_absolute(path)?;
         let content = required_for_command(file_text, "file_text", "create", true)?;
-        if self.fs.stat(path).await.map_err(map_fs)?.is_some() {
+        let target = self.fs.resolve(path).await.map_err(map_fs)?;
+        if self
+            .fs
+            .stat(&target.target_key)
+            .await
+            .map_err(map_fs)?
+            .is_some()
+        {
             return Err(format!(
                 "File already exists at: {path}. Cannot overwrite files using command `create`."
             ));
         }
-        self.fs.write_text(path, &content).await.map_err(map_fs)?;
+        let intent = self.write_intent(&target, actor);
+        let outcome = self
+            .fs
+            .write_intended(&target, &content, intent)
+            .await
+            .map_err(|error| error.remediate().to_string())?;
+        self.observe(
+            &target,
+            FsObservation::Present {
+                version: outcome.version,
+            },
+            actor,
+        );
         Ok(format!("New file created successfully at: {path}"))
     }
 
@@ -313,13 +402,20 @@ impl StrReplaceEditorTool {
         path: &str,
         old_str: Option<&str>,
         new_str: Option<&str>,
+        actor: &FsObservationActor,
     ) -> Result<String, String> {
         require_absolute(path)?;
         let old_value = required_for_command(old_str, "old_str", "str_replace", false)?;
         let new_value = new_str.unwrap_or("");
-        let info = self.fs.stat(path).await.map_err(map_fs)?.ok_or_else(|| {
-            format!("The path {path} does not exist. Please provide a valid path.")
-        })?;
+        let target = self.fs.resolve(path).await.map_err(map_fs)?;
+        let info = self
+            .fs
+            .stat(&target.target_key)
+            .await
+            .map_err(map_fs)?
+            .ok_or_else(|| {
+                format!("The path {path} does not exist. Please provide a valid path.")
+            })?;
         if info.kind == FsKind::Directory {
             return Err(format!(
                 "The path {path} is a directory and only the `view` command can be used on directories"
@@ -328,7 +424,12 @@ impl StrReplaceEditorTool {
         if info.kind != FsKind::File {
             return Err(format!("cannot edit \"{path}\": not a regular file"));
         }
-        let before = self.fs.read_text(path).await.map_err(map_fs)?;
+        let expected = self.edit_intent(&target, actor)?;
+        let before = self
+            .fs
+            .read_text(&target.target_key)
+            .await
+            .map_err(map_fs)?;
         let offsets = match_offsets(&before, &old_value);
         match offsets.as_slice() {
             [] => Err(format!(
@@ -336,7 +437,19 @@ impl StrReplaceEditorTool {
             )),
             [_] => {
                 let after = before.replacen(&old_value, new_value, 1);
-                self.fs.write_text(path, &after).await.map_err(map_fs)?;
+                let intent = expected.map(|version| FsWriteIntent::ReplaceIfVersion { version });
+                let outcome = self
+                    .fs
+                    .write_intended(&target, &after, intent)
+                    .await
+                    .map_err(|error| error.remediate().to_string())?;
+                self.observe(
+                    &target,
+                    FsObservation::Present {
+                        version: outcome.version,
+                    },
+                    actor,
+                );
                 Ok(format!("The file {path} has been edited successfully."))
             }
             many => {
@@ -358,18 +471,30 @@ impl StrReplaceEditorTool {
         path: &str,
         insert_line: Option<i64>,
         new_str: Option<&str>,
+        actor: &FsObservationActor,
     ) -> Result<String, String> {
         require_absolute(path)?;
         let insert_line = insert_line
             .ok_or_else(|| "Parameter `insert_line` is required for command: insert".to_string())?;
         let value = required_for_command(new_str, "new_str", "insert", true)?;
-        let info = self.fs.stat(path).await.map_err(map_fs)?.ok_or_else(|| {
-            format!("The path {path} does not exist. Please provide a valid path.")
-        })?;
+        let target = self.fs.resolve(path).await.map_err(map_fs)?;
+        let info = self
+            .fs
+            .stat(&target.target_key)
+            .await
+            .map_err(map_fs)?
+            .ok_or_else(|| {
+                format!("The path {path} does not exist. Please provide a valid path.")
+            })?;
         if info.kind != FsKind::File {
             return Err(format!("cannot insert into \"{path}\": not a regular file"));
         }
-        let before = self.fs.read_text(path).await.map_err(map_fs)?;
+        let expected = self.edit_intent(&target, actor)?;
+        let before = self
+            .fs
+            .read_text(&target.target_key)
+            .await
+            .map_err(map_fs)?;
         let lines: Vec<&str> = before.split('\n').collect();
         if insert_line < 0 || insert_line as usize > lines.len() {
             return Err(format!(
@@ -382,10 +507,19 @@ impl StrReplaceEditorTool {
         after.extend(&lines[..at]);
         after.extend(value.split('\n'));
         after.extend(&lines[at..]);
-        self.fs
-            .write_text(path, &after.join("\n"))
+        let intent = expected.map(|version| FsWriteIntent::ReplaceIfVersion { version });
+        let outcome = self
+            .fs
+            .write_intended(&target, &after.join("\n"), intent)
             .await
-            .map_err(map_fs)?;
+            .map_err(|error| error.remediate().to_string())?;
+        self.observe(
+            &target,
+            FsObservation::Present {
+                version: outcome.version,
+            },
+            actor,
+        );
         Ok(format!("The file {path} has been edited successfully."))
     }
 }
@@ -441,6 +575,17 @@ impl Tool for StrReplaceEditorTool {
     }
 
     async fn execute(&self, args: Value) -> Result<ToolOutcome, ToolError> {
+        self.execute_call(&ToolCall {
+            name: self.name().into(),
+            args,
+            agent_id: None,
+        })
+        .await
+    }
+
+    async fn execute_call(&self, call: &ToolCall) -> Result<ToolOutcome, ToolError> {
+        let args = &call.args;
+        let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
         let command = args
             .get("command")
             .and_then(Value::as_str)
@@ -451,11 +596,11 @@ impl Tool for StrReplaceEditorTool {
             .ok_or_else(|| ToolError::Body("path required".into()))?;
         let result = match command {
             "view" => {
-                let range = view_range_from(&args).map_err(ToolError::Body)?;
-                self.view(path, range).await
+                let range = view_range_from(args).map_err(ToolError::Body)?;
+                self.view(path, range, &actor).await
             }
             "create" => {
-                self.create(path, args.get("file_text").and_then(Value::as_str))
+                self.create(path, args.get("file_text").and_then(Value::as_str), &actor)
                     .await
             }
             "str_replace" => {
@@ -463,6 +608,7 @@ impl Tool for StrReplaceEditorTool {
                     path,
                     args.get("old_str").and_then(Value::as_str),
                     args.get("new_str").and_then(Value::as_str),
+                    &actor,
                 )
                 .await
             }
@@ -471,6 +617,7 @@ impl Tool for StrReplaceEditorTool {
                     path,
                     args.get("insert_line").and_then(Value::as_i64),
                     args.get("new_str").and_then(Value::as_str),
+                    &actor,
                 )
                 .await
             }
@@ -491,7 +638,7 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<()> {
     let tools = ctx.service::<ToolRuntime>().map_err(|_| {
         dsh_cordis::CordisError::Validation("tool-str-replace-editor requires ctx.tools".into())
     })?;
-    tools.insert(Arc::new(StrReplaceEditorTool::new(fs, config)));
+    tools.insert(Arc::new(StrReplaceEditorTool::new(fs, config, ctx.clone())));
     Ok(())
 }
 
@@ -506,6 +653,7 @@ mod tests {
         StrReplaceEditorTool::new(
             Arc::new(FsRuntime::new(Arc::new(LocalFs::new()))),
             Config::resolve(None).unwrap(),
+            Context::new(),
         )
     }
 

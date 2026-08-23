@@ -60,8 +60,8 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
         let jobs = ctx.get::<JobRegistry>();
         tools.insert(Arc::new(BashTool::with_jobs(shell, jobs, true)));
         if let Some(fs) = ctx.get::<FsRuntime>() {
-            tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs))));
-            tools.insert(Arc::new(WriteFileTool::new(fs)));
+            tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs), ctx.clone())));
+            tools.insert(Arc::new(WriteFileTool::new(fs, ctx.clone())));
         }
         dsh_tool_fs_search::install(ctx, dsh_tool_fs_search::Config::with_sample_over_cap(false))?;
         dsh_tool_str_replace_editor::install(

@@ -30,6 +30,7 @@ dsh-goal.workspace = true
 dsh-goal-round-driver.workspace = true
 dsh-fs.workspace = true
 dsh-fs-local.workspace = true
+dsh-fs-observation-policy.workspace = true
 dsh-jobs.workspace = true
 dsh-jobs-local.workspace = true
 dsh-tool-jobs.workspace = true

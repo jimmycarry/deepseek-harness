@@ -1177,6 +1177,68 @@ async fn feedback_command_profile() {
     assert!(session.derive_messages().is_empty());
 }
 
+#[tokio::test]
+async fn write_file_requires_prior_observation_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-n-fs-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("note.txt");
+    std::fs::write(&path, "old").unwrap();
+    let ctx = mount_profile_in(&dir, "unused", vec![]);
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let tools = ctx.service::<ToolRuntime>().unwrap();
+    let path_str = path.to_string_lossy().into_owned();
+    let denied = tools
+        .execute_for(
+            &ctx,
+            "write_file",
+            serde_json::json!({ "path": path_str, "content": "new" }),
+            Some(session.id().as_str()),
+        )
+        .await
+        .unwrap();
+    assert!(denied.outcome.is_error);
+    let denied_text = match &denied.outcome.content[0] {
+        ContentBlock::Text { text } => text.as_str(),
+        _ => "",
+    };
+    assert!(
+        denied_text.contains("without reading it first"),
+        "{denied_text}"
+    );
+    assert!(
+        denied_text.contains("read the file, then retry"),
+        "{denied_text}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+    let read = tools
+        .execute_for(
+            &ctx,
+            "read_file",
+            serde_json::json!({ "path": path_str }),
+            Some(session.id().as_str()),
+        )
+        .await
+        .unwrap();
+    assert!(!read.outcome.is_error);
+    let wrote = tools
+        .execute_for(
+            &ctx,
+            "write_file",
+            serde_json::json!({ "path": path_str, "content": "new" }),
+            Some(session.id().as_str()),
+        )
+        .await
+        .unwrap();
+    assert!(!wrote.outcome.is_error, "{:?}", wrote.outcome.content);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn typescript_headless_profile_types_are_known() {
     let path = concat!(
