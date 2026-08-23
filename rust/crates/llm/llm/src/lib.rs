@@ -48,6 +48,81 @@ impl LlmError {
             status: None,
         })
     }
+
+    /// Adapter-returned exact-model metadata that failed runtime validation.
+    pub fn invalid_model_info(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Failure(LlmFailure {
+            message: message.into(),
+            code: code.into(),
+            status: None,
+        })
+    }
+}
+
+/// Provider-owned context capacity for one exact provider/model route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmModelContext {
+    /// Maximum combined request and response context in tokens.
+    pub context_window: u32,
+}
+
+/// Display metadata for one adapter-owned reasoning effort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmReasoningEffortInfo {
+    /// Opaque stable value accepted as `reasoningEffort`.
+    pub id: String,
+    /// Human-readable effort name.
+    pub name: String,
+    /// Optional distinction from otherwise similar efforts.
+    pub description: Option<String>,
+}
+
+/// Selectable reasoning efforts for one exact provider/model route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmModelReasoningInfo {
+    /// Supported efforts in adapter-preferred display order.
+    pub efforts: Vec<LlmReasoningEffortInfo>,
+    /// Adapter-configured default when callers omit an effort.
+    pub default_effort: Option<String>,
+}
+
+/// Exact-route model metadata resolved by its owning adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmResolvedModelInfo {
+    /// Provider route that owns this model.
+    pub provider: String,
+    /// Exact model id passed to the adapter.
+    pub id: String,
+    /// Human-readable model name.
+    pub name: String,
+    /// Optional user-facing distinction from otherwise similar models.
+    pub description: Option<String>,
+    /// Provider-owned context capacity when known.
+    pub context: Option<LlmModelContext>,
+    /// Adapter-configured per-request output cap when callers omit one.
+    pub default_max_tokens: Option<u32>,
+    /// Accepted request modalities; absent means unknown.
+    pub input_modalities: Option<Vec<String>>,
+    /// Adapter-owned selectable reasoning levels when exposed.
+    pub reasoning: Option<LlmModelReasoningInfo>,
+}
+
+impl LlmResolvedModelInfo {
+    /// Identity-only result when an adapter publishes no extra metadata.
+    #[must_use]
+    pub fn identity(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        Self {
+            provider: provider.into(),
+            id: model.clone(),
+            name: model,
+            description: None,
+            context: None,
+            default_max_tokens: None,
+            input_modalities: None,
+            reasoning: None,
+        }
+    }
 }
 
 /// Plain text visible to the end user.
@@ -1004,6 +1079,16 @@ impl LlmRuntime {
     ) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
         self.adapter.stream(request).await
     }
+
+    /// Resolve and validate exact-model metadata from the registered adapter.
+    pub async fn resolve_model_info(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<LlmResolvedModelInfo, LlmError> {
+        let resolved = self.adapter.resolve_model(provider, model).await?;
+        normalize_model_info(provider, model, resolved)
+    }
 }
 
 impl Service for LlmRuntime {
@@ -1018,6 +1103,82 @@ pub trait LlmAdapter: Send + Sync {
         &self,
         request: LlmRequest,
     ) -> Result<BoxStream<'static, StreamChunk>, LlmError>;
+
+    /// Resolve all metadata available for one exact model.
+    async fn resolve_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<LlmResolvedModelInfo, LlmError> {
+        Ok(LlmResolvedModelInfo::identity(provider, model))
+    }
+}
+
+fn normalize_model_info(
+    provider: &str,
+    model: &str,
+    resolved: LlmResolvedModelInfo,
+) -> Result<LlmResolvedModelInfo, LlmError> {
+    if resolved.provider != provider || resolved.id != model || resolved.name.is_empty() {
+        return Err(LlmError::invalid_model_info(
+            "INVALID_MODEL_INFO",
+            format!(
+                "adapter returned invalid exact model metadata for provider \"{provider}\" model \"{model}\""
+            ),
+        ));
+    }
+    if let Some(context) = &resolved.context {
+        if context.context_window == 0 {
+            return Err(LlmError::invalid_model_info(
+                "INVALID_MODEL_CONTEXT",
+                format!(
+                    "adapter returned invalid context metadata for provider \"{provider}\" model \"{model}\""
+                ),
+            ));
+        }
+    }
+    if let Some(max_tokens) = resolved.default_max_tokens {
+        if max_tokens == 0 {
+            return Err(LlmError::invalid_model_info(
+                "INVALID_MODEL_MAX_TOKENS",
+                format!(
+                    "adapter returned invalid default maxTokens for provider \"{provider}\" model \"{model}\""
+                ),
+            ));
+        }
+    }
+    if let Some(reasoning) = &resolved.reasoning {
+        if reasoning.efforts.is_empty() {
+            return Err(LlmError::invalid_model_info(
+                "INVALID_MODEL_REASONING",
+                format!(
+                    "adapter returned invalid reasoning metadata for provider \"{provider}\" model \"{model}\""
+                ),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for effort in &reasoning.efforts {
+            if effort.id.is_empty() || effort.name.is_empty() || !seen.insert(effort.id.as_str()) {
+                return Err(LlmError::invalid_model_info(
+                    "INVALID_MODEL_REASONING",
+                    format!(
+                        "adapter returned invalid or duplicate reasoning effort metadata for provider \"{provider}\" model \"{model}\""
+                    ),
+                ));
+            }
+        }
+        if let Some(default) = &reasoning.default_effort {
+            if !seen.contains(default.as_str()) {
+                return Err(LlmError::invalid_model_info(
+                    "INVALID_MODEL_REASONING",
+                    format!(
+                        "adapter returned an unknown default reasoning effort for provider \"{provider}\" model \"{model}\""
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// In-progress block keyed by stream index.
@@ -1250,5 +1411,62 @@ mod tests {
             serde_json::to_value(&usage).unwrap(),
             serde_json::json!({"inputTokens":11,"outputTokens":3,"cacheReadTokens":2})
         );
+    }
+
+    struct InfoAdapter {
+        info: LlmResolvedModelInfo,
+    }
+
+    #[async_trait]
+    impl LlmAdapter for InfoAdapter {
+        async fn stream(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn resolve_model(
+            &self,
+            _provider: &str,
+            _model: &str,
+        ) -> Result<LlmResolvedModelInfo, LlmError> {
+            Ok(self.info.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_model_info_accepts_identity_and_capacity() {
+        let runtime = LlmRuntime::new(std::sync::Arc::new(InfoAdapter {
+            info: LlmResolvedModelInfo {
+                context: Some(LlmModelContext {
+                    context_window: 128_000,
+                }),
+                ..LlmResolvedModelInfo::identity("replay", "script")
+            },
+        }));
+        let info = runtime.resolve_model_info("replay", "script").await.unwrap();
+        assert_eq!(info.context.unwrap().context_window, 128_000);
+    }
+
+    #[tokio::test]
+    async fn resolve_model_info_rejects_mismatched_identity_and_zero_window() {
+        let runtime = LlmRuntime::new(std::sync::Arc::new(InfoAdapter {
+            info: LlmResolvedModelInfo::identity("other", "script"),
+        }));
+        let err = runtime.resolve_model_info("replay", "script").await.unwrap_err();
+        match err {
+            LlmError::Failure(failure) => assert_eq!(failure.code, "INVALID_MODEL_INFO"),
+        }
+        let runtime = LlmRuntime::new(std::sync::Arc::new(InfoAdapter {
+            info: LlmResolvedModelInfo {
+                context: Some(LlmModelContext { context_window: 0 }),
+                ..LlmResolvedModelInfo::identity("replay", "script")
+            },
+        }));
+        let err = runtime.resolve_model_info("replay", "script").await.unwrap_err();
+        match err {
+            LlmError::Failure(failure) => assert_eq!(failure.code, "INVALID_MODEL_CONTEXT"),
+        }
     }
 }

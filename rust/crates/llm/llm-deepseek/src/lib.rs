@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 use dsh_llm::{
-    ContentBlock, LlmAdapter, LlmError, LlmFailure, LlmRequest, Message, StreamChunk,
+    ContentBlock, LlmAdapter, LlmError, LlmFailure, LlmModelContext, LlmResolvedModelInfo,
+    LlmRequest, Message, StreamChunk,
 };
 use futures::stream::{self, BoxStream};
 use serde_json::{json, Value};
@@ -71,6 +72,19 @@ impl LlmAdapter for DeepSeekAdapter {
             })
         })?;
         Ok(Box::pin(stream::iter(StreamChunk::text_stream(content))))
+    }
+
+    async fn resolve_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<LlmResolvedModelInfo, LlmError> {
+        Ok(LlmResolvedModelInfo {
+            context: Some(LlmModelContext {
+                context_window: 1_000_000,
+            }),
+            ..LlmResolvedModelInfo::identity(provider, model)
+        })
     }
 }
 

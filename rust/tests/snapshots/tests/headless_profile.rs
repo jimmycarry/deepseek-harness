@@ -1787,6 +1787,86 @@ async fn overflow_recovery_retries_after_compact_profile() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn pressure_uses_adapter_context_window_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-q-pressure-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut overlay = replay_overlay(serde_json::json!({
+        "text": "pong",
+        "auxiliary": {
+            "compaction": "## Primary Request and Intent\n- keep going under pressure"
+        },
+        "providers": [{
+            "id": "replay",
+            "models": [{
+                "id": "script",
+                "contextWindow": 400
+            }]
+        }]
+    }));
+    let mut compact = EntryPatch::replace("compaction-basic");
+    compact.config = Some(serde_json::json!({
+        "thresholdRatio": 0.5,
+        "retainRatio": 0.1
+    }));
+    overlay.push(compact);
+    let ctx = mount_profile_in(&dir, "unused", overlay);
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let _handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(Arc::clone(&session))
+        .unwrap();
+    session
+        .append(
+            SessionEventData::RequestHeader {
+                header: serde_json::json!({
+                    "config": { "provider": "replay", "model": "script" }
+                }),
+                reason: "initial".into(),
+            },
+            None,
+        )
+        .unwrap();
+    for label in ["alpha", "bravo", "charlie", "delta"] {
+        session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text(format!(
+                    "{label} {}",
+                    "context ".repeat(40)
+                ))),
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+    }
+    let _ = ctx
+        .waterfall(
+            "agent/pre-step",
+            serde_json::json!({ "sessionId": session.id().as_str() }),
+            |payload| payload,
+        )
+        .unwrap();
+    let events = events_of(&session);
+    let types = types_of(&events);
+    for name in ["compaction/start", "compaction/summary", "compaction/end"] {
+        assert!(types.iter().any(|found| found == name), "{types:?}");
+    }
+    assert!(
+        !events.iter().any(|event| {
+            event["type"] == "request/context"
+                && event["data"].get("contextWindow").is_some()
+                && event["data"]["contextWindow"] != Value::Null
+        }),
+        "pressure must come from resolveModelInfo, not a logged contextWindow"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn typescript_headless_profile_types_are_known() {
     let path = concat!(

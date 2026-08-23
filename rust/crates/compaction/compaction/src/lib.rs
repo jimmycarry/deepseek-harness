@@ -44,6 +44,14 @@ pub enum ManualCompactionError {
     /// The summarizer produced no useful checkpoint.
     #[error("summary")]
     Summary,
+    /// Routed pressure cannot resolve a usable adapter capacity or retain budget.
+    #[error("{message}")]
+    PressureConfig {
+        /// Exact `provider/model` route used as the warning key.
+        target: String,
+        /// Actionable configuration failure, matching TypeScript wording.
+        message: String,
+    },
     /// Automatic pressure exhausted its retry budget above the threshold.
     #[error(
         "compaction still above threshold after {attempts} compaction attempts ({tokens} estimated tokens >= threshold {threshold})"

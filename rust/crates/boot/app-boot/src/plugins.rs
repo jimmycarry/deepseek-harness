@@ -853,6 +853,20 @@ impl LlmAdapter for LiveDeepSeekAdapter {
         .stream(request)
         .await
     }
+
+    async fn resolve_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> std::result::Result<dsh_llm::LlmResolvedModelInfo, LlmError> {
+        dsh_llm_deepseek::DeepSeekAdapter {
+            api_key: String::new(),
+            base_url: String::new(),
+            model: String::new(),
+        }
+        .resolve_model(provider, model)
+        .await
+    }
 }
 
 fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
@@ -880,6 +894,15 @@ fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
             };
             adapter = adapter.with_auxiliary(purpose, text);
         }
+    }
+    if let Some(providers) = config.as_ref().and_then(|value| value.get("providers")) {
+        let parsed = serde_json::from_value::<Vec<dsh_llm_replay::ReplayProviderConfig>>(
+            providers.clone(),
+        )
+        .map_err(|error| {
+            CordisError::Validation(format!("llm-replay: invalid providers catalog: {error}"))
+        })?;
+        adapter = adapter.with_providers(parsed);
     }
     ctx.provide(Arc::new(LlmRuntime::new(Arc::new(adapter))))
 }

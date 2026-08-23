@@ -239,14 +239,6 @@ impl CompactionPolicy {
 }
 
 impl ResolvedTargetPolicy {
-    fn retain_tokens_for(&self, window: Option<u32>) -> u64 {
-        match self.retention {
-            ResolvedRetention::Tokens(tokens) => tokens,
-            ResolvedRetention::Ratio(ratio) => window
-                .map(|window| ((window as f64) * ratio).floor() as u64)
-                .unwrap_or(0),
-        }
-    }
 }
 
 fn validate_keys(value: &Value, keys: &[&str], name: &str) -> Result<(), String> {
@@ -661,6 +653,34 @@ impl BasicCompactionEngine {
         state.assistant_seq = assistant_seq;
     }
 
+    async fn resolve_pressure_window(
+        &self,
+        session: &Session,
+    ) -> Result<Option<(String, String, u32)>, ManualCompactionError> {
+        let Some((provider, model)) = last_request_route(session) else {
+            return Ok(None);
+        };
+        let target = format!("{provider}/{model}");
+        let Some(llm) = self
+            .llm
+            .clone()
+            .or_else(|| self.lookup.get::<LlmRuntime>())
+        else {
+            return Err(missing_capacity(&target));
+        };
+        let info = llm
+            .resolve_model_info(&provider, &model)
+            .await
+            .map_err(|error| ManualCompactionError::PressureConfig {
+                target: target.clone(),
+                message: error.to_string(),
+            })?;
+        let Some(context) = info.context else {
+            return Err(missing_capacity(&target));
+        };
+        Ok(Some((provider, model, context.context_window)))
+    }
+
     async fn compact_session(
         &self,
         agent: &dyn Agent,
@@ -684,22 +704,22 @@ impl BasicCompactionEngine {
             .as_ref()
             .map(|(provider, model)| self.policy.resolve_target(provider, model))
             .unwrap_or_else(|| self.policy.default_target());
-        if !force {
-            let Some(window) = last_context_window(&session) else {
+        let retain_tokens = if force {
+            0
+        } else {
+            let Some((provider, model, window)) = self.resolve_pressure_window(&session).await?
+            else {
                 return Ok(None);
             };
-            let threshold = ((window as f64) * effective.threshold_ratio).floor() as u64;
+            let routed = self.policy.resolve_target(&provider, &model);
+            let (threshold, retain_tokens) = compact_spec(&routed, &provider, &model, window)?;
             let total_tokens = meter
                 .map(|meter| meter.estimate_session(&session) as u64)
                 .unwrap_or(0);
             if total_tokens < threshold {
                 return Ok(None);
             }
-        }
-        let retain_tokens = if force {
-            0
-        } else {
-            effective.retain_tokens_for(last_context_window(&session))
+            retain_tokens
         };
         let Some((start, end, shadowed)) =
             select_compactable_span(&session, meter, retain_tokens)
@@ -850,13 +870,44 @@ impl BasicCompactionEngine {
     }
 }
 
-fn last_context_window(session: &Session) -> Option<u32> {
-    session.events().into_iter().rev().find_map(|event| match event.data {
-        SessionEventData::RequestContext {
-            context_window, ..
-        } => context_window,
-        _ => None,
-    })
+fn missing_capacity(target: &str) -> ManualCompactionError {
+    ManualCompactionError::PressureConfig {
+        target: target.to_string(),
+        message: format!(
+            "compaction-basic: no context capacity for {target}; configure contextWindow on that adapter model"
+        ),
+    }
+}
+
+fn compact_spec(
+    policy: &ResolvedTargetPolicy,
+    provider: &str,
+    model: &str,
+    window: u32,
+) -> Result<(u64, u64), ManualCompactionError> {
+    let target = format!("{provider}/{model}");
+    if window == 0 {
+        return Err(ManualCompactionError::PressureConfig {
+            target,
+            message: format!(
+                "BasicCompactionConfig: contextWindow ({window}) must be a positive integer"
+            ),
+        });
+    }
+    let threshold_tokens = ((window as f64) * policy.threshold_ratio).floor() as u64;
+    let retain_tokens = match policy.retention {
+        ResolvedRetention::Tokens(tokens) => tokens,
+        ResolvedRetention::Ratio(ratio) => ((window as f64) * ratio).floor() as u64,
+    };
+    if retain_tokens >= threshold_tokens {
+        return Err(ManualCompactionError::PressureConfig {
+            target,
+            message: format!(
+                "BasicCompactionConfig: {provider}/{model} retainTokens ({retain_tokens}) must be less than threshold tokens {threshold_tokens}"
+            ),
+        });
+    }
+    Ok((threshold_tokens, retain_tokens))
 }
 
 fn select_compactable_span(
@@ -1097,15 +1148,11 @@ impl CompactionEngine for BasicCompactionEngine {
             return self.compact_session(agent, true, None).await;
         }
         let session = agent.session();
-        let Some(window) = last_context_window(&session) else {
+        let Some((provider, model, window)) = self.resolve_pressure_window(&session).await? else {
             return Ok(None);
         };
-        let target = last_request_route(&session);
-        let effective = target
-            .as_ref()
-            .map(|(provider, model)| self.policy.resolve_target(provider, model))
-            .unwrap_or_else(|| self.policy.default_target());
-        let threshold = ((window as f64) * effective.threshold_ratio).floor() as u64;
+        let effective = self.policy.resolve_target(&provider, &model);
+        let (threshold, _) = compact_spec(&effective, &provider, &model, window)?;
         let mut total_tokens = self
             .meter
             .as_ref()
@@ -1165,6 +1212,7 @@ mod tests {
         text: String,
         last: Mutex<Option<LlmRequest>>,
         fail: bool,
+        context_window: Option<u32>,
     }
 
     #[async_trait]
@@ -1188,13 +1236,30 @@ mod tests {
                 self.text.clone(),
             ))))
         }
+
+        async fn resolve_model(
+            &self,
+            provider: &str,
+            model: &str,
+        ) -> std::result::Result<dsh_llm::LlmResolvedModelInfo, LlmError> {
+            Ok(dsh_llm::LlmResolvedModelInfo {
+                context: self.context_window.map(|context_window| {
+                    dsh_llm::LlmModelContext { context_window }
+                }),
+                ..dsh_llm::LlmResolvedModelInfo::identity(provider, model)
+            })
+        }
     }
 
-    fn scripted_engine(text: &str) -> (BasicCompactionEngine, Arc<ScriptedSummarizer>) {
+    fn scripted_engine_with_window(
+        text: &str,
+        context_window: Option<u32>,
+    ) -> (BasicCompactionEngine, Arc<ScriptedSummarizer>) {
         let adapter = Arc::new(ScriptedSummarizer {
             text: text.into(),
             last: Mutex::new(None),
             fail: false,
+            context_window,
         });
         let engine = BasicCompactionEngine {
             policy: CompactionPolicy::resolve(Some(&serde_json::json!({
@@ -1208,6 +1273,10 @@ mod tests {
             overflow_retries: Mutex::new(HashMap::new()),
         };
         (engine, adapter)
+    }
+
+    fn scripted_engine(text: &str) -> (BasicCompactionEngine, Arc<ScriptedSummarizer>) {
+        scripted_engine_with_window(text, None)
     }
 
     struct StubAgent {
@@ -1373,6 +1442,7 @@ mod tests {
             text: "overflow checkpoint".into(),
             last: Mutex::new(None),
             fail: false,
+            context_window: None,
         });
         ctx.provide(Arc::new(LlmRuntime::new(
             Arc::clone(&adapter) as Arc<dyn LlmAdapter>,
@@ -1660,6 +1730,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pressure_fails_without_adapter_capacity() {
+        let session = Arc::new(Session::new(session_id("nocap")));
+        session
+            .append(
+                SessionEventData::RequestHeader {
+                    header: serde_json::json!({
+                        "config": { "provider": "replay", "model": "script" }
+                    }),
+                    reason: "initial".into(),
+                },
+                None,
+            )
+            .unwrap();
+        for text in ["aaaa", "bbbb", "cccc", "dddd"] {
+            append_user(&session, text);
+        }
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let (engine, _) = scripted_engine("ok");
+        let err = engine
+            .compact_if_needed(&agent, CompactionTrigger::Pressure)
+            .await
+            .unwrap_err();
+        match err {
+            ManualCompactionError::PressureConfig { target, message } => {
+                assert_eq!(target, "replay/script");
+                assert!(
+                    message.contains("no context capacity for replay/script"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected PressureConfig, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn pressure_compacts_when_tokens_cross_the_window_ratio() {
         let session = Arc::new(Session::new(session_id("window")));
         session
@@ -1667,7 +1775,7 @@ mod tests {
                 SessionEventData::RequestContext {
                     provider: "deepseek-official".into(),
                     model: "deepseek-v4-flash".into(),
-                    context_window: Some(500),
+                    context_window: None,
                 },
                 None,
             )
@@ -1679,7 +1787,7 @@ mod tests {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let (mut engine, _) = scripted_engine("ok");
+        let (mut engine, _) = scripted_engine_with_window("ok", Some(500));
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.5,
             "retainRatio": 0.1,
@@ -1709,6 +1817,7 @@ mod tests {
             text: String::new(),
             last: Mutex::new(None),
             fail: true,
+            context_window: None,
         });
         let engine = BasicCompactionEngine {
             policy: CompactionPolicy::resolve(Some(&serde_json::json!({
@@ -1799,7 +1908,7 @@ mod tests {
                 SessionEventData::RequestContext {
                     provider: "deepseek-official".into(),
                     model: "deepseek-v4-flash".into(),
-                    context_window: Some(2000),
+                    context_window: None,
                 },
                 None,
             )
@@ -1811,7 +1920,7 @@ mod tests {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let (mut engine, adapter) = scripted_engine("policy summary");
+        let (mut engine, adapter) = scripted_engine_with_window("policy summary", Some(2000));
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.95,
             "retainRatio": 0.1,
@@ -1941,7 +2050,7 @@ mod tests {
                 SessionEventData::RequestContext {
                     provider: "replay".into(),
                     model: "script".into(),
-                    context_window: Some(100),
+                    context_window: None,
                 },
                 None,
             )
@@ -1953,7 +2062,7 @@ mod tests {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let (mut engine, _) = scripted_engine("ok");
+        let (mut engine, _) = scripted_engine_with_window("ok", Some(100));
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.3,
             "retainRatio": 0.05,
@@ -1974,5 +2083,46 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event.data, SessionEventData::CompactionSummary { .. })));
+    }
+
+    #[tokio::test]
+    async fn pressure_rejects_retain_tokens_at_or_above_threshold() {
+        let session = Arc::new(Session::new(session_id("retain-too-big")));
+        session
+            .append(
+                SessionEventData::RequestContext {
+                    provider: "replay".into(),
+                    model: "script".into(),
+                    context_window: None,
+                },
+                None,
+            )
+            .unwrap();
+        append_user(&session, &bulky("alpha"));
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let (mut engine, _) = scripted_engine_with_window("ok", Some(1000));
+        engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdRatio": 0.5,
+            "retainTokens": 500,
+            "summarizationProvider": "replay",
+            "summarizationModel": "script"
+        })))
+        .unwrap();
+        let err = engine
+            .compact_if_needed(&agent, CompactionTrigger::Pressure)
+            .await
+            .unwrap_err();
+        match err {
+            ManualCompactionError::PressureConfig { message, .. } => {
+                assert!(
+                    message.contains("retainTokens (500) must be less than threshold tokens 500"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected PressureConfig, got {other:?}"),
+        }
     }
 }

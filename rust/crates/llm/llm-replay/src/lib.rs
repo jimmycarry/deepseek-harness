@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use dsh_llm::{
-    text_block, tool_block, ContentBlock, FinishReason, LlmAdapter, LlmError, LlmFailure, LlmRequest,
-    StreamChunk,
+    text_block, tool_block, ContentBlock, FinishReason, LlmAdapter, LlmError, LlmFailure,
+    LlmModelContext, LlmResolvedModelInfo, LlmRequest, StreamChunk,
 };
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,29 @@ pub struct ReplayToolCall {
     pub arguments: String,
 }
 
+/// One model exposed by a replay-only provider catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayModelConfig {
+    /// Model id used for replay requests.
+    pub id: String,
+    /// Selector label; defaults to [`Self::id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional positive integer context capacity published by the adapter.
+    #[serde(default, rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+}
+
+/// One provider route exposed by the replay adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayProviderConfig {
+    /// Provider route used for replay requests.
+    pub id: String,
+    /// Advisory models exposed to replay scenarios that exercise discovery.
+    #[serde(default)]
+    pub models: Vec<ReplayModelConfig>,
+}
+
 /// Plays recorded turns in order, then repeats the last one. Auxiliary
 /// requests (a non-empty `purpose`) never consume the scripted turn queue:
 /// they are served from the optional per-purpose script or rejected.
@@ -52,6 +75,7 @@ pub struct ReplayAdapter {
     turns: Vec<ReplayTurn>,
     cursor: std::sync::atomic::AtomicUsize,
     auxiliary: std::collections::HashMap<String, String>,
+    providers: std::collections::HashMap<String, ReplayProviderConfig>,
 }
 
 impl ReplayAdapter {
@@ -61,6 +85,7 @@ impl ReplayAdapter {
             turns,
             cursor: std::sync::atomic::AtomicUsize::new(0),
             auxiliary: std::collections::HashMap::new(),
+            providers: std::collections::HashMap::new(),
         }
     }
 
@@ -77,6 +102,15 @@ impl ReplayAdapter {
     /// Serve auxiliary requests carrying `purpose` with one fixed text reply.
     pub fn with_auxiliary(mut self, purpose: impl Into<String>, text: impl Into<String>) -> Self {
         self.auxiliary.insert(purpose.into(), text.into());
+        self
+    }
+
+    /// Publish a replay-only provider/model catalog for `resolve_model`.
+    pub fn with_providers(mut self, providers: Vec<ReplayProviderConfig>) -> Self {
+        self.providers = providers
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider))
+            .collect();
         self
     }
 }
@@ -136,6 +170,35 @@ impl LlmAdapter for ReplayAdapter {
             replay_state: None,
         });
         Ok(Box::pin(stream::iter(chunks)))
+    }
+
+    async fn resolve_model(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<LlmResolvedModelInfo, LlmError> {
+        let Some(configured) = self.providers.get(provider) else {
+            return Ok(LlmResolvedModelInfo::identity(provider, model));
+        };
+        let configured_model = configured
+            .models
+            .iter()
+            .find(|candidate| candidate.id == model);
+        Ok(LlmResolvedModelInfo {
+            provider: provider.to_string(),
+            id: model.to_string(),
+            name: configured_model
+                .and_then(|item| item.name.clone())
+                .unwrap_or_else(|| model.to_string()),
+            description: None,
+            context: configured_model.and_then(|item| {
+                item.context_window
+                    .map(|context_window| LlmModelContext { context_window })
+            }),
+            default_max_tokens: None,
+            input_modalities: None,
+            reasoning: None,
+        })
     }
 }
 
@@ -231,5 +294,23 @@ mod tests {
             chunk,
             StreamChunk::TextDelta { text, .. } if text == "recovered"
         )));
+    }
+
+    #[tokio::test]
+    async fn resolve_model_publishes_configured_context_window() {
+        let adapter = ReplayAdapter::text("pong").with_providers(vec![ReplayProviderConfig {
+            id: "replay".into(),
+            models: vec![ReplayModelConfig {
+                id: "script".into(),
+                name: Some("Script".into()),
+                context_window: Some(500),
+            }],
+        }]);
+        let listed = adapter.resolve_model("replay", "script").await.unwrap();
+        assert_eq!(listed.context.unwrap().context_window, 500);
+        let unlisted = adapter.resolve_model("replay", "other").await.unwrap();
+        assert!(unlisted.context.is_none());
+        let missing = adapter.resolve_model("empty", "script").await.unwrap();
+        assert!(missing.context.is_none());
     }
 }
