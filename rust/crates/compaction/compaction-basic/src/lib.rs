@@ -1455,6 +1455,7 @@ mod tests {
         let session = Arc::new(Session::new(session_id("noshrink")));
         append_user(&session, "a");
         append_user(&session, "b");
+        append_user(&session, "c");
         let agent = StubAgent {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
