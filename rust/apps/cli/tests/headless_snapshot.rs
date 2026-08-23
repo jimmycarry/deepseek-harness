@@ -105,11 +105,13 @@ async fn bash_turn_snapshot() {
                     arguments: r#"{"command":"echo hello"}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "done".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -173,11 +175,13 @@ async fn fs_edit_turn_snapshot() {
                     ),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "wrote".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -224,11 +228,13 @@ async fn glob_turn_snapshot() {
                     arguments: format!(r#"{{"pattern":"*.txt","path":"{path}"}}"#),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "listed".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -288,11 +294,13 @@ async fn str_replace_editor_turn_snapshot() {
                     ),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "created".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -336,6 +344,7 @@ async fn goal_turn_snapshot() {
                     arguments: r#"{"objective":"ship the rust port","max_goal_rounds":2}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: String::new(),
@@ -345,16 +354,19 @@ async fn goal_turn_snapshot() {
                     arguments: "{}".into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "created".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "continuing".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -411,11 +423,13 @@ async fn web_search_turn_snapshot() {
                     arguments: r#"{"queries":["rust"]}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "cited".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -462,11 +476,13 @@ async fn workflow_turn_snapshot() {
                     arguments: r#"{"script":"return {\"ok\":true}","meta":{"name":"snapshot-flow","description":"test"}}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "done".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -523,16 +539,19 @@ async fn subagent_turn_snapshot() {
                             .into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "child-done".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "parent-done".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -597,16 +616,19 @@ async fn ralph_turn_snapshot() {
                     arguments: r#"{"objective":"Finish the migration.","maxRounds":1}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: complete.into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "parent-done".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -657,6 +679,7 @@ async fn background_bash_job_snapshot() {
                     arguments: r#"{"command":"echo hello","run_in_background":true}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: String::new(),
@@ -666,11 +689,13 @@ async fn background_bash_job_snapshot() {
                     arguments: r#"{"job_id":"bash-1","wait":true}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "done".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -725,6 +750,7 @@ async fn repeat_tool_reminder_snapshot() {
                     arguments: r#"{"command":"echo hi"}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: String::new(),
@@ -734,6 +760,7 @@ async fn repeat_tool_reminder_snapshot() {
                     arguments: r#"{"command":"echo hi"}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: String::new(),
@@ -743,11 +770,13 @@ async fn repeat_tool_reminder_snapshot() {
                     arguments: r#"{"command":"echo hi"}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "stopped".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )
@@ -805,11 +834,13 @@ async fn spill_policy_turn_snapshot() {
                     arguments: r#"{"command":"yes x | head -c 60000"}"#.into(),
                 }),
                 finish: None,
+                error: None,
             },
             ReplayTurn {
                 text: "spilled".into(),
                 tool: None,
                 finish: None,
+                error: None,
             },
         ])),
     )

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use dsh_llm::{
-    text_block, tool_block, ContentBlock, FinishReason, LlmAdapter, LlmError, LlmRequest,
+    text_block, tool_block, ContentBlock, FinishReason, LlmAdapter, LlmError, LlmFailure, LlmRequest,
     StreamChunk,
 };
 use futures::stream::{self, BoxStream};
@@ -20,6 +20,18 @@ pub struct ReplayTurn {
     /// Terminal finish when the script wants one recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<dsh_llm::FinishReason>,
+    /// When set, this turn fails the stream instead of emitting chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ReplayFailure>,
+}
+
+/// Scripted adapter failure replayed as `LlmError::Failure`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayFailure {
+    /// Human-readable provider or transport failure.
+    pub message: String,
+    /// Stable provider-neutral machine-routing code.
+    pub code: String,
 }
 
 /// Scripted tool call.
@@ -58,6 +70,7 @@ impl ReplayAdapter {
             text: text.into(),
             tool: None,
             finish: None,
+            error: None,
         }])
     }
 
@@ -94,7 +107,15 @@ impl LlmAdapter for ReplayAdapter {
             text: String::new(),
             tool: None,
             finish: None,
+            error: None,
         });
+        if let Some(error) = turn.error {
+            return Err(LlmError::Failure(LlmFailure {
+                message: error.message,
+                code: error.code,
+                status: None,
+            }));
+        }
         let mut chunks = Vec::new();
         let mut index = 0u32;
         if !turn.text.is_empty() {
@@ -168,5 +189,47 @@ mod tests {
                 replay_state: None,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn throws_scripted_failure_then_plays_the_next_turn() {
+        let adapter = ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: None,
+                finish: None,
+                error: Some(ReplayFailure {
+                    message: "context overflow".into(),
+                    code: "CONTEXT_WINDOW_EXCEEDED".into(),
+                }),
+            },
+            ReplayTurn {
+                text: "recovered".into(),
+                tool: None,
+                finish: None,
+                error: None,
+            },
+        ]);
+        let request = LlmRequest {
+            config: dsh_llm::LlmCallConfig::default(),
+            adapter_defaults: None,
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            purpose: None,
+        };
+        match adapter.stream(request.clone()).await {
+            Err(LlmError::Failure(failure)) => {
+                assert_eq!(failure.code, "CONTEXT_WINDOW_EXCEEDED");
+                assert_eq!(failure.message, "context overflow");
+            }
+            Ok(_) => panic!("expected CONTEXT_WINDOW_EXCEEDED"),
+        }
+        let stream = adapter.stream(request).await.unwrap();
+        let chunks: Vec<_> = stream.collect().await;
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::TextDelta { text, .. } if text == "recovered"
+        )));
     }
 }

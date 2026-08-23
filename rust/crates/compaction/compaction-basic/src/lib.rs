@@ -17,7 +17,8 @@ use dsh_token_meter::TokenMeter;
 use futures::executor::block_on;
 use futures::StreamExt;
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_THRESHOLD_RATIO: f64 = 0.8;
 const DEFAULT_RETAIN_RATIO: f64 = 0.16;
@@ -496,6 +497,13 @@ fn optional_non_negative_int(
     }
 }
 
+/// Per-session overflow-recovery budget, reset after a later assistant message.
+#[derive(Default)]
+struct OverflowRetryState {
+    retries: u32,
+    assistant_seq: u64,
+}
+
 /// Token-budget backend. Thresholds are Config, never hidden defaults in `run`.
 pub struct BasicCompactionEngine {
     /// Resolved TypeScript pressure / retention policy.
@@ -506,6 +514,8 @@ pub struct BasicCompactionEngine {
     lookup: Context,
     /// Test-only adapter; production reads `ctx.llm` from [`Self::lookup`].
     llm: Option<Arc<LlmRuntime>>,
+    /// Overflow attempts since the last assistant message or idle reset.
+    overflow_retries: Mutex<HashMap<String, OverflowRetryState>>,
 }
 
 impl BasicCompactionEngine {
@@ -516,6 +526,7 @@ impl BasicCompactionEngine {
             meter: None,
             lookup: Context::new(),
             llm: None,
+            overflow_retries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -526,6 +537,7 @@ impl BasicCompactionEngine {
             meter: ctx.get::<TokenMeter>(),
             lookup: ctx.clone(),
             llm: None,
+            overflow_retries: Mutex::new(HashMap::new()),
         });
         engine.register_automatic(ctx)?;
         ctx.provide(Arc::new(CompactionRuntime::new(
@@ -536,43 +548,10 @@ impl BasicCompactionEngine {
 
     /// Register automatic listeners.
     pub fn register_automatic(self: &Arc<Self>, ctx: &Context) -> dsh_cordis::Result<()> {
-        let engine = Arc::clone(self);
-        let lookup = ctx.clone();
-        ctx.on_waterfall("agent/pre-step", move |payload, next| {
-            if !engine.policy.auto {
-                return next.call(payload);
-            }
-            if let Some(id) = payload
-                .get("sessionId")
-                .or_else(|| payload.get("agentId"))
-                .and_then(|value| value.as_str())
-            {
-                if let Some(agents) = lookup.get::<AgentRegistry>() {
-                    if let Some(agent) = agents.get(&session_id(id)) {
-                        let meter = lookup.get::<TokenMeter>();
-                        if let Some(pruner) =
-                            lookup.get::<dsh_tool_result_pruner::ToolResultPruner>()
-                        {
-                            let _ = pruner.prune_session(&agent.session(), meter.as_deref());
-                        }
-                        if let Some(meter) = &meter {
-                            let _pressure = meter.estimate_session(&agent.session());
-                        }
-                        let _ = block_on(
-                            engine.compact_if_needed(agent.as_ref(), CompactionTrigger::Pressure),
-                        );
-                    }
-                }
-            }
-            next.call(payload)
-        })?;
-
-        let engine = Arc::clone(self);
-        let lookup = ctx.clone();
-        ctx.on_waterfall("agent/request-error", move |payload, next| {
-            if payload.get("code").and_then(|value| value.as_str())
-                == Some("CONTEXT_WINDOW_EXCEEDED")
-            {
+        if self.policy.auto {
+            let engine = Arc::clone(self);
+            let lookup = ctx.clone();
+            ctx.on_waterfall("agent/pre-step", move |payload, next| {
                 if let Some(id) = payload
                     .get("sessionId")
                     .or_else(|| payload.get("agentId"))
@@ -580,25 +559,44 @@ impl BasicCompactionEngine {
                 {
                     if let Some(agents) = lookup.get::<AgentRegistry>() {
                         if let Some(agent) = agents.get(&session_id(id)) {
+                            let meter = lookup.get::<TokenMeter>();
                             if let Some(pruner) =
                                 lookup.get::<dsh_tool_result_pruner::ToolResultPruner>()
                             {
-                                let _ = pruner.prune_session(
-                                    &agent.session(),
-                                    lookup.get::<TokenMeter>().as_deref(),
-                                );
+                                let _ = pruner.prune_session(&agent.session(), meter.as_deref());
                             }
-                            let _ = block_on(engine.compact_if_needed(
-                                agent.as_ref(),
-                                CompactionTrigger::ContextOverflow,
-                            ));
+                            if let Some(meter) = &meter {
+                                let _pressure = meter.estimate_session(&agent.session());
+                            }
+                            let _ = block_on(
+                                engine.compact_if_needed(agent.as_ref(), CompactionTrigger::Pressure),
+                            );
                         }
                     }
                 }
-                return serde_json::json!({ "kind": "retry" });
-            }
-            next.call(payload)
-        })?;
+                next.call(payload)
+            })?;
+
+            let engine = Arc::clone(self);
+            let lookup = ctx.clone();
+            ctx.on_waterfall("agent/request-error", move |payload, next| {
+                match engine.recover_overflow(&lookup, &payload) {
+                    Some(decision) => decision,
+                    None => next.call(payload),
+                }
+            })?;
+
+            let engine = Arc::clone(self);
+            ctx.on("agent/status", move |payload| {
+                if payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("idle"))
+                {
+                    engine.overflow_retries.lock().expect("overflow retries").clear();
+                }
+            })?;
+        }
 
         let engine = Arc::clone(self);
         let lookup = ctx.clone();
@@ -617,6 +615,50 @@ impl BasicCompactionEngine {
             next.call(payload)
         })?;
         Ok(())
+    }
+
+    /// Authorize one overflow retry only after a durable surface replacement.
+    fn recover_overflow(&self, lookup: &Context, payload: &Value) -> Option<Value> {
+        if payload.get("code").and_then(Value::as_str) != Some("CONTEXT_WINDOW_EXCEEDED") {
+            return None;
+        }
+        let id = payload
+            .get("sessionId")
+            .or_else(|| payload.get("agentId"))
+            .and_then(Value::as_str)?;
+        let agent = lookup.get::<AgentRegistry>()?.get(&session_id(id))?;
+        let session = agent.session();
+        let (provider, model) = last_request_route(&session)?;
+        let policy = self.policy.resolve_target(&provider, &model);
+        if !self.authorize_overflow_retry(&session, policy.max_overflow_retries) {
+            return None;
+        }
+        let generation = session.surface().replace_generation;
+        let _ = block_on(self.compact_if_needed(agent.as_ref(), CompactionTrigger::ContextOverflow));
+        if session.surface().replace_generation <= generation {
+            return None;
+        }
+        self.record_overflow_retry(&session);
+        Some(serde_json::json!({ "kind": "retry" }))
+    }
+
+    fn authorize_overflow_retry(&self, session: &Session, max_retries: u32) -> bool {
+        let assistant_seq = last_assistant_seq(session);
+        let mut map = self.overflow_retries.lock().expect("overflow retries");
+        let state = map.entry(session.id().as_str().to_string()).or_default();
+        if assistant_seq > state.assistant_seq {
+            state.retries = 0;
+            state.assistant_seq = assistant_seq;
+        }
+        state.retries < max_retries
+    }
+
+    fn record_overflow_retry(&self, session: &Session) {
+        let assistant_seq = last_assistant_seq(session);
+        let mut map = self.overflow_retries.lock().expect("overflow retries");
+        let state = map.entry(session.id().as_str().to_string()).or_default();
+        state.retries += 1;
+        state.assistant_seq = assistant_seq;
     }
 
     async fn compact_session(
@@ -890,6 +932,18 @@ fn frame_summary(summary: &[ContentBlock]) -> Vec<ContentBlock> {
     blocks
 }
 
+fn last_assistant_seq(session: &Session) -> u64 {
+    session
+        .events()
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.data {
+            SessionEventData::AssistantMessage { .. } => Some(event.seq),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 fn last_request_route(session: &Session) -> Option<(String, String)> {
     session.events().into_iter().rev().find_map(|event| match event.data {
         SessionEventData::RequestContext {
@@ -1037,6 +1091,9 @@ impl CompactionEngine for BasicCompactionEngine {
         trigger: CompactionTrigger,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
         if trigger == CompactionTrigger::ContextOverflow {
+            if let Some(pruner) = self.lookup.get::<dsh_tool_result_pruner::ToolResultPruner>() {
+                let _ = pruner.prune_session(&agent.session(), self.meter.as_deref());
+            }
             return self.compact_session(agent, true, None).await;
         }
         let session = agent.session();
@@ -1093,12 +1150,15 @@ impl CompactionEngine for BasicCompactionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_agent::{Agent, AgentCancelCause, AgentError, AgentStatus, Inbox, InboxTarget};
+    use dsh_agent::{
+        Agent, AgentCancelCause, AgentError, AgentFactory, AgentStatus, Inbox, InboxTarget,
+    };
     use dsh_llm::{
         call_id, AssistantMessage, LlmAdapter, LlmError, LlmFailure, ToolResultMessage,
     };
     use dsh_session::{session_id, Session, SessionStore};
     use futures::stream;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     struct ScriptedSummarizer {
@@ -1145,6 +1205,7 @@ mod tests {
             meter: Some(Arc::new(TokenMeter::new(4))),
             lookup: Context::new(),
             llm: Some(Arc::new(LlmRuntime::new(Arc::clone(&adapter) as Arc<dyn LlmAdapter>))),
+            overflow_retries: Mutex::new(HashMap::new()),
         };
         (engine, adapter)
     }
@@ -1290,23 +1351,203 @@ mod tests {
         assert!(matches!(err, ManualCompactionError::Busy));
     }
 
+    struct StubFactory;
+
+    impl AgentFactory for StubFactory {
+        fn create(&self, session: Arc<Session>) -> Arc<dyn Agent> {
+            Arc::new(StubAgent {
+                session,
+                inbox: Arc::new(Inbox::default()),
+            })
+        }
+    }
+
+    fn overflow_host(policy: CompactionPolicy) -> (Context, Arc<Session>, dsh_agent::AgentHandle) {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        ctx.provide(Arc::new(agents)).unwrap();
+        ctx.provide(Arc::new(TokenMeter::new(4))).unwrap();
+        let adapter = Arc::new(ScriptedSummarizer {
+            text: "overflow checkpoint".into(),
+            last: Mutex::new(None),
+            fail: false,
+        });
+        ctx.provide(Arc::new(LlmRuntime::new(
+            Arc::clone(&adapter) as Arc<dyn LlmAdapter>,
+        )))
+        .unwrap();
+        BasicCompactionEngine::install(&ctx, policy).unwrap();
+        let session = Arc::new(Session::new(session_id("overflow")));
+        session
+            .append(
+                SessionEventData::RequestHeader {
+                    header: serde_json::json!({
+                        "config": { "provider": "replay", "model": "script" }
+                    }),
+                    reason: "initial".into(),
+                },
+                None,
+            )
+            .unwrap();
+        for label in ["alpha", "bravo", "charlie", "delta"] {
+            append_user(&session, &bulky(label));
+        }
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(Arc::clone(&session))
+            .unwrap();
+        (ctx, session, handle)
+    }
+
+    fn overflow_payload(session: &Session) -> Value {
+        serde_json::json!({
+            "code": "CONTEXT_WINDOW_EXCEEDED",
+            "agentId": session.id().as_str(),
+        })
+    }
+
+    fn recover_overflow(ctx: &Context, session: &Session) -> bool {
+        ctx.waterfall(
+            "agent/request-error",
+            overflow_payload(session),
+            |payload| payload,
+        )
+        .unwrap()
+        .get("kind")
+        .and_then(Value::as_str)
+        == Some("retry")
+    }
+
     #[test]
-    fn install_provides_compaction_and_retries_overflow() {
+    fn install_provides_compaction() {
         let ctx = Context::new();
         ctx.provide(Arc::new(SessionStore::new())).unwrap();
         ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
         ctx.provide(Arc::new(TokenMeter::new(4))).unwrap();
         BasicCompactionEngine::install(&ctx, CompactionPolicy::resolve(None).unwrap()).unwrap();
         assert!(ctx.has_service("compaction"));
+    }
 
-        let recovered = ctx
+    #[test]
+    fn overflow_without_agent_or_route_delegates() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        ctx.provide(Arc::new(TokenMeter::new(4))).unwrap();
+        BasicCompactionEngine::install(&ctx, CompactionPolicy::resolve(None).unwrap()).unwrap();
+        let missing_agent = ctx
             .waterfall(
                 "agent/request-error",
                 serde_json::json!({ "code": "CONTEXT_WINDOW_EXCEEDED" }),
                 |payload| payload,
             )
             .unwrap();
-        assert_eq!(recovered["kind"], "retry");
+        assert_ne!(missing_agent.get("kind").and_then(Value::as_str), Some("retry"));
+
+        let session = Arc::new(Session::new(session_id("headerless")));
+        append_user(&session, &bulky("only"));
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(agents)).unwrap();
+        ctx.provide(Arc::new(TokenMeter::new(4))).unwrap();
+        BasicCompactionEngine::install(&ctx, CompactionPolicy::resolve(None).unwrap()).unwrap();
+        let _handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(Arc::clone(&session))
+            .unwrap();
+        assert!(!recover_overflow(&ctx, &session));
+    }
+
+    #[test]
+    fn overflow_retries_only_after_replacement_and_honors_cap() {
+        let (ctx, session, _handle) = overflow_host(CompactionPolicy::resolve(None).unwrap());
+        let generation = session.surface().replace_generation;
+        assert!(recover_overflow(&ctx, &session));
+        assert!(session.surface().replace_generation > generation);
+        assert!(session
+            .events()
+            .iter()
+            .any(|event| matches!(event.data, SessionEventData::CompactionSummary { .. })));
+        assert!(!recover_overflow(&ctx, &session));
+    }
+
+    #[test]
+    fn overflow_zero_retries_disables_recovery() {
+        let (ctx, session, _handle) = overflow_host(
+            CompactionPolicy::resolve(Some(&serde_json::json!({ "maxOverflowRetries": 0 })))
+                .unwrap(),
+        );
+        assert!(!recover_overflow(&ctx, &session));
+        assert!(!session
+            .events()
+            .iter()
+            .any(|event| matches!(event.data, SessionEventData::CompactionStart { .. })));
+    }
+
+    #[test]
+    fn overflow_model_policy_overrides_retry_cap() {
+        let (ctx, session, _handle) = overflow_host(
+            CompactionPolicy::resolve(Some(&serde_json::json!({
+                "maxOverflowRetries": 2,
+                "modelPolicies": [{
+                    "provider": "replay",
+                    "model": "script",
+                    "maxOverflowRetries": 0
+                }]
+            })))
+            .unwrap(),
+        );
+        assert!(!recover_overflow(&ctx, &session));
+    }
+
+    #[test]
+    fn overflow_resets_after_a_later_assistant_message() {
+        let (ctx, session, _handle) = overflow_host(CompactionPolicy::resolve(None).unwrap());
+        assert!(recover_overflow(&ctx, &session));
+        session
+            .append(
+                SessionEventData::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    message: AssistantMessage::model(
+                        vec![ContentBlock::text("recovered")],
+                        "replay",
+                        "script",
+                    ),
+                    usage: None,
+                },
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+        for label in ["echo", "foxtrot"] {
+            append_user(&session, &bulky(label));
+        }
+        assert!(recover_overflow(&ctx, &session));
+    }
+
+    #[test]
+    fn overflow_resets_on_idle_status() {
+        let (ctx, session, _handle) = overflow_host(CompactionPolicy::resolve(None).unwrap());
+        assert!(recover_overflow(&ctx, &session));
+        ctx.emit("agent/status", serde_json::json!({ "status": "Idle" }));
+        for label in ["echo", "foxtrot"] {
+            append_user(&session, &bulky(label));
+        }
+        assert!(recover_overflow(&ctx, &session));
+    }
+
+    #[test]
+    fn auto_false_skips_overflow_recovery() {
+        let (ctx, session, _handle) = overflow_host(
+            CompactionPolicy::resolve(Some(&serde_json::json!({ "auto": false }))).unwrap(),
+        );
+        assert!(!recover_overflow(&ctx, &session));
     }
 
     #[test]
@@ -1409,6 +1650,7 @@ mod tests {
             meter: Some(Arc::new(TokenMeter::new(1))),
             lookup: Context::new(),
             llm: None,
+            overflow_retries: Mutex::new(HashMap::new()),
         };
         assert!(engine
             .compact_if_needed(&agent, CompactionTrigger::Pressure)
@@ -1479,6 +1721,7 @@ mod tests {
             llm: Some(Arc::new(LlmRuntime::new(
                 Arc::clone(&adapter) as Arc<dyn LlmAdapter>
             ))),
+            overflow_retries: Mutex::new(HashMap::new()),
         };
         let err = engine.compact_now(&agent, None).await.unwrap_err();
         assert!(matches!(err, ManualCompactionError::Summary));

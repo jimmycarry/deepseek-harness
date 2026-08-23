@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 dsh-acp.workspace = true
 dsh-agent.workspace = true
+dsh-agent-loop.workspace = true
 dsh-app-boot.workspace = true
 dsh-bundle-headless.workspace = true
 dsh-commands.workspace = true

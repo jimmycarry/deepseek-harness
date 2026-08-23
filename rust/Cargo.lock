@@ -541,6 +541,7 @@ dependencies = [
  "dsh-agent",
  "dsh-cordis",
  "dsh-llm",
+ "dsh-session",
  "thiserror",
 ]
 
@@ -808,6 +809,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-acp",
  "dsh-agent",
+ "dsh-agent-loop",
  "dsh-app-boot",
  "dsh-bundle-headless",
  "dsh-commands",

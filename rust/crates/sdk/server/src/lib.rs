@@ -631,16 +631,19 @@ mod tests {
                                 .into(),
                     }),
                     finish: None,
+                    error: None,
                 },
                 ReplayTurn {
                     text: "child-done".into(),
                     tool: None,
                     finish: None,
+                    error: None,
                 },
                 ReplayTurn {
                     text: "parent-done".into(),
                     tool: None,
                     finish: None,
+                    error: None,
                 },
             ])),
         )

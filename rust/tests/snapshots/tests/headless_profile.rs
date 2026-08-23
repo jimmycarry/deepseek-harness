@@ -1728,6 +1728,65 @@ async fn compact_preserves_tool_pairing_profile() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn overflow_recovery_retries_after_compact_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-q-overflow-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let overlay = replay_overlay(serde_json::json!({
+        "turns": [
+            {
+                "error": {
+                    "message": "context overflow",
+                    "code": "CONTEXT_WINDOW_EXCEEDED"
+                }
+            },
+            { "text": "recovered after compact" }
+        ],
+        "auxiliary": {
+            "compaction": "## Primary Request and Intent\n- keep going after overflow"
+        }
+    }));
+    let ctx = mount_profile_in(&dir, "unused", overlay);
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(Arc::clone(&session))
+        .unwrap();
+    for label in ["alpha", "bravo", "charlie", "delta"] {
+        session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text(format!(
+                    "{label} {}",
+                    "context ".repeat(40)
+                ))),
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+    }
+    dsh_agent_loop::run_followup(
+        handle.agent.as_ref(),
+        UserMessage::text("continue after overflow"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        handle.agent.session().last_assistant_text().as_deref(),
+        Some("recovered after compact")
+    );
+    let events = events_of(&session);
+    let types = types_of(&events);
+    for name in ["compaction/start", "compaction/summary", "compaction/end"] {
+        assert!(types.iter().any(|found| found == name), "{types:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn typescript_headless_profile_types_are_known() {
     let path = concat!(
