@@ -144,7 +144,9 @@ pub struct BasicCompactionEngine {
     pub policy: CompactionPolicy,
     /// Meter used to price the shadowed span, when mounted.
     meter: Option<Arc<TokenMeter>>,
-    /// `ctx.llm` used for the one-shot `purpose: "compaction"` call.
+    /// Host used to resolve `ctx.llm` at summarize time, not at mount.
+    lookup: Context,
+    /// Test-only adapter; production reads `ctx.llm` from [`Self::lookup`].
     llm: Option<Arc<LlmRuntime>>,
 }
 
@@ -154,6 +156,7 @@ impl BasicCompactionEngine {
         Self {
             policy,
             meter: None,
+            lookup: Context::new(),
             llm: None,
         }
     }
@@ -163,7 +166,8 @@ impl BasicCompactionEngine {
         let engine = Arc::new(Self {
             policy,
             meter: ctx.get::<TokenMeter>(),
-            llm: ctx.get::<LlmRuntime>(),
+            lookup: ctx.clone(),
+            llm: None,
         });
         engine.register_automatic(ctx)?;
         ctx.provide(Arc::new(CompactionRuntime::new(
@@ -340,8 +344,12 @@ impl BasicCompactionEngine {
                     .sum()
             })
             .unwrap_or(0);
+        let llm = self
+            .llm
+            .clone()
+            .or_else(|| self.lookup.get::<LlmRuntime>());
         let summarized = match summarize_with_llm(
-            self.llm.as_deref(),
+            llm.as_deref(),
             &self.policy,
             &session,
             &shadowed,
@@ -689,6 +697,7 @@ mod tests {
             })))
             .unwrap(),
             meter: Some(Arc::new(TokenMeter::new(4))),
+            lookup: Context::new(),
             llm: Some(Arc::new(LlmRuntime::new(Arc::clone(&adapter) as Arc<dyn LlmAdapter>))),
         };
         (engine, adapter)
@@ -866,6 +875,7 @@ mod tests {
             })))
             .unwrap(),
             meter: Some(Arc::new(TokenMeter::new(1))),
+            lookup: Context::new(),
             llm: None,
         };
         assert!(engine
@@ -934,6 +944,7 @@ mod tests {
             })))
             .unwrap(),
             meter: None,
+            lookup: Context::new(),
             llm: Some(Arc::new(LlmRuntime::new(
                 Arc::clone(&adapter) as Arc<dyn LlmAdapter>
             ))),
