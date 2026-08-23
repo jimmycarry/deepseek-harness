@@ -310,12 +310,14 @@ impl Tool for EditTool {
     }
 }
 
+#[derive(Debug)]
 struct ReadInput {
     file_path: String,
     offset: usize,
     limit: usize,
 }
 
+#[derive(Debug)]
 struct EditInput {
     file_path: String,
     old_string: String,

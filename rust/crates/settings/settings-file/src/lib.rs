@@ -115,7 +115,7 @@ fn parse_mapping(lines: &[(usize, &str)], start: usize, indent: usize) -> Result
                 map.insert(key, Value::Object(Map::new()));
             }
         } else {
-            map.insert(key, scalar(rest));
+            map.insert(key, scalar(&rest));
         }
     }
     Ok((Value::Object(map), i))
