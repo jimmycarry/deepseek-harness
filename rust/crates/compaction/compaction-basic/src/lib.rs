@@ -257,7 +257,7 @@ impl BasicCompactionEngine {
         Ok(())
     }
 
-    fn compact_session(
+    async fn compact_session(
         &self,
         agent: &dyn Agent,
         force: bool,
@@ -345,7 +345,9 @@ impl BasicCompactionEngine {
             &self.policy,
             &session,
             &shadowed,
-        ) {
+        )
+        .await
+        {
             Ok(summarized) => summarized,
             Err(error) => {
                 session
@@ -533,7 +535,7 @@ fn shadowed_messages(session: &Session, shadowed: &[u64]) -> Vec<Message> {
         .collect()
 }
 
-fn summarize_with_llm(
+async fn summarize_with_llm(
     llm: Option<&LlmRuntime>,
     policy: &CompactionPolicy,
     session: &Session,
@@ -575,47 +577,45 @@ fn summarize_with_llm(
         tools,
         purpose: Some("compaction".into()),
     };
-    block_on(async {
-        let stream = llm
-            .stream(request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut assembler = BlockAssembler::default();
-        let mut finish: Option<FinishReason> = None;
-        futures::pin_mut!(stream);
-        while let Some(chunk) = stream.next().await {
-            if let StreamChunk::Finish { reason, .. } = &chunk {
-                finish = Some(reason.clone());
+    let stream = llm
+        .stream(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut assembler = BlockAssembler::default();
+    let mut finish: Option<FinishReason> = None;
+    futures::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        if let StreamChunk::Finish { reason, .. } = &chunk {
+            finish = Some(reason.clone());
+        }
+        assembler.push(&chunk);
+    }
+    if let Some(reason) = finish.as_ref() {
+        match reason {
+            FinishReason::Error { failure } | FinishReason::Aborted { failure } => {
+                return Err(failure.message.clone());
             }
-            assembler.push(&chunk);
-        }
-        if let Some(reason) = finish.as_ref() {
-            match reason {
-                FinishReason::Error { failure } | FinishReason::Aborted { failure } => {
-                    return Err(failure.message.clone());
-                }
-                FinishReason::MaxTokens => {
-                    return Err(
-                        "summarization truncated at the token cap (incomplete checkpoint)".into(),
-                    );
-                }
-                _ => {}
+            FinishReason::MaxTokens => {
+                return Err(
+                    "summarization truncated at the token cap (incomplete checkpoint)".into(),
+                );
             }
+            _ => {}
         }
-        let summary_text = assembler
-            .finish()
-            .into_iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        if summary_text.trim().is_empty() {
-            return Err("summarization produced no text summary content".into());
-        }
-        Ok(SummarizedText { summary_text })
-    })
+    }
+    let summary_text = assembler
+        .finish()
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if summary_text.trim().is_empty() {
+        return Err("summarization produced no text summary content".into());
+    }
+    Ok(SummarizedText { summary_text })
 }
 
 #[async_trait]
@@ -626,6 +626,7 @@ impl CompactionEngine for BasicCompactionEngine {
         trigger: CompactionTrigger,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
         self.compact_session(agent, trigger == CompactionTrigger::ContextOverflow, None)
+            .await
     }
 
     async fn compact_now(
@@ -633,7 +634,7 @@ impl CompactionEngine for BasicCompactionEngine {
         agent: &dyn Agent,
         source_command_id: Option<&str>,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
-        self.compact_session(agent, true, source_command_id)
+        self.compact_session(agent, true, source_command_id).await
     }
 }
 
