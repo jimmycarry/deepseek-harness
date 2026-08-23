@@ -1,24 +1,34 @@
 //! File-backed `ctx.settings`. Loads `$DSH_HOME/settings.yaml` (or an explicit
-//! path) at mount. A missing file is an empty document. Invalid YAML fails loud.
+//! path) at mount. A missing file is an empty document. Invalid YAML at mount
+//! fails loud. When `watch` is on (the default), later reads re-load the
+//! document after the debounce window; an unreadable or invalid live edit
+//! keeps the last good document.
 
 use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_home_paths::resolve_dsh_home;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Plugin role name matching the TypeScript `export const name`.
 pub fn name() -> &'static str {
     "settings-file"
 }
 
+struct DocumentState {
+    document: Value,
+    text: Option<String>,
+}
+
 /// `ctx.settings`: one raw document of per-namespace sections.
-#[derive(Debug, Clone)]
 pub struct SettingsRuntime {
     /// Absolute path of the settings document.
     pub path: PathBuf,
-    /// Parsed document object. Missing file yields `{}`.
-    pub document: Value,
+    watch: bool,
+    debounce_ms: u64,
+    last_probe: Mutex<Option<Instant>>,
+    state: Mutex<DocumentState>,
 }
 
 impl Service for SettingsRuntime {
@@ -26,25 +36,122 @@ impl Service for SettingsRuntime {
 }
 
 impl SettingsRuntime {
-    /// One top-level section, when present.
-    pub fn section(&self, name: &str) -> Option<&Value> {
-        self.document.get(name)
+    /// One top-level section, when present. Reloads a watched document first.
+    pub fn section(&self, name: &str) -> Option<Value> {
+        self.refresh();
+        self.state
+            .lock()
+            .expect("settings")
+            .document
+            .get(name)
+            .cloned()
+    }
+
+    /// Current document object. Reloads a watched document first.
+    pub fn document(&self) -> Value {
+        self.refresh();
+        self.state.lock().expect("settings").document.clone()
+    }
+
+    /// Re-read the file when watching is on. Unchanged text is a no-op.
+    /// A missing file becomes `{}`. A live parse or I/O failure keeps the last
+    /// good document.
+    pub fn refresh(&self) {
+        if !self.watch {
+            return;
+        }
+        {
+            let mut last = self.last_probe.lock().expect("settings probe");
+            if let Some(previous) = *last {
+                if self.debounce_ms > 0
+                    && previous.elapsed() < Duration::from_millis(self.debounce_ms)
+                {
+                    return;
+                }
+            }
+            *last = Some(Instant::now());
+        }
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return,
+        };
+        let mut state = self.state.lock().expect("settings");
+        if text.as_deref() == state.text.as_deref() {
+            return;
+        }
+        match text {
+            None => {
+                state.text = None;
+                state.document = Value::Object(Map::new());
+            }
+            Some(text) => match parse_settings_yaml(&text) {
+                Ok(document) => {
+                    state.text = Some(text);
+                    state.document = document;
+                }
+                Err(_) => {}
+            },
+        }
     }
 }
 
 /// Resolve the document path from plugin config.
-pub fn resolve_path(config: Option<&Value>) -> PathBuf {
-    if let Some(path) = config
+///
+/// # Errors
+/// An extension other than `.yaml`, `.yml`, or `.json`.
+pub fn resolve_path(config: Option<&Value>) -> Result<PathBuf> {
+    let path = if let Some(path) = config
         .and_then(|value| value.get("path"))
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
     {
-        return PathBuf::from(path);
+        PathBuf::from(path)
+    } else {
+        let home = config
+            .and_then(|value| value.get("dshHome"))
+            .and_then(Value::as_str);
+        resolve_dsh_home(home).join("settings.yaml")
+    };
+    assert_supported_extension(&path)?;
+    Ok(path)
+}
+
+fn assert_supported_extension(path: &Path) -> Result<()> {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "yaml" | "yml" | "json") {
+        return Ok(());
     }
-    let home = config
-        .and_then(|value| value.get("dshHome"))
-        .and_then(Value::as_str);
-    resolve_dsh_home(home).join("settings.yaml")
+    Err(CordisError::Validation(format!(
+        "settings-file: extension \"{}\" is not supported (use .yaml, .yml, or .json)",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_default()
+    )))
+}
+
+fn resolve_watch(config: Option<&Value>) -> Result<(bool, u64)> {
+    let watch = match config.and_then(|value| value.get("watch")) {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(CordisError::Validation(
+                "settings-file: watch must be a boolean".into(),
+            ))
+        }
+    };
+    let debounce_ms = match config.and_then(|value| value.get("debounceMs")) {
+        None => 100,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            CordisError::Validation("settings-file: debounceMs must be an integer".into())
+        })?,
+    };
+    Ok((watch, debounce_ms))
 }
 
 /// Load the document. Missing file is `{}`; unreadable or invalid YAML fails.
@@ -161,9 +268,27 @@ fn scalar(text: &str) -> Value {
 
 /// Provide `ctx.settings` from the resolved document.
 pub fn install(ctx: &Context, config: Option<&Value>) -> Result<()> {
-    let path = resolve_path(config);
-    let document = load_document(&path)?;
-    ctx.provide(Arc::new(SettingsRuntime { path, document }))
+    let path = resolve_path(config)?;
+    let (watch, debounce_ms) = resolve_watch(config)?;
+    let text = if path.exists() {
+        Some(
+            std::fs::read_to_string(&path)
+                .map_err(|error| CordisError::plugin(format!("settings-file: {error}")))?,
+        )
+    } else {
+        None
+    };
+    let document = match &text {
+        None => Value::Object(Map::new()),
+        Some(text) => parse_settings_yaml(text)?,
+    };
+    ctx.provide(Arc::new(SettingsRuntime {
+        path,
+        watch,
+        debounce_ms,
+        last_probe: Mutex::new(None),
+        state: Mutex::new(DocumentState { document, text }),
+    }))
 }
 
 #[cfg(test)]
@@ -211,8 +336,8 @@ mod tests {
         assert_eq!(
             settings
                 .section("llm-deepseek")
-                .and_then(|value| value.get("baseURL")),
-            Some(&serde_json::json!("https://example.test"))
+                .and_then(|value| value.get("baseURL").cloned()),
+            Some(serde_json::json!("https://example.test"))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -220,5 +345,73 @@ mod tests {
     #[test]
     fn rejects_sequence_document() {
         assert!(parse_settings_yaml("- not a mapping\n").is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_extension() {
+        assert!(resolve_path(Some(&serde_json::json!({ "path": "/tmp/settings.txt" }))).is_err());
+    }
+
+    #[test]
+    fn watched_document_reloads_after_external_edit() {
+        let dir = stamp_dir("reload");
+        let path = dir.join("settings.yaml");
+        std::fs::write(&path, "llm-deepseek:\n  baseURL: https://first.test\n").unwrap();
+        let ctx = Context::new();
+        install(
+            &ctx,
+            Some(&serde_json::json!({
+                "path": path.to_string_lossy(),
+                "debounceMs": 0
+            })),
+        )
+        .unwrap();
+        let settings = ctx.service::<SettingsRuntime>().unwrap();
+        assert_eq!(
+            settings
+                .section("llm-deepseek")
+                .and_then(|value| value.get("baseURL").cloned()),
+            Some(serde_json::json!("https://first.test"))
+        );
+        std::fs::write(&path, "llm-deepseek:\n  baseURL: https://second.test\n").unwrap();
+        assert_eq!(
+            settings
+                .section("llm-deepseek")
+                .and_then(|value| value.get("baseURL").cloned()),
+            Some(serde_json::json!("https://second.test"))
+        );
+        std::fs::write(&path, "- not a mapping\n").unwrap();
+        assert_eq!(
+            settings
+                .section("llm-deepseek")
+                .and_then(|value| value.get("baseURL").cloned()),
+            Some(serde_json::json!("https://second.test"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_false_keeps_the_mount_document() {
+        let dir = stamp_dir("nowatch");
+        let path = dir.join("settings.yaml");
+        std::fs::write(&path, "llm-deepseek:\n  baseURL: https://first.test\n").unwrap();
+        let ctx = Context::new();
+        install(
+            &ctx,
+            Some(&serde_json::json!({
+                "path": path.to_string_lossy(),
+                "watch": false
+            })),
+        )
+        .unwrap();
+        std::fs::write(&path, "llm-deepseek:\n  baseURL: https://second.test\n").unwrap();
+        let settings = ctx.service::<SettingsRuntime>().unwrap();
+        assert_eq!(
+            settings
+                .section("llm-deepseek")
+                .and_then(|value| value.get("baseURL").cloned()),
+            Some(serde_json::json!("https://first.test"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

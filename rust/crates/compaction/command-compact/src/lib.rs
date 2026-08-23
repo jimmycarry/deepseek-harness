@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use dsh_agent::AgentRegistry;
-use dsh_commands::{Command, CommandHandler, CommandRegistry};
+use dsh_commands::{Command, CommandHandler, CommandInvocation, CommandRegistry};
 use dsh_compaction::{CompactionRuntime, ManualCompactionError};
 use dsh_cordis::Context;
 use dsh_session::session_id;
@@ -24,31 +24,55 @@ struct CompactHandler {
 #[async_trait]
 impl CommandHandler for CompactHandler {
     async fn handle(&self, args: &str) -> Result<String, String> {
+        self.run(args, None, None)
+    }
+
+    async fn handle_invocation(
+        &self,
+        invocation: CommandInvocation<'_>,
+    ) -> Result<String, String> {
+        self.run(
+            invocation.raw_input,
+            Some(invocation.session.id().as_str()),
+            Some(invocation.command_id),
+        )
+    }
+}
+
+impl CompactHandler {
+    fn run(
+        &self,
+        args: &str,
+        session_id_hint: Option<&str>,
+        command_id: Option<&str>,
+    ) -> Result<String, String> {
         if !args.trim().is_empty() {
             return Err(USAGE.to_string());
         }
         let Some(agents) = self.lookup.get::<AgentRegistry>() else {
             return Err("agents service is not provided".into());
         };
-        let Some(id) = self
-            .lookup
-            .serial("command/compact", serde_json::json!({}))
-            .and_then(|value| {
-                value
-                    .get("sessionId")
-                    .and_then(|value| value.as_str().map(str::to_string))
-            })
-        else {
-            return Err("sessionId required".into());
+        let id = match session_id_hint {
+            Some(id) => id.to_string(),
+            None => self
+                .lookup
+                .serial("command/compact", serde_json::json!({}))
+                .and_then(|value| {
+                    value
+                        .get("sessionId")
+                        .and_then(|value| value.as_str().map(str::to_string))
+                })
+                .ok_or_else(|| "sessionId required".to_string())?,
         };
         let Some(agent) = agents.get(&session_id(id)) else {
             return Err("unknown session".into());
         };
-        let command_id = format!("cmd-{}", uuid::Uuid::new_v4());
+        let generated = format!("cmd-{}", uuid::Uuid::new_v4());
+        let command_id = command_id.unwrap_or(generated.as_str());
         match block_on(
             self.compaction
                 .engine()
-                .compact_now(agent.as_ref(), Some(&command_id)),
+                .compact_now(agent.as_ref(), Some(command_id)),
         ) {
             Ok(None) => Ok("No compactable history yet.".into()),
             Ok(Some(result)) => Ok(format!(
@@ -201,5 +225,41 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err, USAGE);
+    }
+
+    #[tokio::test]
+    async fn execute_compacts_the_invocation_session() {
+        let ctx = Context::new();
+        let commands = Arc::new(CommandRegistry::new());
+        ctx.provide(Arc::clone(&commands)).unwrap();
+        ctx.provide(Arc::new(CompactionRuntime::new(Arc::new(NullEngine))))
+            .unwrap();
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        ctx.provide(Arc::new(agents)).unwrap();
+        install(&ctx).unwrap();
+
+        let session = Arc::new(Session::new(session_id("exec")));
+        let _handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(Arc::clone(&session))
+            .unwrap();
+        let outcome = commands
+            .execute(session.as_ref(), "/compact")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.text, "No compactable history yet.");
+        let types: Vec<String> = session
+            .events()
+            .into_iter()
+            .map(|event| match event.data {
+                dsh_session::SessionEventData::Extension { type_name, .. } => type_name,
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(types, vec!["command/run".to_string(), "command/done".to_string()]);
     }
 }

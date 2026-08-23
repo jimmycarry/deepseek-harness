@@ -30,6 +30,8 @@ pub struct CommandInvocation<'a> {
     pub session: &'a Session,
     /// Remainder of the typed line after the command name.
     pub raw_input: &'a str,
+    /// Pairing id already written on `command/run`.
+    pub command_id: &'a str,
 }
 
 /// Body of one command.
@@ -168,6 +170,7 @@ impl CommandRegistry {
             .handle_invocation(CommandInvocation {
                 session,
                 raw_input: args,
+                command_id: &command_id,
             })
             .await;
         let (success, text) = match &outcome {

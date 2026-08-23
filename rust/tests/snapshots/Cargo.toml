@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 dsh-acp.workspace = true
+dsh-agent.workspace = true
 dsh-app-boot.workspace = true
 dsh-bundle-headless.workspace = true
 dsh-commands.workspace = true
@@ -18,6 +19,7 @@ dsh-cordis.workspace = true
 dsh-cordis-loader.workspace = true
 dsh-llm.workspace = true
 dsh-session.workspace = true
+dsh-settings-file.workspace = true
 dsh-subagent.workspace = true
 dsh-tools.workspace = true
 serde_json.workspace = true

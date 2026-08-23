@@ -8,40 +8,126 @@ use dsh_compaction::{
 };
 use dsh_cordis::Context;
 use dsh_llm::ContentBlock;
-use dsh_session::{session_id, SessionEventData, SurfaceOp};
+use dsh_session::{session_id, Session, SessionEventData, SurfaceOp};
 use dsh_token_meter::TokenMeter;
 use futures::executor::block_on;
+use serde_json::Value;
 use std::sync::Arc;
+
+const DEFAULT_THRESHOLD_RATIO: f64 = 0.8;
+const DEFAULT_RETAIN_RATIO: f64 = 0.16;
+
+/// TypeScript `BasicCompactionConfig` fields used for pressure and retention.
+#[derive(Debug, Clone)]
+pub struct CompactionPolicy {
+    /// Request-pressure fraction of the routed context window.
+    pub threshold_ratio: f64,
+    /// Verbatim-tail fraction of the routed context window.
+    pub retain_ratio: f64,
+    /// Explicit tail budget in tokens, when set.
+    pub retain_tokens: Option<u64>,
+    /// Whether `agent/pre-step` runs automatic pressure compaction.
+    pub auto: bool,
+}
+
+impl CompactionPolicy {
+    /// Validate raw cordis.yml config.
+    ///
+    /// # Errors
+    /// Unknown keys, non-boolean `auto`, ratios outside `(0, 1]`, or
+    /// `retainRatio >= thresholdRatio`.
+    pub fn resolve(config: Option<&Value>) -> Result<Self, String> {
+        if let Some(Value::Object(map)) = config {
+            for key in map.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "thresholdRatio"
+                        | "retainRatio"
+                        | "retainTokens"
+                        | "summarizationProvider"
+                        | "summarizationModel"
+                        | "maxTokens"
+                        | "compactionRetries"
+                        | "maxOverflowRetries"
+                        | "modelPolicies"
+                        | "auto"
+                ) {
+                    return Err(format!(
+                        "compaction-basic: unknown config key {key} (use thresholdRatio / retainRatio)"
+                    ));
+                }
+            }
+        }
+        let threshold_ratio = ratio_field(config, "thresholdRatio", DEFAULT_THRESHOLD_RATIO)?;
+        let retain_ratio = ratio_field(config, "retainRatio", DEFAULT_RETAIN_RATIO)?;
+        if retain_ratio >= threshold_ratio {
+            return Err(format!(
+                "compaction-basic: retainRatio ({retain_ratio}) must be less than the resolved thresholdRatio ({threshold_ratio})"
+            ));
+        }
+        if config.and_then(|value| value.get("retainRatio")).is_some()
+            && config.and_then(|value| value.get("retainTokens")).is_some()
+        {
+            return Err(
+                "compaction-basic: retainRatio and retainTokens are mutually exclusive".into(),
+            );
+        }
+        let retain_tokens = match config.and_then(|value| value.get("retainTokens")) {
+            None => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                "compaction-basic: retainTokens must be an integer".to_string()
+            })?),
+        };
+        let auto = match config.and_then(|value| value.get("auto")) {
+            None => true,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err("compaction-basic: auto must be a boolean".into()),
+        };
+        Ok(Self {
+            threshold_ratio,
+            retain_ratio,
+            retain_tokens,
+            auto,
+        })
+    }
+}
+
+fn ratio_field(config: Option<&Value>, key: &str, default: f64) -> Result<f64, String> {
+    match config.and_then(|value| value.get(key)) {
+        None => Ok(default),
+        Some(value) => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| format!("compaction-basic: {key} must be a number"))?;
+            if number <= 0.0 || number > 1.0 {
+                return Err(format!("compaction-basic: {key} must be a number in (0, 1]"));
+            }
+            Ok(number)
+        }
+    }
+}
 
 /// Token-budget backend. Thresholds are Config, never hidden defaults in `run`.
 pub struct BasicCompactionEngine {
-    /// Compact when surface message count reaches this value.
-    pub threshold_messages: usize,
-    /// Messages to keep after the checkpoint.
-    pub retain_tail: usize,
+    /// Resolved TypeScript pressure / retention policy.
+    pub policy: CompactionPolicy,
     /// Meter used to price the shadowed span, when mounted.
     meter: Option<Arc<TokenMeter>>,
 }
 
 impl BasicCompactionEngine {
     /// Build from explicit policy without a token meter.
-    pub fn new(threshold_messages: usize, retain_tail: usize) -> Self {
+    pub fn new(policy: CompactionPolicy) -> Self {
         Self {
-            threshold_messages,
-            retain_tail,
+            policy,
             meter: None,
         }
     }
 
     /// Provide `ctx.compaction` and register automatic listeners.
-    pub fn install(
-        ctx: &Context,
-        threshold_messages: usize,
-        retain_tail: usize,
-    ) -> dsh_cordis::Result<Arc<Self>> {
+    pub fn install(ctx: &Context, policy: CompactionPolicy) -> dsh_cordis::Result<Arc<Self>> {
         let engine = Arc::new(Self {
-            threshold_messages,
-            retain_tail,
+            policy,
             meter: ctx.get::<TokenMeter>(),
         });
         engine.register_automatic(ctx)?;
@@ -56,7 +142,14 @@ impl BasicCompactionEngine {
         let engine = Arc::clone(self);
         let lookup = ctx.clone();
         ctx.on_waterfall("agent/pre-step", move |payload, next| {
-            if let Some(id) = payload.get("sessionId").and_then(|value| value.as_str()) {
+            if !engine.policy.auto {
+                return next.call(payload);
+            }
+            if let Some(id) = payload
+                .get("sessionId")
+                .or_else(|| payload.get("agentId"))
+                .and_then(|value| value.as_str())
+            {
                 if let Some(agents) = lookup.get::<AgentRegistry>() {
                     if let Some(agent) = agents.get(&session_id(id)) {
                         let meter = lookup.get::<TokenMeter>();
@@ -83,7 +176,11 @@ impl BasicCompactionEngine {
             if payload.get("code").and_then(|value| value.as_str())
                 == Some("CONTEXT_WINDOW_EXCEEDED")
             {
-                if let Some(id) = payload.get("sessionId").and_then(|value| value.as_str()) {
+                if let Some(id) = payload
+                    .get("sessionId")
+                    .or_else(|| payload.get("agentId"))
+                    .and_then(|value| value.as_str())
+                {
                     if let Some(agents) = lookup.get::<AgentRegistry>() {
                         if let Some(agent) = agents.get(&session_id(id)) {
                             if let Some(pruner) =
@@ -109,7 +206,11 @@ impl BasicCompactionEngine {
         let engine = Arc::clone(self);
         let lookup = ctx.clone();
         ctx.on_waterfall("agent/maintenance", move |payload, next| {
-            if let Some(id) = payload.get("sessionId").and_then(|value| value.as_str()) {
+            if let Some(id) = payload
+                .get("sessionId")
+                .or_else(|| payload.get("agentId"))
+                .and_then(|value| value.as_str())
+            {
                 if let Some(agents) = lookup.get::<AgentRegistry>() {
                     if let Some(agent) = agents.get(&session_id(id)) {
                         let _ = block_on(engine.compact_now(agent.as_ref(), None));
@@ -139,13 +240,34 @@ impl BasicCompactionEngine {
             return Err(ManualCompactionError::Busy);
         }
         let surface = session.surface();
-        if !force && surface.nodes.len() < self.threshold_messages {
+        let meter = self.meter.as_deref();
+        let total_tokens = meter
+            .map(|meter| meter.estimate_session(&session) as u64)
+            .unwrap_or(0);
+        let window = last_context_window(&session);
+        if !force {
+            let Some(window) = window else {
+                return Ok(None);
+            };
+            let threshold = ((window as f64) * self.policy.threshold_ratio).floor() as u64;
+            if total_tokens < threshold {
+                return Ok(None);
+            }
+        }
+        let retain_tokens = if force {
+            0
+        } else {
+            self.policy.retain_tokens.unwrap_or_else(|| {
+                window
+                    .map(|window| ((window as f64) * self.policy.retain_ratio).floor() as u64)
+                    .unwrap_or(0)
+            })
+        };
+        let retain_tail = retain_tail_nodes(&session, meter, retain_tokens);
+        if surface.nodes.len() <= retain_tail + 1 {
             return Ok(None);
         }
-        if surface.nodes.len() <= self.retain_tail + 1 {
-            return Ok(None);
-        }
-        let end_idx = surface.nodes.len() - 1 - self.retain_tail;
+        let end_idx = surface.nodes.len() - 1 - retain_tail;
         let start = surface.nodes[0];
         let end = surface.nodes[end_idx];
         let shadowed = surface.nodes[..=end_idx].to_vec();
@@ -244,6 +366,55 @@ impl BasicCompactionEngine {
     }
 }
 
+fn last_context_window(session: &Session) -> Option<u32> {
+    session.events().into_iter().rev().find_map(|event| match event.data {
+        SessionEventData::RequestContext {
+            context_window, ..
+        } => context_window,
+        _ => None,
+    })
+}
+
+fn retain_tail_nodes(session: &Session, meter: Option<&TokenMeter>, retain_tokens: u64) -> usize {
+    let nodes = session.surface().nodes;
+    if nodes.is_empty() {
+        return 0;
+    }
+    if retain_tokens == 0 {
+        return 1;
+    }
+    let Some(meter) = meter else {
+        return 1;
+    };
+    let events = session.events();
+    let mut kept = 0u64;
+    let mut count = 0usize;
+    for seq in nodes.iter().rev() {
+        let cost = events
+            .iter()
+            .find(|event| event.seq == *seq)
+            .map(|event| match &event.data {
+                SessionEventData::UserMessage(message) => {
+                    meter.estimate_content(&message.content) as u64
+                }
+                SessionEventData::AssistantMessage { message, .. } => {
+                    meter.estimate_content(&message.content) as u64
+                }
+                SessionEventData::ToolResult { message, .. } => {
+                    meter.estimate_content(message.result_blocks()) as u64
+                }
+                _ => 0,
+            })
+            .unwrap_or(0);
+        if count > 0 && kept + cost > retain_tokens {
+            break;
+        }
+        kept += cost;
+        count += 1;
+    }
+    count.max(1)
+}
+
 /// Model-facing framing that precedes the `<compacted-summary>` block.
 pub const CHECKPOINT_PREAMBLE: &str =
     "This is an automatically generated checkpoint condensing an earlier span of this conversation.";
@@ -320,7 +491,7 @@ mod tests {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let engine = BasicCompactionEngine::new(3, 1);
+        let engine = BasicCompactionEngine::new(CompactionPolicy::resolve(None).unwrap());
         let result = engine.compact_now(&agent, None).await.unwrap().unwrap();
         assert!(!result.shadowed_seqs.is_empty());
         let messages = session.derive_messages();
@@ -362,7 +533,7 @@ mod tests {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let engine = BasicCompactionEngine::new(1, 0);
+        let engine = BasicCompactionEngine::new(CompactionPolicy::resolve(None).unwrap());
         let err = engine.compact_now(&agent, None).await.unwrap_err();
         assert!(matches!(err, ManualCompactionError::Busy));
     }
@@ -373,7 +544,7 @@ mod tests {
         ctx.provide(Arc::new(SessionStore::new())).unwrap();
         ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
         ctx.provide(Arc::new(TokenMeter::new(4))).unwrap();
-        BasicCompactionEngine::install(&ctx, 3, 1).unwrap();
+        BasicCompactionEngine::install(&ctx, CompactionPolicy::resolve(None).unwrap()).unwrap();
         assert!(ctx.has_service("compaction"));
 
         let recovered = ctx
@@ -384,5 +555,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recovered["kind"], "retry");
+    }
+
+    #[test]
+    fn resolve_defaults_and_rejects_stale_or_inverted_ratios() {
+        let policy = CompactionPolicy::resolve(None).unwrap();
+        assert_eq!(policy.threshold_ratio, 0.8);
+        assert_eq!(policy.retain_ratio, 0.16);
+        assert!(policy.auto);
+        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdMessages": 40
+        })))
+        .is_err());
+        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdRatio": 0.1,
+            "retainRatio": 0.2
+        })))
+        .is_err());
+        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+            "retainRatio": 0.1,
+            "retainTokens": 100
+        })))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn pressure_skips_without_a_context_window() {
+        let session = Arc::new(Session::new(session_id("nowindow")));
+        for text in ["aaaa", "bbbb", "cccc", "dddd"] {
+            append_user(&session, text);
+        }
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let engine = BasicCompactionEngine {
+            policy: CompactionPolicy::resolve(Some(&serde_json::json!({
+                "thresholdRatio": 0.1,
+                "retainRatio": 0.01
+            })))
+            .unwrap(),
+            meter: Some(Arc::new(TokenMeter::new(1))),
+        };
+        assert!(engine
+            .compact_if_needed(&agent, CompactionTrigger::Pressure)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn pressure_compacts_when_tokens_cross_the_window_ratio() {
+        let session = Arc::new(Session::new(session_id("window")));
+        session
+            .append(
+                SessionEventData::RequestContext {
+                    provider: "deepseek-official".into(),
+                    model: "deepseek-v4-flash".into(),
+                    context_window: Some(20),
+                },
+                None,
+            )
+            .unwrap();
+        for text in ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"] {
+            append_user(&session, text);
+        }
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let engine = BasicCompactionEngine {
+            policy: CompactionPolicy::resolve(Some(&serde_json::json!({
+                "thresholdRatio": 0.5,
+                "retainRatio": 0.1
+            })))
+            .unwrap(),
+            meter: Some(Arc::new(TokenMeter::new(1))),
+        };
+        let result = engine
+            .compact_if_needed(&agent, CompactionTrigger::Pressure)
+            .await
+            .unwrap()
+            .expect("pressure compaction");
+        assert!(!result.shadowed_seqs.is_empty());
     }
 }

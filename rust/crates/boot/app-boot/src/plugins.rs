@@ -763,23 +763,9 @@ fn apply_token_meter(ctx: &Context, config: Option<Value>) -> Result<()> {
 }
 
 fn apply_compaction_basic(ctx: &Context, config: Option<Value>) -> Result<()> {
-    fn field(config: Option<&Value>, key: &str, default: usize) -> Result<usize> {
-        match config.and_then(|value| value.get(key)) {
-            None => Ok(default),
-            Some(value) => value
-                .as_u64()
-                .filter(|value| *value > 0)
-                .map(|value| value as usize)
-                .ok_or_else(|| {
-                    CordisError::Validation(format!(
-                        "compaction-basic: {key} must be a positive integer"
-                    ))
-                }),
-        }
-    }
-    let threshold_messages = field(config.as_ref(), "thresholdMessages", 40)?;
-    let retain_tail = field(config.as_ref(), "retainTail", 8)?;
-    dsh_compaction_basic::BasicCompactionEngine::install(ctx, threshold_messages, retain_tail)?;
+    let policy = dsh_compaction_basic::CompactionPolicy::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
+    dsh_compaction_basic::BasicCompactionEngine::install(ctx, policy)?;
     Ok(())
 }
 
@@ -819,9 +805,17 @@ fn apply_tool_web(ctx: &Context, config: Option<Value>) -> Result<()> {
 }
 
 fn apply_llm_deepseek(ctx: &Context) -> Result<()> {
-    let section = ctx
-        .get::<SettingsRuntime>()
-        .and_then(|settings| settings.section("llm-deepseek").cloned());
+    ctx.provide(Arc::new(LlmRuntime::new(Arc::new(LiveDeepSeekAdapter {
+        settings: ctx.get::<SettingsRuntime>(),
+    }))))
+}
+
+struct LiveDeepSeekAdapter {
+    settings: Option<Arc<SettingsRuntime>>,
+}
+
+fn resolve_deepseek(settings: Option<&SettingsRuntime>) -> (String, String, String) {
+    let section = settings.and_then(|settings| settings.section("llm-deepseek"));
     let api_key_env = section
         .as_ref()
         .and_then(|value| value.get("apiKeyEnv"))
@@ -841,13 +835,24 @@ fn apply_llm_deepseek(ctx: &Context) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("deepseek-chat")
         .to_string();
-    ctx.provide(Arc::new(LlmRuntime::new(Arc::new(
+    (api_key, base_url, model)
+}
+
+#[async_trait::async_trait]
+impl LlmAdapter for LiveDeepSeekAdapter {
+    async fn stream(
+        &self,
+        request: LlmRequest,
+    ) -> std::result::Result<BoxStream<'static, StreamChunk>, LlmError> {
+        let (api_key, base_url, model) = resolve_deepseek(self.settings.as_deref());
         dsh_llm_deepseek::DeepSeekAdapter {
             api_key,
             base_url,
             model,
-        },
-    ))))
+        }
+        .stream(request)
+        .await
+    }
 }
 
 fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {

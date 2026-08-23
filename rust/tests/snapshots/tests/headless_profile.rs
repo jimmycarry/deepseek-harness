@@ -1,12 +1,14 @@
 //! Profile-path snapshots: compose + mount + runner, then compare type sequence
 //! and key payloads to the TypeScript headless-profile fixture vocabulary.
 
+use dsh_agent::AgentRegistry;
 use dsh_app_boot::{compose_profile, register_profile_plugins, shipped_bundles};
 use dsh_bundle_headless::HeadlessStartup;
 use dsh_cordis::Context;
 use dsh_cordis_loader::{Entry, EntryPatch, Loader};
-use dsh_llm::{ContentBlock, FinishReason, StreamChunk};
-use dsh_session::{event_type_name, session_id, Session, SessionEventData, SessionStore};
+use dsh_llm::{ContentBlock, FinishReason, StreamChunk, UserMessage};
+use dsh_session::{event_type_name, session_id, Session, SessionEventData, SessionStore, SurfaceOp};
+use dsh_settings_file::SettingsRuntime;
 use dsh_subagent::SubagentRuntime;
 use dsh_tools::ToolRuntime;
 use serde_json::Value;
@@ -1429,6 +1431,96 @@ async fn skill_catalog_replaces_after_new_skill_file() {
         "{body}"
     );
     assert!(body.contains("- `extra`: extra skill"), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn settings_file_reloads_after_external_edit() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-p-settings-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("settings.yaml"),
+        "llm-deepseek:\n  baseURL: https://first.test\n",
+    )
+    .unwrap();
+    let mut overlay = Vec::new();
+    let mut settings_row = EntryPatch::replace("settings");
+    settings_row.config = Some(serde_json::json!({ "debounceMs": 0 }));
+    overlay.push(settings_row);
+    let ctx = mount_profile_in(&dir, "unused", overlay);
+    let settings = ctx.service::<SettingsRuntime>().unwrap();
+    assert_eq!(
+        settings
+            .section("llm-deepseek")
+            .and_then(|value| value.get("baseURL").cloned()),
+        Some(serde_json::json!("https://first.test"))
+    );
+    std::fs::write(
+        dir.join("settings.yaml"),
+        "llm-deepseek:\n  baseURL: https://second.test\n",
+    )
+    .unwrap();
+    assert_eq!(
+        settings
+            .section("llm-deepseek")
+            .and_then(|value| value.get("baseURL").cloned()),
+        Some(serde_json::json!("https://second.test"))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn compact_command_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-q-compact-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = mount_profile_in(&dir, "unused", vec![]);
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let _handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(Arc::clone(&session))
+        .unwrap();
+    for text in ["alpha", "bravo", "charlie", "delta"] {
+        session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text(text)),
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+    }
+    let outcome = ctx
+        .service::<dsh_commands::CommandRegistry>()
+        .unwrap()
+        .execute(session.as_ref(), "/compact")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(outcome.success, "{}", outcome.text);
+    assert!(
+        outcome.text.starts_with("Compacted ") && outcome.text.contains(" history items (~"),
+        "{}",
+        outcome.text
+    );
+    let types = types_of(&events_of(&session));
+    for name in [
+        "command/run",
+        "compaction/start",
+        "compaction/summary",
+        "compaction/end",
+        "command/done",
+    ] {
+        assert!(types.iter().any(|found| found == name), "{types:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
