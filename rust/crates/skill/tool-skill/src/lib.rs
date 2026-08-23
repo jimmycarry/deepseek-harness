@@ -1,9 +1,9 @@
 //! Model-facing `skill` tool plus the per-session skill-catalog publication.
 //!
 //! The catalog rides `agent/pre-step` as a `user/message` with
-//! `source.kind: "skill-catalog"`; the first publication for an agent frames
-//! the skills concept, and it appears only while the `skill` tool and a
-//! non-empty catalog exist.
+//! `source.kind: "skill-catalog"`. The first publication for an agent frames
+//! the skills concept. A later scan whose name/description digest differs
+//! publishes a replacement catalog with `update: true`.
 
 use async_trait::async_trait;
 use dsh_cordis::{Context, CordisError};
@@ -11,7 +11,7 @@ use dsh_llm::{MessageSource, SkillCatalogEntry, UserMessage};
 use dsh_skill::{render_skill_content, SkillRuntime};
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome, ToolRuntime};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Catalog presentation policy.
@@ -116,16 +116,41 @@ fn truncate_description(description: &str, cap: usize) -> String {
     format!("{head}…")
 }
 
-/// First-publication catalog body listing `entries`.
-fn catalog_body(entries: &[SkillCatalogEntry]) -> String {
-    let lines = entries
+fn catalog_lines(entries: &[SkillCatalogEntry]) -> String {
+    entries
         .iter()
         .map(|entry| format!("- `{}`: {}", entry.name, entry.description))
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+/// First-publication catalog body listing `entries`.
+fn catalog_body(entries: &[SkillCatalogEntry]) -> String {
+    let lines = catalog_lines(entries);
     format!(
-        "<system-reminder>\nA skill is a reusable set of task-specific instructions. The skills below are available in this session; load one with the `skill` tool (exact name) before performing a task it covers.\n<available_skills>\n{lines}\n</available_skills>\n</system-reminder>"
+        "<system-reminder>\nA skill is a reusable set of task-specific instructions. The following skills are available in this session:\n\n<available_skills>\n{lines}\n</available_skills>\n\nIf the user names a skill, or the task clearly matches a skill's description, call the `skill` tool with the exact skill name before taking task actions. Load all applicable skills, then follow their full instructions. This catalog contains summaries only; do not infer or follow a skill's instructions until it has been loaded.\nA user may also invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool again for that skill.\n</system-reminder>"
     )
+}
+
+/// Replacement catalog body after the first publication.
+fn catalog_update_body(entries: &[SkillCatalogEntry]) -> String {
+    let lines = catalog_lines(entries);
+    let availability = if entries.is_empty() {
+        "No skills are currently available through the `skill` tool. Do not use names from earlier skill catalogs.\nA user may still invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool for it."
+    } else {
+        "Use only names in this replacement catalog. If the user names a listed skill, or the task clearly matches its description, call the `skill` tool with the exact name before acting.\nA user may also invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool again for that skill."
+    };
+    format!(
+        "<system-reminder>\nThe available skill catalog changed. This complete catalog replaces every earlier available-skills list in this session:\n\n<available_skills>\n{lines}\n</available_skills>\n\n{availability}\n</system-reminder>"
+    )
+}
+
+fn catalog_digest(entries: &[SkillCatalogEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("{}\n{}", entry.name, entry.description))
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
 }
 
 /// Register the `skill` tool and the pre-step catalog publication.
@@ -136,16 +161,18 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<()> {
     let tools = ctx.service::<ToolRuntime>()?;
     let skills = ctx.service::<SkillRuntime>()?;
     tools.insert(Arc::new(LoadSkillTool::new(Arc::clone(&skills))));
-    let published: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let published: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let cap = config.catalog_description_max_length;
     ctx.on_waterfall("agent/pre-step", move |payload, next| {
+        let mut payload = next.call(payload);
         let agent_id = payload
             .get("agentId")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let already =
-            agent_id.is_empty() || published.lock().expect("skill catalog").contains(&agent_id);
+        if agent_id.is_empty() {
+            return payload;
+        }
         let entries: Vec<SkillCatalogEntry> = skills
             .catalog()
             .into_iter()
@@ -154,23 +181,40 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<()> {
                 description: truncate_description(&skill.description, cap),
             })
             .collect();
-        if already || entries.is_empty() {
-            return next.call(payload);
+        let digest = catalog_digest(&entries);
+        let previous = published
+            .lock()
+            .expect("skill catalog")
+            .get(&agent_id)
+            .cloned();
+        if previous.as_deref() == Some(digest.as_str()) {
+            return payload;
         }
-        let mut payload = payload;
+        if previous.is_none() && entries.is_empty() {
+            return payload;
+        }
+        let update = previous.is_some();
+        let body = if update {
+            catalog_update_body(&entries)
+        } else {
+            catalog_body(&entries)
+        };
         if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
             let catalog = UserMessage::from_parts(
-                vec![dsh_llm::ContentBlock::text(catalog_body(&entries))],
+                vec![dsh_llm::ContentBlock::text(body)],
                 MessageSource::SkillCatalog {
                     form: "catalog".into(),
-                    update: None,
+                    update: update.then_some(true),
                     entries,
                 },
             );
             messages.push(serde_json::to_value(&catalog).unwrap_or_default());
-            published.lock().expect("skill catalog").insert(agent_id);
+            published
+                .lock()
+                .expect("skill catalog")
+                .insert(agent_id, digest);
         }
-        next.call(payload)
+        payload
     })
     .map_err(|error| CordisError::Plugin(error.to_string()))?;
     Ok(())
@@ -275,6 +319,37 @@ mod tests {
             .waterfall("agent/pre-step", payload, |payload| payload)
             .unwrap();
         assert_eq!(second["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn catalog_replaces_when_entries_change() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        let skills = runtime_with(Skill::new("review", "do reviews", "body"));
+        ctx.provide(Arc::clone(&skills)).unwrap();
+        install(&ctx, Config::resolve(None).unwrap()).unwrap();
+        let payload = serde_json::json!({
+            "agentId": "a1",
+            "messages": [],
+            "turn": 1,
+        });
+        let first = ctx
+            .waterfall("agent/pre-step", payload.clone(), |payload| payload)
+            .unwrap();
+        assert!(first["messages"][0]["source"].get("update").is_none());
+        skills.register(Skill::new("extra", "another skill", "x"));
+        let second = ctx
+            .waterfall("agent/pre-step", payload, |payload| payload)
+            .unwrap();
+        let messages = second["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["source"]["update"], true);
+        let body = messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            body.contains("This complete catalog replaces every earlier available-skills list"),
+            "{body}"
+        );
+        assert!(body.contains("- `extra`: another skill"), "{body}");
     }
 
     #[test]

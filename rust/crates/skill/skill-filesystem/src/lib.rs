@@ -2,13 +2,16 @@
 //! flat `*.md` skills under the default roots (project `.dsh/skills`, project
 //! `.agents/skills`, custom dirs, `{dshHome}/skills`, `{agentsHome}/skills`)
 //! and registers them on `ctx.skills`. Later (higher-rank) roots do not
-//! override earlier ones. File watching is not implemented; the scan runs at
-//! install.
+//! override earlier ones. Each `agent/pre-step` and each `fs/observed` on a
+//! skill path rescans those roots so a write or edit is visible on the next
+//! catalog publication.
 
 use dsh_cordis::Context;
 use dsh_skill::{Skill, SkillRuntime};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Resolved discovery policy.
 #[derive(Debug, Clone)]
@@ -47,11 +50,21 @@ impl Config {
                 return Err("skill-filesystem: customSkillDirs must be an array".into());
             }
         };
+        let project_root = config
+            .and_then(|value| value.get("projectRoot"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let dsh_home = config
+            .and_then(|value| value.get("dshHome"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("DSH_HOME").map(PathBuf::from));
         Ok(Self {
             include_default_roots,
             custom_skill_dirs,
-            project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            dsh_home: std::env::var_os("DSH_HOME").map(PathBuf::from),
+            project_root,
+            dsh_home,
         })
     }
 }
@@ -158,26 +171,87 @@ fn roots(config: &Config) -> Vec<PathBuf> {
     roots
 }
 
+/// Scan `config` roots. The first (lowest-rank) registration of a name wins.
+pub fn scan(config: &Config) -> Vec<Skill> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for root in roots(config) {
+        let Ok(loaded) = load_dir(&root) else {
+            continue;
+        };
+        for skill in loaded {
+            if !seen.insert(skill.name.clone()) {
+                continue;
+            }
+            out.push(skill);
+        }
+    }
+    out
+}
+
+/// Replace this provider's previous registrations with a fresh scan.
+pub fn apply_scan(skills: &SkillRuntime, config: &Config, owned: &Mutex<HashSet<String>>) {
+    let loaded = scan(config);
+    let mut previous = owned.lock().expect("skill-filesystem owned");
+    for name in previous.iter() {
+        skills.unregister(name);
+    }
+    previous.clear();
+    for skill in loaded {
+        previous.insert(skill.name.clone());
+        skills.register(skill);
+    }
+}
+
+fn config_for_cwd(config: &Config, cwd: Option<&str>) -> Config {
+    let mut next = config.clone();
+    if let Some(cwd) = cwd.filter(|value| !value.is_empty()) {
+        next.project_root = PathBuf::from(cwd);
+    }
+    next
+}
+
+fn observed_skill_path(config: &Config, path: &str) -> bool {
+    let path = Path::new(path);
+    roots(config).iter().any(|root| {
+        path.starts_with(root)
+            && (path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "SKILL.md" || name.ends_with(".md")))
+    })
+}
+
 /// Scan the discovery roots and register every skill on `ctx.skills`.
-/// The first (lowest-rank) registration of a name wins.
+/// Later `agent/pre-step` and `fs/observed` events rescan the same roots.
 ///
 /// # Errors
 /// Missing `ctx.skills`.
 pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<()> {
     let skills = ctx.service::<SkillRuntime>()?;
-    let mut seen: Vec<String> = skills.names();
-    for root in roots(&config) {
-        let Ok(loaded) = load_dir(&root) else {
-            continue;
-        };
-        for skill in loaded {
-            if seen.contains(&skill.name) {
-                continue;
-            }
-            seen.push(skill.name.clone());
-            skills.register(skill);
+    let owned = Arc::new(Mutex::new(HashSet::new()));
+    apply_scan(&skills, &config, &owned);
+    let pre_skills = Arc::clone(&skills);
+    let pre_owned = Arc::clone(&owned);
+    let pre_config = config.clone();
+    ctx.on_waterfall("agent/pre-step", move |payload, next| {
+        let cwd = payload.get("cwd").and_then(Value::as_str);
+        apply_scan(&pre_skills, &config_for_cwd(&pre_config, cwd), &pre_owned);
+        next.call(payload)
+    })?;
+    let observed_skills = Arc::clone(&skills);
+    let observed_owned = Arc::clone(&owned);
+    let observed_config = config;
+    ctx.on("fs/observed", move |payload| {
+        let path = payload
+            .pointer("/target/displayPath")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if path.is_empty() || !observed_skill_path(&observed_config, path) {
+            return;
         }
-    }
+        apply_scan(&observed_skills, &observed_config, &observed_owned);
+    })?;
     Ok(())
 }
 
@@ -261,6 +335,53 @@ mod tests {
         .unwrap();
         let skills = ctx.service::<SkillRuntime>().unwrap();
         assert_eq!(skills.get("only").unwrap().body, "project body");
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn pre_step_rescans_a_new_skill_file() {
+        let project = scratch("rescan");
+        let skills_dir = project.join(".dsh").join("skills");
+        std::fs::create_dir_all(skills_dir.join("first")).unwrap();
+        std::fs::write(
+            skills_dir.join("first").join("SKILL.md"),
+            "---\nname: first\ndescription: first skill\n---\nfirst body",
+        )
+        .unwrap();
+        let ctx = Context::new();
+        ctx.provide(std::sync::Arc::new(SkillRuntime::new()))
+            .unwrap();
+        install(
+            &ctx,
+            Config {
+                include_default_roots: true,
+                custom_skill_dirs: vec![],
+                project_root: project.clone(),
+                dsh_home: None,
+            },
+        )
+        .unwrap();
+        assert!(ctx.service::<SkillRuntime>().unwrap().get("second").is_none());
+        std::fs::create_dir_all(skills_dir.join("second")).unwrap();
+        std::fs::write(
+            skills_dir.join("second").join("SKILL.md"),
+            "---\nname: second\ndescription: second skill\n---\nsecond body",
+        )
+        .unwrap();
+        ctx.waterfall(
+            "agent/pre-step",
+            serde_json::json!({ "cwd": project.to_string_lossy() }),
+            |payload| payload,
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.service::<SkillRuntime>()
+                .unwrap()
+                .get("second")
+                .unwrap()
+                .body,
+            "second body"
+        );
         let _ = std::fs::remove_dir_all(project);
     }
 }

@@ -56,6 +56,11 @@ impl SkillRuntime {
             .insert(skill.name.clone(), skill);
     }
 
+    /// Drop one skill by name.
+    pub fn unregister(&self, name: &str) -> Option<Skill> {
+        self.skills.lock().expect("skills").remove(name)
+    }
+
     /// Look up a skill by name.
     pub fn get(&self, name: &str) -> Option<Skill> {
         self.skills.lock().expect("skills").get(name).cloned()
@@ -115,11 +120,10 @@ mod tests {
         let mut hidden = Skill::new("internal", "hidden", "x");
         hidden.model_invocable = false;
         skills.register(hidden);
+        assert!(skills.unregister("internal").is_some());
+        assert!(skills.get("internal").is_none());
         assert_eq!(skills.get("review").unwrap().body, "do a review");
-        assert_eq!(
-            skills.names(),
-            vec!["internal".to_string(), "review".to_string()]
-        );
+        assert_eq!(skills.names(), vec!["review".to_string()]);
         let catalog = skills.catalog();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "review");

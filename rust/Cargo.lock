@@ -304,6 +304,7 @@ dependencies = [
  "dsh-fs",
  "dsh-fs-local",
  "dsh-fs-observation-policy",
+ "dsh-fs-sandbox",
  "dsh-goal",
  "dsh-goal-round-driver",
  "dsh-jobs",
@@ -323,8 +324,10 @@ dependencies = [
  "dsh-session-persistence-sqlite",
  "dsh-session-projection",
  "dsh-session-query-sqlite",
+ "dsh-session-telemetry-otel",
  "dsh-session-title",
  "dsh-session-title-first-prompt-llm",
+ "dsh-settings-file",
  "dsh-shell",
  "dsh-skill",
  "dsh-skill-filesystem",
@@ -456,6 +459,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-agent",
  "dsh-agent-loop",
+ "dsh-commands",
  "dsh-cordis",
  "dsh-cordis-loader",
  "dsh-llm",
@@ -632,6 +636,19 @@ dependencies = [
  "dsh-cordis",
  "dsh-fs",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-fs-sandbox"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-fs",
+ "dsh-fs-local",
+ "dsh-sandbox",
+ "dsh-sandbox-local",
  "tokio",
 ]
 
@@ -967,6 +984,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-session-telemetry-otel"
+version = "0.1.1-rc.2"
+dependencies = [
+ "dsh-command-feedback",
+ "dsh-cordis",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dsh-session-title"
 version = "0.1.1-rc.2"
 dependencies = [
@@ -989,6 +1016,16 @@ dependencies = [
  "dsh-session",
  "dsh-session-title",
  "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-settings-file"
+version = "0.1.1-rc.2"
+dependencies = [
+ "dsh-cordis",
+ "dsh-home-paths",
  "serde_json",
  "tokio",
 ]

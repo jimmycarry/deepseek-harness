@@ -1299,6 +1299,139 @@ async fn headless_runner_executes_slash_feedback() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn agent_instructions_update_after_write() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "dsh-instr-write-{}-{}",
+            std::process::id(),
+            uuid_stamp()
+        ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "old workspace rule").unwrap();
+    let path = dir.join("AGENTS.md");
+    let path_str = path.to_string_lossy();
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "read",
+                "arguments": format!("{{\"file_path\":{}}}", serde_json::to_string(&*path_str).unwrap())
+            }
+        },
+        {
+            "text": "",
+            "tool": {
+                "id": "c2",
+                "name": "write",
+                "arguments": format!("{{\"file_path\":{},\"content\":\"new workspace rule\"}}", serde_json::to_string(&*path_str).unwrap())
+            }
+        },
+        { "text": "done" }
+    ]);
+    let (_ctx, session) = run_profile_host_in(&dir, "update the instructions", replay_turns_overlay(turns)).await;
+    let events = events_of(&session);
+    let instructions: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "user/message"
+                && event["data"]["source"]["kind"] == "agent-instructions"
+        })
+        .collect();
+    assert!(
+        instructions.len() >= 2,
+        "expected baseline plus file-touch update, got {instructions:?}"
+    );
+    assert_eq!(instructions[0]["data"]["source"]["baseline"], true);
+    let first = instructions[0]["data"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(first.contains("old workspace rule"), "{first}");
+    let update = instructions
+        .iter()
+        .find(|event| event["data"]["source"].get("baseline").is_none())
+        .expect("file-touch update");
+    let text = update["data"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("Updated instructions from: AGENTS.md"),
+        "{text}"
+    );
+    assert!(text.contains("new workspace rule"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn skill_catalog_replaces_after_new_skill_file() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "dsh-skill-update-{}-{}",
+            std::process::id(),
+            uuid_stamp()
+        ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let skills_dir = dir.join("skills");
+    std::fs::create_dir_all(skills_dir.join("demo")).unwrap();
+    std::fs::write(
+        skills_dir.join("demo").join("SKILL.md"),
+        "---\nname: demo\ndescription: demo skill for the snapshot\n---\nfollow the demo steps",
+    )
+    .unwrap();
+    std::fs::create_dir_all(skills_dir.join("extra")).unwrap();
+    let extra = skills_dir.join("extra").join("SKILL.md");
+    let extra_str = extra.to_string_lossy();
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "write",
+                "arguments": format!(
+                    "{{\"file_path\":{},\"content\":\"---\\nname: extra\\ndescription: extra skill\\n---\\nextra body\"}}",
+                    serde_json::to_string(&*extra_str).unwrap()
+                )
+            }
+        },
+        { "text": "done" }
+    ]);
+    let mut overlay = replay_turns_overlay(turns);
+    let mut skill_fs = EntryPatch::replace("skill-filesystem");
+    skill_fs.config = Some(serde_json::json!({
+        "includeDefaultRoots": false,
+        "customSkillDirs": [skills_dir.to_string_lossy()]
+    }));
+    overlay.push(skill_fs);
+    let (_ctx, session) = run_profile_host_in(&dir, "add a skill", overlay).await;
+    let events = events_of(&session);
+    let catalogs: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "user/message" && event["data"]["source"]["kind"] == "skill-catalog"
+        })
+        .collect();
+    assert!(
+        catalogs.len() >= 2,
+        "expected first catalog plus replacement, got {catalogs:?}"
+    );
+    assert!(catalogs[0]["data"]["source"].get("update").is_none());
+    let update = catalogs
+        .iter()
+        .find(|event| event["data"]["source"]["update"] == true)
+        .expect("replacement catalog");
+    let body = update["data"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        body.contains("This complete catalog replaces every earlier available-skills list"),
+        "{body}"
+    );
+    assert!(body.contains("- `extra`: extra skill"), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn typescript_headless_profile_types_are_known() {
     let path = concat!(
