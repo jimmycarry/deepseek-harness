@@ -20,15 +20,92 @@ use std::sync::Arc;
 
 const DEFAULT_THRESHOLD_RATIO: f64 = 0.8;
 const DEFAULT_RETAIN_RATIO: f64 = 0.16;
+const BASIC_COMPACT_CONFIG_KEYS: &[&str] = &[
+    "thresholdRatio",
+    "retainRatio",
+    "retainTokens",
+    "summarizationProvider",
+    "summarizationModel",
+    "maxTokens",
+    "compactionRetries",
+    "maxOverflowRetries",
+    "modelPolicies",
+    "auto",
+];
+const MODEL_POLICY_KEYS: &[&str] = &[
+    "provider",
+    "model",
+    "thresholdRatio",
+    "retainRatio",
+    "retainTokens",
+    "summarizationProvider",
+    "summarizationModel",
+    "maxTokens",
+    "compactionRetries",
+    "maxOverflowRetries",
+];
+
+/// Exact provider/model override merged over the default compaction policy.
+#[derive(Debug, Clone)]
+pub struct ModelCompactPolicy {
+    /// Registered provider route to match.
+    pub provider: String,
+    /// Exact routed model id to match within `provider`.
+    pub model: String,
+    /// Optional pressure-fraction override.
+    pub threshold_ratio: Option<f64>,
+    /// Optional verbatim-tail fraction override.
+    pub retain_ratio: Option<f64>,
+    /// Optional absolute tail-budget override.
+    pub retain_tokens: Option<u64>,
+    /// Optional summarizer provider; a pair with [`Self::summarization_model`].
+    pub summarization_provider: Option<String>,
+    /// Optional summarizer model; a pair with [`Self::summarization_provider`].
+    pub summarization_model: Option<String>,
+    /// Optional generation cap override.
+    pub max_tokens: Option<u32>,
+    /// Optional extra pressure attempts after the first compaction.
+    pub compaction_retries: Option<u32>,
+    /// Optional overflow-recovery retry budget.
+    pub max_overflow_retries: Option<u32>,
+}
+
+/// One form of recent-tail retention after defaults and overrides merge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResolvedRetention {
+    /// Tail priced as a fraction of the routed context window.
+    Ratio(f64),
+    /// Absolute tail budget in tokens.
+    Tokens(u64),
+}
+
+/// Merged policy for one routed conversation target, before capacity scaling.
+#[derive(Debug, Clone)]
+pub struct ResolvedTargetPolicy {
+    /// Request-pressure fraction of the routed context window.
+    pub threshold_ratio: f64,
+    /// Recent-tail retention after override merge.
+    pub retention: ResolvedRetention,
+    /// Dedicated summarizer provider; empty inherits the last route.
+    pub summarization_provider: String,
+    /// Dedicated summarizer model; empty inherits the last route.
+    pub summarization_model: String,
+    /// Output-token cap sent on the summarization request.
+    pub max_tokens: u32,
+    /// Extra pressure attempts after the first compaction.
+    pub compaction_retries: u32,
+    /// Overflow-recovery retry budget.
+    pub max_overflow_retries: u32,
+}
 
 /// TypeScript `BasicCompactionConfig` fields used for pressure and retention.
 #[derive(Debug, Clone)]
 pub struct CompactionPolicy {
     /// Request-pressure fraction of the routed context window.
     pub threshold_ratio: f64,
-    /// Verbatim-tail fraction of the routed context window.
+    /// Default verbatim-tail fraction when no absolute budget is set.
     pub retain_ratio: f64,
-    /// Explicit tail budget in tokens, when set.
+    /// Explicit tail budget in tokens, when set at the default scope.
     pub retain_tokens: Option<u64>,
     /// Whether `agent/pre-step` runs automatic pressure compaction.
     pub auto: bool,
@@ -38,102 +115,382 @@ pub struct CompactionPolicy {
     pub summarization_model: String,
     /// Output-token cap sent on the summarization request.
     pub max_tokens: u32,
+    /// Extra pressure attempts after the first compaction.
+    pub compaction_retries: u32,
+    /// Overflow-recovery retry budget.
+    pub max_overflow_retries: u32,
+    /// Exact provider/model overrides; duplicate targets fail load.
+    pub model_policies: Vec<ModelCompactPolicy>,
 }
 
 impl CompactionPolicy {
     /// Validate raw cordis.yml config.
     ///
     /// # Errors
-    /// Unknown keys, non-boolean `auto`, ratios outside `(0, 1]`, or
-    /// `retainRatio >= thresholdRatio`.
+    /// Unknown keys, non-boolean `auto`, ratios outside `(0, 1]`, a merged
+    /// `retainRatio` that is not below `thresholdRatio`, or an invalid
+    /// `modelPolicies` table.
     pub fn resolve(config: Option<&Value>) -> Result<Self, String> {
-        if let Some(Value::Object(map)) = config {
-            for key in map.keys() {
-                if !matches!(
-                    key.as_str(),
-                    "thresholdRatio"
-                        | "retainRatio"
-                        | "retainTokens"
-                        | "summarizationProvider"
-                        | "summarizationModel"
-                        | "maxTokens"
-                        | "compactionRetries"
-                        | "maxOverflowRetries"
-                        | "modelPolicies"
-                        | "auto"
-                ) {
-                    return Err(format!(
-                        "compaction-basic: unknown config key {key} (use thresholdRatio / retainRatio)"
-                    ));
-                }
+        if let Some(value) = config {
+            validate_keys(value, BASIC_COMPACT_CONFIG_KEYS, "BasicCompactionConfig")?;
+        }
+        validate_policy(config, "BasicCompactionConfig")?;
+        if let Some(auto) = config.and_then(|value| value.get("auto")) {
+            if !auto.is_boolean() {
+                return Err("BasicCompactionConfig: auto must be a boolean".into());
             }
         }
-        let threshold_ratio = ratio_field(config, "thresholdRatio", DEFAULT_THRESHOLD_RATIO)?;
-        let retain_ratio = ratio_field(config, "retainRatio", DEFAULT_RETAIN_RATIO)?;
-        if retain_ratio >= threshold_ratio {
-            return Err(format!(
-                "compaction-basic: retainRatio ({retain_ratio}) must be less than the resolved thresholdRatio ({threshold_ratio})"
-            ));
+        let threshold_ratio = optional_ratio(config, "thresholdRatio")?
+            .unwrap_or(DEFAULT_THRESHOLD_RATIO);
+        let retention = resolve_retention(config, ResolvedRetention::Ratio(DEFAULT_RETAIN_RATIO))?;
+        validate_ratio_retention(threshold_ratio, retention, "BasicCompactionConfig")?;
+        let model_policies = resolve_model_policies(config.and_then(|value| value.get("modelPolicies")))?;
+        for (index, policy) in model_policies.iter().enumerate() {
+            validate_ratio_retention(
+                policy.threshold_ratio.unwrap_or(threshold_ratio),
+                resolve_override_retention(policy, retention),
+                &format!("BasicCompactionConfig: modelPolicies[{index}]"),
+            )?;
         }
-        if config.and_then(|value| value.get("retainRatio")).is_some()
-            && config.and_then(|value| value.get("retainTokens")).is_some()
-        {
-            return Err(
-                "compaction-basic: retainRatio and retainTokens are mutually exclusive".into(),
-            );
-        }
-        let retain_tokens = match config.and_then(|value| value.get("retainTokens")) {
-            None => None,
-            Some(value) => Some(value.as_u64().ok_or_else(|| {
-                "compaction-basic: retainTokens must be an integer".to_string()
-            })?),
-        };
-        let auto = match config.and_then(|value| value.get("auto")) {
-            None => true,
-            Some(Value::Bool(value)) => *value,
-            Some(_) => return Err("compaction-basic: auto must be a boolean".into()),
-        };
-        let summarization_provider = config
-            .and_then(|value| value.get("summarizationProvider"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let summarization_model = config
-            .and_then(|value| value.get("summarizationModel"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let max_tokens = match config.and_then(|value| value.get("maxTokens")) {
-            None => 8192,
-            Some(value) => value
-                .as_u64()
-                .filter(|value| *value > 0)
-                .map(|value| value as u32)
-                .ok_or_else(|| "compaction-basic: maxTokens must be a positive integer".to_string())?,
+        let (retain_ratio, retain_tokens) = match retention {
+            ResolvedRetention::Ratio(ratio) => (ratio, None),
+            ResolvedRetention::Tokens(tokens) => (DEFAULT_RETAIN_RATIO, Some(tokens)),
         };
         Ok(Self {
             threshold_ratio,
             retain_ratio,
             retain_tokens,
-            auto,
-            summarization_provider,
-            summarization_model,
-            max_tokens,
+            auto: config
+                .and_then(|value| value.get("auto"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            summarization_provider: string_field(config, "summarizationProvider")?,
+            summarization_model: string_field(config, "summarizationModel")?,
+            max_tokens: optional_positive_int(config, "maxTokens", "BasicCompactionConfig.maxTokens")?
+                .unwrap_or(8192),
+            compaction_retries: optional_non_negative_int(
+                config,
+                "compactionRetries",
+                "BasicCompactionConfig.compactionRetries",
+            )?
+            .unwrap_or(1) as u32,
+            max_overflow_retries: optional_non_negative_int(
+                config,
+                "maxOverflowRetries",
+                "BasicCompactionConfig.maxOverflowRetries",
+            )?
+            .unwrap_or(1) as u32,
+            model_policies,
         })
+    }
+
+    /// Merge the exact provider/model override over the default policy.
+    #[must_use]
+    pub fn resolve_target(&self, provider: &str, model: &str) -> ResolvedTargetPolicy {
+        let override_policy = self.model_policies.iter().find(|policy| {
+            policy.provider == provider && policy.model == model
+        });
+        let inherited = self.default_retention();
+        ResolvedTargetPolicy {
+            threshold_ratio: override_policy
+                .and_then(|policy| policy.threshold_ratio)
+                .unwrap_or(self.threshold_ratio),
+            retention: override_policy
+                .map(|policy| resolve_override_retention(policy, inherited))
+                .unwrap_or(inherited),
+            summarization_provider: override_policy
+                .and_then(|policy| policy.summarization_provider.clone())
+                .unwrap_or_else(|| self.summarization_provider.clone()),
+            summarization_model: override_policy
+                .and_then(|policy| policy.summarization_model.clone())
+                .unwrap_or_else(|| self.summarization_model.clone()),
+            max_tokens: override_policy
+                .and_then(|policy| policy.max_tokens)
+                .unwrap_or(self.max_tokens),
+            compaction_retries: override_policy
+                .and_then(|policy| policy.compaction_retries)
+                .unwrap_or(self.compaction_retries),
+            max_overflow_retries: override_policy
+                .and_then(|policy| policy.max_overflow_retries)
+                .unwrap_or(self.max_overflow_retries),
+        }
+    }
+
+    fn default_retention(&self) -> ResolvedRetention {
+        match self.retain_tokens {
+            Some(tokens) => ResolvedRetention::Tokens(tokens),
+            None => ResolvedRetention::Ratio(self.retain_ratio),
+        }
+    }
+
+    fn default_target(&self) -> ResolvedTargetPolicy {
+        ResolvedTargetPolicy {
+            threshold_ratio: self.threshold_ratio,
+            retention: self.default_retention(),
+            summarization_provider: self.summarization_provider.clone(),
+            summarization_model: self.summarization_model.clone(),
+            max_tokens: self.max_tokens,
+            compaction_retries: self.compaction_retries,
+            max_overflow_retries: self.max_overflow_retries,
+        }
     }
 }
 
-fn ratio_field(config: Option<&Value>, key: &str, default: f64) -> Result<f64, String> {
+impl ResolvedTargetPolicy {
+    fn retain_tokens_for(&self, window: Option<u32>) -> u64 {
+        match self.retention {
+            ResolvedRetention::Tokens(tokens) => tokens,
+            ResolvedRetention::Ratio(ratio) => window
+                .map(|window| ((window as f64) * ratio).floor() as u64)
+                .unwrap_or(0),
+        }
+    }
+}
+
+fn validate_keys(value: &Value, keys: &[&str], name: &str) -> Result<(), String> {
+    let Some(map) = value.as_object() else {
+        return Ok(());
+    };
+    for key in map.keys() {
+        if !keys.contains(&key.as_str()) {
+            return Err(format!("{name}: unknown key \"{key}\""));
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy(config: Option<&Value>, name: &str) -> Result<(), String> {
+    if let Some(ratio) = optional_ratio(config, "thresholdRatio")? {
+        let _ = ratio;
+    }
+    if let Some(ratio) = optional_ratio(config, "retainRatio")? {
+        let _ = ratio;
+    }
+    if config.and_then(|value| value.get("retainTokens")).is_some() {
+        optional_non_negative_int(config, "retainTokens", &format!("{name}.retainTokens"))?;
+    }
+    if config.and_then(|value| value.get("retainRatio")).is_some()
+        && config.and_then(|value| value.get("retainTokens")).is_some()
+    {
+        return Err(format!("{name}: retainRatio and retainTokens are mutually exclusive"));
+    }
+    if config.and_then(|value| value.get("maxTokens")).is_some() {
+        optional_positive_int(config, "maxTokens", &format!("{name}.maxTokens"))?;
+    }
+    if config.and_then(|value| value.get("compactionRetries")).is_some() {
+        optional_non_negative_int(
+            config,
+            "compactionRetries",
+            &format!("{name}.compactionRetries"),
+        )?;
+    }
+    if config.and_then(|value| value.get("maxOverflowRetries")).is_some() {
+        optional_non_negative_int(
+            config,
+            "maxOverflowRetries",
+            &format!("{name}.maxOverflowRetries"),
+        )?;
+    }
+    validate_summarization_pair(config, name)
+}
+
+fn validate_summarization_pair(config: Option<&Value>, name: &str) -> Result<(), String> {
+    let provider = config.and_then(|value| value.get("summarizationProvider"));
+    let model = config.and_then(|value| value.get("summarizationModel"));
+    if let Some(value) = provider {
+        if !value.is_string() {
+            return Err(format!("{name}.summarizationProvider must be a string"));
+        }
+    }
+    if let Some(value) = model {
+        if !value.is_string() {
+            return Err(format!("{name}.summarizationModel must be a string"));
+        }
+    }
+    if provider.is_none() && model.is_none() {
+        return Ok(());
+    }
+    let provider_empty = provider.and_then(Value::as_str).is_none_or(str::is_empty);
+    let model_empty = model.and_then(Value::as_str).is_none_or(str::is_empty);
+    if provider.is_none() || model.is_none() || provider_empty != model_empty {
+        return Err(format!(
+            "{name}: summarizationProvider and summarizationModel must be set together as an empty or non-empty pair"
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_retention(
+    config: Option<&Value>,
+    fallback: ResolvedRetention,
+) -> Result<ResolvedRetention, String> {
+    if let Some(tokens) = config.and_then(|value| value.get("retainTokens")) {
+        let tokens = tokens.as_u64().ok_or_else(|| {
+            "BasicCompactionConfig.retainTokens (null) must be a non-negative integer".to_string()
+        })?;
+        return Ok(ResolvedRetention::Tokens(tokens));
+    }
+    if let Some(ratio) = optional_ratio(config, "retainRatio")? {
+        return Ok(ResolvedRetention::Ratio(ratio));
+    }
+    Ok(fallback)
+}
+
+fn resolve_override_retention(
+    policy: &ModelCompactPolicy,
+    fallback: ResolvedRetention,
+) -> ResolvedRetention {
+    if let Some(tokens) = policy.retain_tokens {
+        return ResolvedRetention::Tokens(tokens);
+    }
+    if let Some(ratio) = policy.retain_ratio {
+        return ResolvedRetention::Ratio(ratio);
+    }
+    fallback
+}
+
+fn validate_ratio_retention(
+    threshold_ratio: f64,
+    retention: ResolvedRetention,
+    name: &str,
+) -> Result<(), String> {
+    if let ResolvedRetention::Ratio(retain_ratio) = retention {
+        if retain_ratio >= threshold_ratio {
+            return Err(format!(
+                "{name}: retainRatio ({retain_ratio}) must be less than the resolved thresholdRatio ({threshold_ratio})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_model_policies(configured: Option<&Value>) -> Result<Vec<ModelCompactPolicy>, String> {
+    let Some(configured) = configured else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = configured.as_array() else {
+        return Err("BasicCompactionConfig: modelPolicies must be an array".into());
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut policies = Vec::with_capacity(items.len());
+    for (index, source) in items.iter().enumerate() {
+        let name = format!("BasicCompactionConfig: modelPolicies[{index}]");
+        let policy = parse_model_policy(source, &name)?;
+        let key = format!("{}\u{0000}{}", policy.provider, policy.model);
+        if !seen.insert(key) {
+            return Err(format!(
+                "BasicCompactionConfig: duplicate model policy for {}/{}",
+                policy.provider, policy.model
+            ));
+        }
+        policies.push(policy);
+    }
+    Ok(policies)
+}
+
+fn parse_model_policy(source: &Value, name: &str) -> Result<ModelCompactPolicy, String> {
+    if !source.is_object() || source.as_array().is_some() {
+        return Err(format!("{name} must be an object"));
+    }
+    validate_keys(source, MODEL_POLICY_KEYS, name)?;
+    let provider = source
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name}.provider must be a non-empty string"))?;
+    let model = source
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name}.model must be a non-empty string"))?;
+    validate_policy(Some(source), name)?;
+    Ok(ModelCompactPolicy {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        threshold_ratio: optional_ratio(Some(source), "thresholdRatio")?,
+        retain_ratio: optional_ratio(Some(source), "retainRatio")?,
+        retain_tokens: optional_non_negative_int(
+            Some(source),
+            "retainTokens",
+            &format!("{name}.retainTokens"),
+        )?,
+        summarization_provider: source
+            .get("summarizationProvider")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        summarization_model: source
+            .get("summarizationModel")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        max_tokens: optional_positive_int(Some(source), "maxTokens", &format!("{name}.maxTokens"))?,
+        compaction_retries: optional_non_negative_int(
+            Some(source),
+            "compactionRetries",
+            &format!("{name}.compactionRetries"),
+        )?
+        .map(|value| value as u32),
+        max_overflow_retries: optional_non_negative_int(
+            Some(source),
+            "maxOverflowRetries",
+            &format!("{name}.maxOverflowRetries"),
+        )?
+        .map(|value| value as u32),
+    })
+}
+
+fn string_field(config: Option<&Value>, key: &str) -> Result<String, String> {
     match config.and_then(|value| value.get(key)) {
-        None => Ok(default),
+        None => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("BasicCompactionConfig.{key} must be a string")),
+    }
+}
+
+fn optional_ratio(config: Option<&Value>, key: &str) -> Result<Option<f64>, String> {
+    match config.and_then(|value| value.get(key)) {
+        None => Ok(None),
         Some(value) => {
-            let number = value
-                .as_f64()
-                .ok_or_else(|| format!("compaction-basic: {key} must be a number"))?;
-            if number <= 0.0 || number > 1.0 {
-                return Err(format!("compaction-basic: {key} must be a number in (0, 1]"));
+            let number = value.as_f64().ok_or_else(|| {
+                format!("BasicCompactionConfig.{key} ({value}) must be a number in (0, 1]")
+            })?;
+            if !number.is_finite() || number <= 0.0 || number > 1.0 {
+                return Err(format!(
+                    "BasicCompactionConfig.{key} ({number}) must be a number in (0, 1]"
+                ));
             }
-            Ok(number)
+            Ok(Some(number))
+        }
+    }
+}
+
+fn optional_positive_int(
+    config: Option<&Value>,
+    key: &str,
+    name: &str,
+) -> Result<Option<u32>, String> {
+    match config.and_then(|value| value.get(key)) {
+        None => Ok(None),
+        Some(value) => {
+            let number = value.as_u64().filter(|value| *value > 0).ok_or_else(|| {
+                format!("{name} ({value}) must be a positive integer")
+            })?;
+            Ok(Some(number as u32))
+        }
+    }
+}
+
+fn optional_non_negative_int(
+    config: Option<&Value>,
+    key: &str,
+    name: &str,
+) -> Result<Option<u64>, String> {
+    match config.and_then(|value| value.get(key)) {
+        None => Ok(None),
+        Some(value) => {
+            let number = value.as_u64().ok_or_else(|| {
+                format!("{name} ({value}) must be a non-negative integer")
+            })?;
+            Ok(Some(number))
         }
     }
 }
@@ -284,11 +641,16 @@ impl BasicCompactionEngine {
             .map(|meter| meter.estimate_session(&session) as u64)
             .unwrap_or(0);
         let window = last_context_window(&session);
+        let target = last_request_route(&session);
+        let effective = target
+            .as_ref()
+            .map(|(provider, model)| self.policy.resolve_target(provider, model))
+            .unwrap_or_else(|| self.policy.default_target());
         if !force {
             let Some(window) = window else {
                 return Ok(None);
             };
-            let threshold = ((window as f64) * self.policy.threshold_ratio).floor() as u64;
+            let threshold = ((window as f64) * effective.threshold_ratio).floor() as u64;
             if total_tokens < threshold {
                 return Ok(None);
             }
@@ -296,11 +658,7 @@ impl BasicCompactionEngine {
         let retain_tokens = if force {
             0
         } else {
-            self.policy.retain_tokens.unwrap_or_else(|| {
-                window
-                    .map(|window| ((window as f64) * self.policy.retain_ratio).floor() as u64)
-                    .unwrap_or(0)
-            })
+            effective.retain_tokens_for(window)
         };
         let retain_tail = retain_tail_nodes(&session, meter, retain_tokens);
         if surface.nodes.len() <= retain_tail + 1 {
@@ -326,21 +684,9 @@ impl BasicCompactionEngine {
             .meter
             .as_ref()
             .map(|meter| {
-                events
+                shadowed
                     .iter()
-                    .filter(|event| shadowed.contains(&event.seq))
-                    .map(|event| match &event.data {
-                        SessionEventData::UserMessage(message) => {
-                            meter.estimate_content(&message.content) as u64
-                        }
-                        SessionEventData::AssistantMessage { message, .. } => {
-                            meter.estimate_content(&message.content) as u64
-                        }
-                        SessionEventData::ToolResult { message, .. } => {
-                            meter.estimate_content(message.result_blocks()) as u64
-                        }
-                        _ => 0,
-                    })
+                    .map(|seq| node_tokens(&session, meter, *seq))
                     .sum()
             })
             .unwrap_or(0);
@@ -350,7 +696,7 @@ impl BasicCompactionEngine {
             .or_else(|| self.lookup.get::<LlmRuntime>());
         let summarized = match summarize_with_llm(
             llm.as_deref(),
-            &self.policy,
+            &effective,
             &session,
             &shadowed,
         )
@@ -372,20 +718,50 @@ impl BasicCompactionEngine {
                 return Err(ManualCompactionError::Summary);
             }
         };
+        let framed = frame_summary(&summarized.summary);
+        if let Some(meter) = self.meter.as_deref() {
+            let framed_tokens = meter.estimate_message(&Message::User(UserMessage::from_parts(
+                framed.clone(),
+                MessageSource::plugin("dsh-compaction-basic"),
+            ))) as u64;
+            if framed_tokens >= shadowed_token_count {
+                let error = format!(
+                    "summary is not smaller than the shadowed content ({framed_tokens} estimated framed tokens >= {shadowed_token_count})"
+                );
+                session
+                    .append(
+                        SessionEventData::CompactionEnd {
+                            compaction_id,
+                            source_command_id,
+                            turn: None,
+                            error: Some(error),
+                        },
+                        None,
+                    )
+                    .ok();
+                return Err(ManualCompactionError::Summary);
+            }
+        }
         let summary_event = session
             .append(
                 SessionEventData::CompactionSummary {
                     compaction_id: compaction_id.clone(),
                     source_command_id: source_command_id.clone(),
-                    summary: summarized.summary_text.clone(),
+                    summary: summarized.summary.clone(),
+                    raw_output: Some(summarized.raw_output.clone()),
+                    llm_stream_call: Some(true),
                     shadowed_range: serde_json::json!({ "start": start, "end": end }),
                     shadowed_seqs: shadowed.clone(),
                     shadowed_token_count,
+                    provider: summarized.provider.clone(),
+                    model: summarized.model.clone(),
+                    max_tokens: Some(summarized.max_tokens),
+                    usage: summarized.usage.clone(),
                 },
                 None,
             )
             .ok();
-        let summary = frame_summary(&summarized.summary_text);
+        let summary = framed;
         let mut cited: Vec<u64> = Vec::new();
         if let Some(event) = &start_event {
             cited.push(event.seq);
@@ -451,26 +827,10 @@ fn retain_tail_nodes(session: &Session, meter: Option<&TokenMeter>, retain_token
     let Some(meter) = meter else {
         return 1;
     };
-    let events = session.events();
     let mut kept = 0u64;
     let mut count = 0usize;
     for seq in nodes.iter().rev() {
-        let cost = events
-            .iter()
-            .find(|event| event.seq == *seq)
-            .map(|event| match &event.data {
-                SessionEventData::UserMessage(message) => {
-                    meter.estimate_content(&message.content) as u64
-                }
-                SessionEventData::AssistantMessage { message, .. } => {
-                    meter.estimate_content(&message.content) as u64
-                }
-                SessionEventData::ToolResult { message, .. } => {
-                    meter.estimate_content(message.result_blocks()) as u64
-                }
-                _ => 0,
-            })
-            .unwrap_or(0);
+        let cost = node_tokens(session, meter, *seq);
         if count > 0 && kept + cost > retain_tokens {
             break;
         }
@@ -478,6 +838,16 @@ fn retain_tail_nodes(session: &Session, meter: Option<&TokenMeter>, retain_token
         count += 1;
     }
     count.max(1)
+}
+
+fn node_tokens(session: &Session, meter: &TokenMeter, seq: u64) -> u64 {
+    session
+        .events()
+        .iter()
+        .find(|event| event.seq == seq)
+        .and_then(|event| derive_event_message(&event.data))
+        .map(|message| meter.estimate_message(&message) as u64)
+        .unwrap_or(0)
 }
 
 /// Model-facing framing that precedes the `<compacted-summary>` block.
@@ -488,13 +858,21 @@ pub const CHECKPOINT_PREAMBLE: &str =
 pub const COMPACTION_INSTRUCTION: &str = "You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.\n\nOutput EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write \"(none)\" for an empty section — never drop a section.\n\n## Primary Request and Intent\n- [the user's original and evolving goals; quote verbatim where the exact wording matters]\n\n## Key Technical Concepts\n- [technologies, frameworks, patterns, and conventions in play]\n\n## Files and Code\n- [exact path: why it matters, key changes or snippets]\n\n## Errors and Fixes\n- [error: how it was resolved, plus any related user feedback]\n\n## Pending Jobs\n- [explicitly requested work not yet completed]\n\n## Current Work\n- [precisely what was in progress at this checkpoint]\n\n## Next Step\n- [the single next action, directly in line with the most recent request, or \"(none)\"]\n\n## Critical Context\n- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]\n\nRules:\n- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.\n- Capture user feedback and explicit instructions faithfully, especially corrections.\n- Do NOT mention this summarization request or that the context was compacted.\n- Output only the checkpoint text: do not call any tool or take any other action.\n- If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure.";
 
 struct SummarizedText {
-    summary_text: String,
+    summary: Vec<ContentBlock>,
+    raw_output: Vec<ContentBlock>,
+    provider: String,
+    model: String,
+    max_tokens: u32,
+    usage: Option<dsh_llm::TokenUsage>,
 }
 
-fn frame_summary(summary_text: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::text(format!(
-        "{CHECKPOINT_PREAMBLE}\n\n<compacted-summary>{summary_text}</compacted-summary>"
-    ))]
+fn frame_summary(summary: &[ContentBlock]) -> Vec<ContentBlock> {
+    let mut blocks = vec![ContentBlock::text(format!(
+        "{CHECKPOINT_PREAMBLE}\n\n<compacted-summary>"
+    ))];
+    blocks.extend(summary.iter().cloned());
+    blocks.push(ContentBlock::text("</compacted-summary>"));
+    blocks
 }
 
 fn last_request_route(session: &Session) -> Option<(String, String)> {
@@ -545,7 +923,7 @@ fn shadowed_messages(session: &Session, shadowed: &[u64]) -> Vec<Message> {
 
 async fn summarize_with_llm(
     llm: Option<&LlmRuntime>,
-    policy: &CompactionPolicy,
+    policy: &ResolvedTargetPolicy,
     session: &Session,
     shadowed: &[u64],
 ) -> Result<SummarizedText, String> {
@@ -575,8 +953,8 @@ async fn summarize_with_llm(
     let request = LlmRequest {
         adapter_defaults: None,
         config: LlmCallConfig {
-            provider,
-            model,
+            provider: provider.clone(),
+            model: model.clone(),
             reasoning_effort: None,
             max_tokens: Some(policy.max_tokens),
         },
@@ -611,19 +989,29 @@ async fn summarize_with_llm(
             _ => {}
         }
     }
-    let summary_text = assembler
-        .finish()
-        .into_iter()
+    let usage = assembler.take_usage();
+    let raw_output = assembler.finish();
+    let summary: Vec<ContentBlock> = raw_output
+        .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text),
+            ContentBlock::Text { text } => Some(ContentBlock::text(text.clone())),
             _ => None,
         })
-        .collect::<Vec<_>>()
-        .join("");
-    if summary_text.trim().is_empty() {
+        .collect();
+    if !summary.iter().any(|block| match block {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        _ => false,
+    }) {
         return Err("summarization produced no text summary content".into());
     }
-    Ok(SummarizedText { summary_text })
+    Ok(SummarizedText {
+        summary,
+        raw_output,
+        provider,
+        model,
+        max_tokens: policy.max_tokens,
+        usage,
+    })
 }
 
 #[async_trait]
@@ -739,12 +1127,21 @@ mod tests {
             .unwrap();
     }
 
+    fn bulky(label: &str) -> String {
+        format!("{label} {}", "context ".repeat(40))
+    }
+
+    fn compactable_session(id: &str) -> Arc<Session> {
+        let session = Arc::new(Session::new(session_id(id)));
+        for label in ["alpha", "bravo", "charlie", "delta"] {
+            append_user(&session, &bulky(label));
+        }
+        session
+    }
+
     #[tokio::test]
     async fn replace_removes_shadowed_nodes_from_derive() {
-        let session = Arc::new(Session::new(session_id("c")));
-        for text in ["a", "b", "c", "d"] {
-            append_user(&session, text);
-        }
+        let session = compactable_session("c");
         let agent = StubAgent {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
@@ -784,9 +1181,31 @@ mod tests {
                 dsh_llm::Message::User(user) => user
                     .content
                     .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { text } if text == "a")),
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))),
                 _ => false,
             }));
+        let summary = session
+            .events()
+            .into_iter()
+            .find_map(|event| match event.data {
+                SessionEventData::CompactionSummary {
+                    provider,
+                    model,
+                    llm_stream_call,
+                    raw_output,
+                    summary,
+                    max_tokens,
+                    ..
+                } => Some((provider, model, llm_stream_call, raw_output, summary, max_tokens)),
+                _ => None,
+            })
+            .expect("compaction/summary");
+        assert_eq!(summary.0, "replay");
+        assert_eq!(summary.1, "script");
+        assert_eq!(summary.2, Some(true));
+        assert_eq!(summary.3, Some(vec![ContentBlock::text("condensed checkpoint")]));
+        assert_eq!(summary.4, vec![ContentBlock::text("condensed checkpoint")]);
+        assert_eq!(summary.5, Some(8192));
     }
 
     #[tokio::test]
@@ -838,12 +1257,44 @@ mod tests {
         assert_eq!(policy.threshold_ratio, 0.8);
         assert_eq!(policy.retain_ratio, 0.16);
         assert_eq!(policy.max_tokens, 8192);
+        assert_eq!(policy.compaction_retries, 1);
+        assert_eq!(policy.max_overflow_retries, 1);
         assert!(policy.auto);
         assert!(policy.summarization_provider.is_empty());
-        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+        assert!(policy.model_policies.is_empty());
+        let tokens_only = CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdRatio": 0.1,
+            "retainTokens": 70
+        })))
+        .unwrap();
+        assert_eq!(tokens_only.retain_tokens, Some(70));
+        let merged = CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdRatio": 0.8,
+            "retainRatio": 0.1,
+            "modelPolicies": [{
+                "provider": "small-provider",
+                "model": "shared-id",
+                "thresholdRatio": 0.5,
+                "retainTokens": 120,
+                "summarizationProvider": "policy-summary",
+                "summarizationModel": "policy-summary",
+                "maxTokens": 222
+            }]
+        })))
+        .unwrap();
+        let small = merged.resolve_target("small-provider", "shared-id");
+        assert_eq!(small.threshold_ratio, 0.5);
+        assert_eq!(small.retention, ResolvedRetention::Tokens(120));
+        assert_eq!(small.summarization_provider, "policy-summary");
+        assert_eq!(small.max_tokens, 222);
+        let other = merged.resolve_target("large-provider", "shared-id");
+        assert_eq!(other.threshold_ratio, 0.8);
+        assert_eq!(other.retention, ResolvedRetention::Ratio(0.1));
+        let unknown = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdMessages": 40
         })))
-        .is_err());
+        .unwrap_err();
+        assert!(unknown.contains("unknown key \"thresholdMessages\""), "{unknown}");
         assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.1,
             "retainRatio": 0.2
@@ -852,6 +1303,29 @@ mod tests {
         assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
             "retainRatio": 0.1,
             "retainTokens": 100
+        })))
+        .is_err());
+        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+            "modelPolicies": [{
+                "provider": "replay",
+                "model": "script",
+                "thresholdRatio": 0.1
+            }]
+        })))
+        .is_err());
+        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+            "modelPolicies": [
+                { "provider": "replay", "model": "script" },
+                { "provider": "replay", "model": "script" }
+            ]
+        })))
+        .is_err());
+        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+            "modelPolicies": { "replay": { "retainTokens": 10 } }
+        })))
+        .is_err());
+        assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
+            "summarizationProvider": "replay"
         })))
         .is_err());
     }
@@ -898,14 +1372,14 @@ mod tests {
                 None,
             )
             .unwrap();
-        for text in ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"] {
-            append_user(&session, text);
+        for label in ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"] {
+            append_user(&session, &bulky(label));
         }
         let agent = StubAgent {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let (mut engine, _) = scripted_engine("ratio checkpoint");
+        let (mut engine, _) = scripted_engine("ok");
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.5,
             "retainRatio": 0.1,
@@ -974,5 +1448,105 @@ mod tests {
                     .any(|block| matches!(block, ContentBlock::Text { text } if text == "a")),
                 _ => false,
             }));
+    }
+
+    #[tokio::test]
+    async fn framed_summary_must_be_smaller_than_shadowed_history() {
+        let session = Arc::new(Session::new(session_id("noshrink")));
+        append_user(&session, "a");
+        append_user(&session, "b");
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let verbose = (0..80)
+            .map(|index| format!("verbose {index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (engine, _) = scripted_engine(&verbose);
+        let err = engine.compact_now(&agent, None).await.unwrap_err();
+        assert!(matches!(err, ManualCompactionError::Summary));
+        let end = session.events().into_iter().rev().find_map(|event| match event.data {
+            SessionEventData::CompactionEnd { error, .. } => error,
+            _ => None,
+        });
+        let error = end.expect("compaction/end.error");
+        assert!(
+            error.contains("summary is not smaller than the shadowed content"),
+            "{error}"
+        );
+        assert!(!session.events().iter().any(|event| {
+            matches!(event.data, SessionEventData::CompactionSummary { .. })
+        }));
+        assert!(session
+            .derive_messages()
+            .iter()
+            .any(|message| match message {
+                Message::User(user) => user
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == "a")),
+                _ => false,
+            }));
+    }
+
+    #[tokio::test]
+    async fn model_policy_routes_summarization_and_lowers_pressure() {
+        let session = Arc::new(Session::new(session_id("policy")));
+        session
+            .append(
+                SessionEventData::RequestContext {
+                    provider: "deepseek-official".into(),
+                    model: "deepseek-v4-flash".into(),
+                    context_window: Some(1000),
+                },
+                None,
+            )
+            .unwrap();
+        for label in ["alpha", "bravo", "charlie", "delta"] {
+            append_user(&session, &bulky(label));
+        }
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let (mut engine, adapter) = scripted_engine("policy summary");
+        engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdRatio": 0.95,
+            "retainRatio": 0.1,
+            "maxTokens": 111,
+            "summarizationProvider": "replay",
+            "summarizationModel": "script",
+            "modelPolicies": [{
+                "provider": "deepseek-official",
+                "model": "deepseek-v4-flash",
+                "thresholdRatio": 0.2,
+                "retainRatio": 0.05,
+                "summarizationProvider": "policy-summary",
+                "summarizationModel": "policy-summary",
+                "maxTokens": 222
+            }]
+        })))
+        .unwrap();
+        let default_threshold = ((1000.0_f64) * 0.95).floor() as u64;
+        let total = engine
+            .meter
+            .as_ref()
+            .expect("meter")
+            .estimate_session(session.as_ref()) as u64;
+        assert!(
+            total < default_threshold,
+            "fixture must sit below the default threshold ({total} < {default_threshold})"
+        );
+        let result = engine
+            .compact_if_needed(&agent, CompactionTrigger::Pressure)
+            .await
+            .unwrap()
+            .expect("model policy pressure");
+        assert!(!result.shadowed_seqs.is_empty());
+        let request = adapter.last.lock().expect("last").clone().expect("request");
+        assert_eq!(request.config.provider, "policy-summary");
+        assert_eq!(request.config.model, "policy-summary");
+        assert_eq!(request.config.max_tokens, Some(222));
     }
 }

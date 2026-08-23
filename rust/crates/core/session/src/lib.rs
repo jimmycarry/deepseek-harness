@@ -2,7 +2,10 @@
 
 use dsh_brand::Branded;
 use dsh_cordis::Service;
-use dsh_llm::{AssistantMessage, Message, StreamChunk, TokenUsage, ToolResultMessage, UserMessage};
+use dsh_llm::{
+    AssistantMessage, ContentBlock, Message, StreamChunk, TokenUsage, ToolResultMessage,
+    UserMessage,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -405,8 +408,14 @@ pub enum SessionEventData {
             skip_serializing_if = "Option::is_none"
         )]
         source_command_id: Option<String>,
-        /// Checkpoint summary text.
-        summary: String,
+        /// Safe text-only summary blocks before checkpoint framing.
+        summary: Vec<ContentBlock>,
+        /// Complete provider output before the text-only projection.
+        #[serde(rename = "rawOutput", skip_serializing_if = "Option::is_none")]
+        raw_output: Option<Vec<ContentBlock>>,
+        /// `true` when this result consumed exactly one `ctx.llm.stream()` call.
+        #[serde(rename = "llmStreamCall", skip_serializing_if = "Option::is_none")]
+        llm_stream_call: Option<bool>,
         /// Replaced surface range (`{start, end}` seqs).
         #[serde(rename = "shadowedRange")]
         shadowed_range: Value,
@@ -416,6 +425,16 @@ pub enum SessionEventData {
         /// Estimated token count of the shadowed span.
         #[serde(rename = "shadowedTokenCount")]
         shadowed_token_count: u64,
+        /// Provider route that wrote the summary.
+        provider: String,
+        /// Model that wrote the summary.
+        model: String,
+        /// Generation cap sent on the summarize call, when one applied.
+        #[serde(rename = "maxTokens", skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u32>,
+        /// Provider-reported usage for the summarize call, when emitted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
     },
     /// Compaction lock end.
     #[serde(rename = "compaction/end")]

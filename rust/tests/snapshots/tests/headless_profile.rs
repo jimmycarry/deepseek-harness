@@ -1487,12 +1487,23 @@ async fn compact_command_profile() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let overlay = replay_overlay(serde_json::json!({
+    let mut overlay = replay_overlay(serde_json::json!({
         "text": "pong",
         "auxiliary": {
             "compaction": "## Primary Request and Intent\n- keep the four notes"
         }
     }));
+    let mut compact = EntryPatch::replace("compaction-basic");
+    compact.config = Some(serde_json::json!({
+        "modelPolicies": [{
+            "provider": "replay",
+            "model": "script",
+            "maxTokens": 222,
+            "summarizationProvider": "replay",
+            "summarizationModel": "script"
+        }]
+    }));
+    overlay.push(compact);
     let ctx = mount_profile_in(&dir, "unused", overlay);
     let session = ctx.service::<SessionStore>().unwrap().create_fresh();
     let _handle = ctx
@@ -1510,10 +1521,13 @@ async fn compact_command_profile() {
             None,
         )
         .unwrap();
-    for text in ["alpha", "bravo", "charlie", "delta"] {
+    for label in ["alpha", "bravo", "charlie", "delta"] {
         session
             .append(
-                SessionEventData::UserMessage(UserMessage::text(text)),
+                SessionEventData::UserMessage(UserMessage::text(format!(
+                    "{label} {}",
+                    "context ".repeat(40)
+                ))),
                 Some(SurfaceOp::append()),
             )
             .unwrap();
@@ -1556,18 +1570,42 @@ async fn compact_command_profile() {
         .find(|event| event["type"] == "command/done")
         .expect("command/done");
     assert_eq!(done["data"]["sourceEventSeq"], summary["seq"]);
+    assert_eq!(summary["data"]["provider"], "replay");
+    assert_eq!(summary["data"]["model"], "script");
+    assert_eq!(summary["data"]["llmStreamCall"], true);
+    assert_eq!(summary["data"]["maxTokens"], 222);
+    assert_eq!(
+        summary["data"]["summary"],
+        serde_json::json!([{
+            "type": "text",
+            "text": "## Primary Request and Intent\n- keep the four notes"
+        }])
+    );
+    assert_eq!(
+        summary["data"]["rawOutput"],
+        summary["data"]["summary"]
+    );
     let checkpoint = session
         .derive_messages()
         .into_iter()
         .find_map(|message| match message {
-            dsh_llm::Message::User(user) => user.content.iter().find_map(|block| match block {
-                ContentBlock::Text { text }
-                    if text.contains("<compacted-summary>") =>
-                {
-                    Some(text.clone())
-                }
-                _ => None,
-            }),
+            dsh_llm::Message::User(user)
+                if user.content.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::Text { text } if text.contains("<compacted-summary>")
+                )) =>
+            {
+                Some(
+                    user.content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                )
+            }
             _ => None,
         })
         .expect("checkpoint");
