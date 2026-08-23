@@ -807,6 +807,7 @@ name = "dsh-rust-snapshots"
 version = "0.1.1-rc.2"
 dependencies = [
  "dsh-acp",
+ "dsh-agent",
  "dsh-app-boot",
  "dsh-bundle-headless",
  "dsh-commands",
@@ -816,6 +817,7 @@ dependencies = [
  "dsh-sdk-protocol",
  "dsh-sdk-server",
  "dsh-session",
+ "dsh-settings-file",
  "dsh-subagent",
  "dsh-tools",
  "serde_json",

@@ -44,8 +44,29 @@ pub trait CommandHandler: Send + Sync {
     async fn handle_invocation(
         &self,
         invocation: CommandInvocation<'_>,
-    ) -> Result<String, String> {
-        self.handle(invocation.raw_input).await
+    ) -> Result<CommandResult, String> {
+        self.handle(invocation.raw_input)
+            .await
+            .map(CommandResult::text)
+    }
+}
+
+/// Successful handler body returned to [`CommandRegistry::execute`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResult {
+    /// Handler text shown to the user.
+    pub text: String,
+    /// Earlier non-command event that owns a richer presentation.
+    pub source_event_seq: Option<u64>,
+}
+
+impl CommandResult {
+    /// Text-only success with no domain-event citation.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            source_event_seq: None,
+        }
     }
 }
 
@@ -58,6 +79,8 @@ pub struct CommandExecution {
     pub text: String,
     /// Whether the handler reported success.
     pub success: bool,
+    /// `command/done.sourceEventSeq` when the handler cited one.
+    pub source_event_seq: Option<u64>,
 }
 
 /// `ctx.commands`.
@@ -173,9 +196,9 @@ impl CommandRegistry {
                 command_id: &command_id,
             })
             .await;
-        let (success, text) = match &outcome {
-            Ok(text) => (true, text.clone()),
-            Err(text) => (false, text.clone()),
+        let (success, text, source_event_seq) = match &outcome {
+            Ok(result) => (true, result.text.clone(), result.source_event_seq),
+            Err(text) => (false, text.clone(), None),
         };
         let mut done = serde_json::Map::new();
         done.insert("commandId".into(), json!(command_id));
@@ -185,6 +208,11 @@ impl CommandRegistry {
         );
         if !text.is_empty() {
             done.insert("text".into(), json!(text));
+        }
+        if success {
+            if let Some(seq) = source_event_seq {
+                done.insert("sourceEventSeq".into(), json!(seq));
+            }
         }
         let done_error = session
             .append(
@@ -200,10 +228,11 @@ impl CommandRegistry {
                 return Some(Err(error.to_string()));
             }
         }
-        Some(outcome.map(|text| CommandExecution {
+        Some(outcome.map(|result| CommandExecution {
             command_id,
-            text,
+            text: result.text,
             success,
+            source_event_seq: result.source_event_seq,
         }))
     }
 }

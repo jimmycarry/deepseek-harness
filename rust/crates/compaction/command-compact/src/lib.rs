@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use dsh_agent::AgentRegistry;
-use dsh_commands::{Command, CommandHandler, CommandInvocation, CommandRegistry};
+use dsh_commands::{Command, CommandHandler, CommandInvocation, CommandRegistry, CommandResult};
 use dsh_compaction::{CompactionRuntime, ManualCompactionError};
 use dsh_cordis::Context;
 use dsh_session::session_id;
@@ -24,18 +24,22 @@ struct CompactHandler {
 #[async_trait]
 impl CommandHandler for CompactHandler {
     async fn handle(&self, args: &str) -> Result<String, String> {
-        self.run(args, None, None)
+        self.run(args, None, None).map(|(text, _)| text)
     }
 
     async fn handle_invocation(
         &self,
         invocation: CommandInvocation<'_>,
-    ) -> Result<String, String> {
-        self.run(
+    ) -> Result<CommandResult, String> {
+        let (text, source_event_seq) = self.run(
             invocation.raw_input,
             Some(invocation.session.id().as_str()),
             Some(invocation.command_id),
-        )
+        )?;
+        Ok(CommandResult {
+            text,
+            source_event_seq,
+        })
     }
 }
 
@@ -45,7 +49,7 @@ impl CompactHandler {
         args: &str,
         session_id_hint: Option<&str>,
         command_id: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<u64>), String> {
         if !args.trim().is_empty() {
             return Err(USAGE.to_string());
         }
@@ -74,17 +78,24 @@ impl CompactHandler {
                 .engine()
                 .compact_now(agent.as_ref(), Some(command_id)),
         ) {
-            Ok(None) => Ok("No compactable history yet.".into()),
-            Ok(Some(result)) => Ok(format!(
-                "Compacted {} history items (~{} tokens).",
-                result.shadowed_seqs.len(),
-                result.shadowed_token_count
+            Ok(None) => Ok(("No compactable history yet.".into(), None)),
+            Ok(Some(result)) => Ok((
+                format!(
+                    "Compacted {} history items (~{} tokens).",
+                    result.shadowed_seqs.len(),
+                    result.shadowed_token_count
+                ),
+                Some(result.summary_seq),
             )),
             Err(ManualCompactionError::Busy) => Err(
                 "Compaction is unavailable because this process has an active compaction, or the agent is not idle."
                     .into(),
             ),
-            Err(ManualCompactionError::NoRange) => Ok("No compactable history yet.".into()),
+            Err(ManualCompactionError::NoRange) => Ok(("No compactable history yet.".into(), None)),
+            Err(ManualCompactionError::Summary) => Err(
+                "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."
+                    .into(),
+            ),
         }
     }
 }

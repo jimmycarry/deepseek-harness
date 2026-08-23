@@ -7,10 +7,14 @@ use dsh_compaction::{
     CompactionEngine, CompactionResult, CompactionRuntime, CompactionTrigger, ManualCompactionError,
 };
 use dsh_cordis::Context;
-use dsh_llm::ContentBlock;
-use dsh_session::{session_id, Session, SessionEventData, SurfaceOp};
+use dsh_llm::{
+    BlockAssembler, ContentBlock, FinishReason, LlmCallConfig, LlmRequest, LlmRuntime, Message,
+    MessageSource, StreamChunk, UserMessage,
+};
+use dsh_session::{session_id, derive_event_message, Session, SessionEventData, SurfaceOp};
 use dsh_token_meter::TokenMeter;
 use futures::executor::block_on;
+use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -28,6 +32,12 @@ pub struct CompactionPolicy {
     pub retain_tokens: Option<u64>,
     /// Whether `agent/pre-step` runs automatic pressure compaction.
     pub auto: bool,
+    /// Optional dedicated summarizer provider; empty inherits the last route.
+    pub summarization_provider: String,
+    /// Optional dedicated summarizer model; empty inherits the last route.
+    pub summarization_model: String,
+    /// Output-token cap sent on the summarization request.
+    pub max_tokens: u32,
 }
 
 impl CompactionPolicy {
@@ -83,11 +93,32 @@ impl CompactionPolicy {
             Some(Value::Bool(value)) => *value,
             Some(_) => return Err("compaction-basic: auto must be a boolean".into()),
         };
+        let summarization_provider = config
+            .and_then(|value| value.get("summarizationProvider"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let summarization_model = config
+            .and_then(|value| value.get("summarizationModel"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let max_tokens = match config.and_then(|value| value.get("maxTokens")) {
+            None => 8192,
+            Some(value) => value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .map(|value| value as u32)
+                .ok_or_else(|| "compaction-basic: maxTokens must be a positive integer".to_string())?,
+        };
         Ok(Self {
             threshold_ratio,
             retain_ratio,
             retain_tokens,
             auto,
+            summarization_provider,
+            summarization_model,
+            max_tokens,
         })
     }
 }
@@ -113,6 +144,8 @@ pub struct BasicCompactionEngine {
     pub policy: CompactionPolicy,
     /// Meter used to price the shadowed span, when mounted.
     meter: Option<Arc<TokenMeter>>,
+    /// `ctx.llm` used for the one-shot `purpose: "compaction"` call.
+    llm: Option<Arc<LlmRuntime>>,
 }
 
 impl BasicCompactionEngine {
@@ -121,6 +154,7 @@ impl BasicCompactionEngine {
         Self {
             policy,
             meter: None,
+            llm: None,
         }
     }
 
@@ -129,6 +163,7 @@ impl BasicCompactionEngine {
         let engine = Arc::new(Self {
             policy,
             meter: ctx.get::<TokenMeter>(),
+            llm: ctx.get::<LlmRuntime>(),
         });
         engine.register_automatic(ctx)?;
         ctx.provide(Arc::new(CompactionRuntime::new(
@@ -283,7 +318,6 @@ impl BasicCompactionEngine {
                 None,
             )
             .ok();
-        let summary_text = "earlier conversation condensed".to_string();
         let shadowed_token_count = self
             .meter
             .as_ref()
@@ -306,12 +340,34 @@ impl BasicCompactionEngine {
                     .sum()
             })
             .unwrap_or(0);
+        let summarized = match summarize_with_llm(
+            self.llm.as_deref(),
+            &self.policy,
+            &session,
+            &shadowed,
+        ) {
+            Ok(summarized) => summarized,
+            Err(error) => {
+                session
+                    .append(
+                        SessionEventData::CompactionEnd {
+                            compaction_id,
+                            source_command_id,
+                            turn: None,
+                            error: Some(error),
+                        },
+                        None,
+                    )
+                    .ok();
+                return Err(ManualCompactionError::Summary);
+            }
+        };
         let summary_event = session
             .append(
                 SessionEventData::CompactionSummary {
                     compaction_id: compaction_id.clone(),
                     source_command_id: source_command_id.clone(),
-                    summary: summary_text.clone(),
+                    summary: summarized.summary_text.clone(),
                     shadowed_range: serde_json::json!({ "start": start, "end": end }),
                     shadowed_seqs: shadowed.clone(),
                     shadowed_token_count,
@@ -319,9 +375,7 @@ impl BasicCompactionEngine {
                 None,
             )
             .ok();
-        let summary = vec![ContentBlock::text(format!(
-            "{CHECKPOINT_PREAMBLE}\n\n<compacted-summary>\n{summary_text}\n</compacted-summary>"
-        ))];
+        let summary = frame_summary(&summarized.summary_text);
         let mut cited: Vec<u64> = Vec::new();
         if let Some(event) = &start_event {
             cited.push(event.seq);
@@ -332,9 +386,9 @@ impl BasicCompactionEngine {
         cited.extend(shadowed.iter().copied());
         session
             .append_cited(
-                SessionEventData::UserMessage(dsh_llm::UserMessage::from_parts(
+                SessionEventData::UserMessage(UserMessage::from_parts(
                     summary.clone(),
-                    dsh_llm::MessageSource::Plugin {
+                    MessageSource::Plugin {
                         plugin: "compact".into(),
                         form: None,
                         summary: None,
@@ -362,6 +416,7 @@ impl BasicCompactionEngine {
             shadowed_seqs: shadowed,
             shadowed_token_count,
             summary,
+            summary_seq: summary_event.map(|event| event.seq).unwrap_or(0),
         }))
     }
 }
@@ -417,7 +472,151 @@ fn retain_tail_nodes(session: &Session, meter: Option<&TokenMeter>, retain_token
 
 /// Model-facing framing that precedes the `<compacted-summary>` block.
 pub const CHECKPOINT_PREAMBLE: &str =
-    "This is an automatically generated checkpoint condensing an earlier span of this conversation.";
+    "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.";
+
+/// Compaction directive appended after the replayed region, matching TypeScript.
+pub const COMPACTION_INSTRUCTION: &str = "You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.\n\nOutput EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write \"(none)\" for an empty section — never drop a section.\n\n## Primary Request and Intent\n- [the user's original and evolving goals; quote verbatim where the exact wording matters]\n\n## Key Technical Concepts\n- [technologies, frameworks, patterns, and conventions in play]\n\n## Files and Code\n- [exact path: why it matters, key changes or snippets]\n\n## Errors and Fixes\n- [error: how it was resolved, plus any related user feedback]\n\n## Pending Jobs\n- [explicitly requested work not yet completed]\n\n## Current Work\n- [precisely what was in progress at this checkpoint]\n\n## Next Step\n- [the single next action, directly in line with the most recent request, or \"(none)\"]\n\n## Critical Context\n- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]\n\nRules:\n- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.\n- Capture user feedback and explicit instructions faithfully, especially corrections.\n- Do NOT mention this summarization request or that the context was compacted.\n- Output only the checkpoint text: do not call any tool or take any other action.\n- If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure.";
+
+struct SummarizedText {
+    summary_text: String,
+}
+
+fn frame_summary(summary_text: &str) -> Vec<ContentBlock> {
+    vec![ContentBlock::text(format!(
+        "{CHECKPOINT_PREAMBLE}\n\n<compacted-summary>{summary_text}</compacted-summary>"
+    ))]
+}
+
+fn last_request_route(session: &Session) -> Option<(String, String)> {
+    session.events().into_iter().rev().find_map(|event| match event.data {
+        SessionEventData::RequestContext {
+            provider, model, ..
+        } => Some((provider, model)),
+        SessionEventData::RequestHeader { header, .. } => {
+            let config = header.get("config")?;
+            Some((
+                config.get("provider")?.as_str()?.to_string(),
+                config.get("model")?.as_str()?.to_string(),
+            ))
+        }
+        _ => None,
+    })
+}
+
+fn last_request_prefix(session: &Session) -> (Option<String>, Vec<dsh_llm::ToolSchema>) {
+    for event in session.events().into_iter().rev() {
+        if let SessionEventData::RequestHeader { header, .. } = event.data {
+            let system = header
+                .get("system")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let tools = header
+                .get("tools")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+            return (system, tools);
+        }
+    }
+    (None, Vec::new())
+}
+
+fn shadowed_messages(session: &Session, shadowed: &[u64]) -> Vec<Message> {
+    let events = session.events();
+    shadowed
+        .iter()
+        .filter_map(|seq| {
+            events
+                .iter()
+                .find(|event| event.seq == *seq)
+                .and_then(|event| derive_event_message(&event.data))
+        })
+        .collect()
+}
+
+fn summarize_with_llm(
+    llm: Option<&LlmRuntime>,
+    policy: &CompactionPolicy,
+    session: &Session,
+    shadowed: &[u64],
+) -> Result<SummarizedText, String> {
+    let Some(llm) = llm else {
+        return Err(
+            "no provider/model available for summarization: set both BasicCompactionConfig summarization fields, route one request, or set both AgentOptions fields"
+                .into(),
+        );
+    };
+    let (provider, model) = if !policy.summarization_provider.is_empty() {
+        (
+            policy.summarization_provider.clone(),
+            policy.summarization_model.clone(),
+        )
+    } else {
+        last_request_route(session).ok_or_else(|| {
+            "no provider/model available for summarization: set both BasicCompactionConfig summarization fields, route one request, or set both AgentOptions fields"
+                .to_string()
+        })?
+    };
+    let (system, tools) = last_request_prefix(session);
+    let mut messages = shadowed_messages(session, shadowed);
+    messages.push(Message::User(UserMessage::from_parts(
+        vec![ContentBlock::text(COMPACTION_INSTRUCTION)],
+        MessageSource::plugin("dsh-compaction-basic"),
+    )));
+    let request = LlmRequest {
+        adapter_defaults: None,
+        config: LlmCallConfig {
+            provider,
+            model,
+            reasoning_effort: None,
+            max_tokens: Some(policy.max_tokens),
+        },
+        system,
+        messages,
+        tools,
+        purpose: Some("compaction".into()),
+    };
+    block_on(async {
+        let stream = llm
+            .stream(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut assembler = BlockAssembler::default();
+        let mut finish: Option<FinishReason> = None;
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            if let StreamChunk::Finish { reason, .. } = &chunk {
+                finish = Some(reason.clone());
+            }
+            assembler.push(&chunk);
+        }
+        if let Some(reason) = finish.as_ref() {
+            match reason {
+                FinishReason::Error { failure } | FinishReason::Aborted { failure } => {
+                    return Err(failure.message.clone());
+                }
+                FinishReason::MaxTokens => {
+                    return Err(
+                        "summarization truncated at the token cap (incomplete checkpoint)".into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        let summary_text = assembler
+            .finish()
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if summary_text.trim().is_empty() {
+            return Err("summarization produced no text summary content".into());
+        }
+        Ok(SummarizedText { summary_text })
+    })
+}
 
 #[async_trait]
 impl CompactionEngine for BasicCompactionEngine {
@@ -442,8 +641,57 @@ impl CompactionEngine for BasicCompactionEngine {
 mod tests {
     use super::*;
     use dsh_agent::{Agent, AgentCancelCause, AgentError, AgentStatus, Inbox, InboxTarget};
+    use dsh_llm::{LlmAdapter, LlmError, LlmFailure};
     use dsh_session::{session_id, Session, SessionStore};
-    use std::sync::Arc;
+    use futures::stream;
+    use std::sync::{Arc, Mutex};
+
+    struct ScriptedSummarizer {
+        text: String,
+        last: Mutex<Option<LlmRequest>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl LlmAdapter for ScriptedSummarizer {
+        async fn stream(
+            &self,
+            request: LlmRequest,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<'static, StreamChunk>,
+            LlmError,
+        > {
+            *self.last.lock().expect("last") = Some(request);
+            if self.fail {
+                return Err(LlmError::Failure(LlmFailure {
+                    message: "summarizer boom".into(),
+                    code: "SUMMARIZER".into(),
+                    status: None,
+                }));
+            }
+            Ok(Box::pin(stream::iter(StreamChunk::text_stream(
+                self.text.clone(),
+            ))))
+        }
+    }
+
+    fn scripted_engine(text: &str) -> (BasicCompactionEngine, Arc<ScriptedSummarizer>) {
+        let adapter = Arc::new(ScriptedSummarizer {
+            text: text.into(),
+            last: Mutex::new(None),
+            fail: false,
+        });
+        let engine = BasicCompactionEngine {
+            policy: CompactionPolicy::resolve(Some(&serde_json::json!({
+                "summarizationProvider": "replay",
+                "summarizationModel": "script"
+            })))
+            .unwrap(),
+            meter: Some(Arc::new(TokenMeter::new(4))),
+            llm: Some(Arc::new(LlmRuntime::new(Arc::clone(&adapter) as Arc<dyn LlmAdapter>))),
+        };
+        (engine, adapter)
+    }
 
     struct StubAgent {
         session: Arc<Session>,
@@ -491,8 +739,25 @@ mod tests {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let engine = BasicCompactionEngine::new(CompactionPolicy::resolve(None).unwrap());
+        let (engine, adapter) = scripted_engine("condensed checkpoint");
         let result = engine.compact_now(&agent, None).await.unwrap().unwrap();
+        let request = adapter.last.lock().expect("last").clone().expect("request");
+        assert_eq!(request.purpose.as_deref(), Some("compaction"));
+        let instruction = match request.messages.last() {
+            Some(Message::User(user)) => user
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or(""),
+            _ => "",
+        };
+        assert!(
+            instruction.contains("You are now acting as a compaction engine"),
+            "{instruction}"
+        );
         assert!(!result.shadowed_seqs.is_empty());
         let messages = session.derive_messages();
         assert!(messages.iter().any(|message| match message {
@@ -562,7 +827,9 @@ mod tests {
         let policy = CompactionPolicy::resolve(None).unwrap();
         assert_eq!(policy.threshold_ratio, 0.8);
         assert_eq!(policy.retain_ratio, 0.16);
+        assert_eq!(policy.max_tokens, 8192);
         assert!(policy.auto);
+        assert!(policy.summarization_provider.is_empty());
         assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdMessages": 40
         })))
@@ -592,10 +859,13 @@ mod tests {
         let engine = BasicCompactionEngine {
             policy: CompactionPolicy::resolve(Some(&serde_json::json!({
                 "thresholdRatio": 0.1,
-                "retainRatio": 0.01
+                "retainRatio": 0.01,
+                "summarizationProvider": "replay",
+                "summarizationModel": "script"
             })))
             .unwrap(),
             meter: Some(Arc::new(TokenMeter::new(1))),
+            llm: None,
         };
         assert!(engine
             .compact_if_needed(&agent, CompactionTrigger::Pressure)
@@ -624,19 +894,73 @@ mod tests {
             session: Arc::clone(&session),
             inbox: Arc::new(Inbox::default()),
         };
-        let engine = BasicCompactionEngine {
-            policy: CompactionPolicy::resolve(Some(&serde_json::json!({
-                "thresholdRatio": 0.5,
-                "retainRatio": 0.1
-            })))
-            .unwrap(),
-            meter: Some(Arc::new(TokenMeter::new(1))),
-        };
+        let (mut engine, _) = scripted_engine("ratio checkpoint");
+        engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdRatio": 0.5,
+            "retainRatio": 0.1,
+            "summarizationProvider": "replay",
+            "summarizationModel": "script"
+        })))
+        .unwrap();
+        engine.meter = Some(Arc::new(TokenMeter::new(1)));
         let result = engine
             .compact_if_needed(&agent, CompactionTrigger::Pressure)
             .await
             .unwrap()
             .expect("pressure compaction");
         assert!(!result.shadowed_seqs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn summarize_failure_writes_end_error_and_keeps_history() {
+        let session = Arc::new(Session::new(session_id("fail")));
+        for text in ["a", "b", "c", "d"] {
+            append_user(&session, text);
+        }
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let adapter = Arc::new(ScriptedSummarizer {
+            text: String::new(),
+            last: Mutex::new(None),
+            fail: true,
+        });
+        let engine = BasicCompactionEngine {
+            policy: CompactionPolicy::resolve(Some(&serde_json::json!({
+                "summarizationProvider": "replay",
+                "summarizationModel": "script"
+            })))
+            .unwrap(),
+            meter: None,
+            llm: Some(Arc::new(LlmRuntime::new(
+                Arc::clone(&adapter) as Arc<dyn LlmAdapter>
+            ))),
+        };
+        let err = engine.compact_now(&agent, None).await.unwrap_err();
+        assert!(matches!(err, ManualCompactionError::Summary));
+        let types: Vec<&str> = session
+            .events()
+            .iter()
+            .map(|event| match event.data {
+                SessionEventData::CompactionStart { .. } => "compaction/start",
+                SessionEventData::CompactionSummary { .. } => "compaction/summary",
+                SessionEventData::CompactionEnd { .. } => "compaction/end",
+                _ => "other",
+            })
+            .collect();
+        assert!(types.contains(&"compaction/start"));
+        assert!(types.contains(&"compaction/end"));
+        assert!(!types.contains(&"compaction/summary"));
+        assert!(session
+            .derive_messages()
+            .iter()
+            .any(|message| match message {
+                Message::User(user) => user
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == "a")),
+                _ => false,
+            }));
     }
 }

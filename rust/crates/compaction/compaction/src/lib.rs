@@ -24,6 +24,8 @@ pub struct CompactionResult {
     pub shadowed_token_count: u64,
     /// Summary content.
     pub summary: Vec<ContentBlock>,
+    /// Seq of the log-only `compaction/summary` event.
+    pub summary_seq: u64,
 }
 
 /// Manual compaction failures.
@@ -35,6 +37,9 @@ pub enum ManualCompactionError {
     /// No safe useful range.
     #[error("no range")]
     NoRange,
+    /// The summarizer produced no useful checkpoint.
+    #[error("summary")]
+    Summary,
 }
 
 /// `ctx.compaction`.

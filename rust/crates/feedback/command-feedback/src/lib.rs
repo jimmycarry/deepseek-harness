@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use dsh_anonymous_user_id::get_or_create_anonymous_user_id;
-use dsh_commands::{Command, CommandHandler, CommandInvocation, CommandRegistry};
+use dsh_commands::{Command, CommandHandler, CommandInvocation, CommandRegistry, CommandResult};
 use dsh_cordis::{Context, Result, Service};
 use dsh_session::{Session, SessionEventData};
 use serde_json::json;
@@ -107,18 +107,18 @@ impl CommandHandler for FeedbackCommand {
     async fn handle_invocation(
         &self,
         invocation: CommandInvocation<'_>,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<CommandResult, String> {
         if invocation.raw_input.trim().is_empty() {
             return Err(format!("Feedback text is required. {USAGE}"));
         }
         record_feedback(invocation.session, invocation.raw_input)?;
         let user = get_or_create_anonymous_user_id();
         let telemetry = self.lookup.get::<SessionTelemetry>();
-        Ok(format!(
+        Ok(CommandResult::text(format!(
             "Feedback recorded for session {}\nAnonymous user: {user}. {}",
             invocation.session.id(),
             sharing_disclosure(telemetry.as_deref())
-        ))
+        )))
     }
 }
 

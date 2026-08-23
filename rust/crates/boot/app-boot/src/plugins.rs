@@ -856,22 +856,30 @@ impl LlmAdapter for LiveDeepSeekAdapter {
 }
 
 fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
-    if let Some(turns) = config
+    let mut adapter = if let Some(turns) = config
         .as_ref()
         .and_then(|value| value.get("turns"))
         .cloned()
         .and_then(|value| serde_json::from_value::<Vec<dsh_llm_replay::ReplayTurn>>(value).ok())
     {
-        return ctx.provide(Arc::new(LlmRuntime::new(Arc::new(ReplayAdapter::new(
-            turns,
-        )))));
+        ReplayAdapter::new(turns)
+    } else {
+        let text = config
+            .as_ref()
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("pong");
+        ReplayAdapter::text(text)
+    };
+    if let Some(Value::Object(map)) = config.as_ref().and_then(|value| value.get("auxiliary")) {
+        for (purpose, text) in map {
+            let Some(text) = text.as_str() else {
+                return Err(CordisError::Validation(
+                    "llm-replay: auxiliary values must be strings".into(),
+                ));
+            };
+            adapter = adapter.with_auxiliary(purpose, text);
+        }
     }
-    let text = config
-        .as_ref()
-        .and_then(|value| value.get("text"))
-        .and_then(Value::as_str)
-        .unwrap_or("pong");
-    ctx.provide(Arc::new(LlmRuntime::new(Arc::new(ReplayAdapter::text(
-        text,
-    )))))
+    ctx.provide(Arc::new(LlmRuntime::new(Arc::new(adapter))))
 }

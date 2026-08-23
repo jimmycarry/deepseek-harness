@@ -15,10 +15,14 @@ use serde_json::Value;
 use std::sync::Arc;
 
 fn replay_text_overlay(text: &str) -> Vec<EntryPatch> {
+    replay_overlay(serde_json::json!({ "text": text }))
+}
+
+fn replay_overlay(config: Value) -> Vec<EntryPatch> {
     let mut disable = EntryPatch::replace("llm-deepseek");
     disable.disabled = Some(Value::Bool(true));
     let mut replay = Entry::new("llm-replay", "@deepseek-ai/dsh-llm-replay");
-    replay.config = Some(serde_json::json!({ "text": text }));
+    replay.config = Some(config);
     vec![disable, EntryPatch::insert_row(replay)]
 }
 
@@ -1483,12 +1487,28 @@ async fn compact_command_profile() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let ctx = mount_profile_in(&dir, "unused", vec![]);
+    let overlay = replay_overlay(serde_json::json!({
+        "text": "pong",
+        "auxiliary": {
+            "compaction": "## Primary Request and Intent\n- keep the four notes"
+        }
+    }));
+    let ctx = mount_profile_in(&dir, "unused", overlay);
     let session = ctx.service::<SessionStore>().unwrap().create_fresh();
     let _handle = ctx
         .service::<AgentRegistry>()
         .unwrap()
         .create(Arc::clone(&session))
+        .unwrap();
+    session
+        .append(
+            SessionEventData::RequestContext {
+                provider: "replay".into(),
+                model: "script".into(),
+                context_window: None,
+            },
+            None,
+        )
         .unwrap();
     for text in ["alpha", "bravo", "charlie", "delta"] {
         session
@@ -1511,7 +1531,8 @@ async fn compact_command_profile() {
         "{}",
         outcome.text
     );
-    let types = types_of(&events_of(&session));
+    let events = events_of(&session);
+    let types = types_of(&events);
     for name in [
         "command/run",
         "compaction/start",
@@ -1521,6 +1542,43 @@ async fn compact_command_profile() {
     ] {
         assert!(types.iter().any(|found| found == name), "{types:?}");
     }
+    let summary = events
+        .iter()
+        .find(|event| event["type"] == "compaction/summary")
+        .expect("compaction/summary");
+    assert_eq!(
+        outcome.source_event_seq,
+        summary["seq"].as_u64(),
+        "{outcome:?} {summary}"
+    );
+    let done = events
+        .iter()
+        .find(|event| event["type"] == "command/done")
+        .expect("command/done");
+    assert_eq!(done["data"]["sourceEventSeq"], summary["seq"]);
+    let checkpoint = session
+        .derive_messages()
+        .into_iter()
+        .find_map(|message| match message {
+            dsh_llm::Message::User(user) => user.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text }
+                    if text.contains("<compacted-summary>") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("checkpoint");
+    assert!(
+        checkpoint.contains("Continue the task directly from the messages that follow"),
+        "{checkpoint}"
+    );
+    assert!(
+        checkpoint.contains("keep the four notes"),
+        "{checkpoint}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
