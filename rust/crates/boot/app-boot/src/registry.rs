@@ -99,6 +99,11 @@ mod tests {
         assert!(ctx.has_service("spillStore"));
         assert!(ctx.has_service("sessionProjections"));
         assert!(ctx.has_service("sessionCheckpointPolicy"));
+        let commands = ctx.service::<dsh_commands::CommandRegistry>().unwrap();
+        assert!(
+            commands.get("feedback").is_some(),
+            "dsh-command-feedback must register /feedback"
+        );
     }
 
     #[test]

@@ -2,8 +2,12 @@
 
 use async_trait::async_trait;
 use dsh_cordis::{Context, Service};
+use dsh_session::{Session, SessionEventData};
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 /// One registered slash command.
 pub struct Command {
@@ -13,8 +17,19 @@ pub struct Command {
     pub description: String,
     /// Whether the command text is injected into the model request.
     pub model_visible: bool,
+    /// Whether `command/run` records `args`. `false` when a domain event owns
+    /// the payload (`/feedback`).
+    pub record_input: bool,
     /// Handler invoked by [`CommandRegistry::dispatch`].
     pub handler: Arc<dyn CommandHandler>,
+}
+
+/// Session-aware invocation used by [`CommandRegistry::execute`].
+pub struct CommandInvocation<'a> {
+    /// Receiving session; lifecycle events are appended here.
+    pub session: &'a Session,
+    /// Remainder of the typed line after the command name.
+    pub raw_input: &'a str,
 }
 
 /// Body of one command.
@@ -22,18 +37,49 @@ pub struct Command {
 pub trait CommandHandler: Send + Sync {
     /// Run the command with the remainder of the typed line.
     async fn handle(&self, args: &str) -> Result<String, String>;
+
+    /// Session-aware entry used by [`CommandRegistry::execute`].
+    async fn handle_invocation(
+        &self,
+        invocation: CommandInvocation<'_>,
+    ) -> Result<String, String> {
+        self.handle(invocation.raw_input).await
+    }
+}
+
+/// Settled outcome of [`CommandRegistry::execute`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandExecution {
+    /// Pairing id carried by `command/run` / `command/done`.
+    pub command_id: String,
+    /// Handler text.
+    pub text: String,
+    /// Whether the handler reported success.
+    pub success: bool,
 }
 
 /// `ctx.commands`.
-#[derive(Default)]
 pub struct CommandRegistry {
     commands: Arc<Mutex<HashMap<String, Arc<Command>>>>,
+    instance: String,
+    seq: AtomicU64,
+}
+
+impl Default for CommandRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommandRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self::default()
+        let hex = Uuid::new_v4().as_simple().to_string();
+        Self {
+            commands: Arc::new(Mutex::new(HashMap::new())),
+            instance: hex[..8].to_string(),
+            seq: AtomicU64::new(0),
+        }
     }
 
     /// Register a command. The registration is an effect on `ctx`.
@@ -78,6 +124,85 @@ impl CommandRegistry {
         let command = self.get(name)?;
         Some(command.handler.handle(args).await)
     }
+
+    /// Parse and execute a known command, appending log-only `command/run`
+    /// then `command/done`. Admission misses (not a slash line, unknown name)
+    /// return `None` and write nothing.
+    pub async fn execute(
+        &self,
+        session: &Session,
+        line: &str,
+    ) -> Option<std::result::Result<CommandExecution, String>> {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+        let rest = &trimmed[1..];
+        let (name, args) = match rest.split_once(char::is_whitespace) {
+            Some((name, args)) => (name, args.trim()),
+            None => (rest, ""),
+        };
+        let command = self.get(name)?;
+        let command_id = {
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            format!("cmd-{}-{seq}", self.instance)
+        };
+        let mut run = serde_json::Map::new();
+        run.insert("commandId".into(), json!(command_id));
+        run.insert("name".into(), json!(name));
+        run.insert("source".into(), json!({ "kind": "user" }));
+        if command.record_input {
+            run.insert("args".into(), json!(args));
+        }
+        if let Err(error) = session.append(
+            SessionEventData::Extension {
+                type_name: "command/run".into(),
+                data: Value::Object(run),
+            },
+            None,
+        ) {
+            return Some(Err(error.to_string()));
+        }
+        let outcome = command
+            .handler
+            .handle_invocation(CommandInvocation {
+                session,
+                raw_input: args,
+            })
+            .await;
+        let (success, text) = match &outcome {
+            Ok(text) => (true, text.clone()),
+            Err(text) => (false, text.clone()),
+        };
+        let mut done = serde_json::Map::new();
+        done.insert("commandId".into(), json!(command_id));
+        done.insert(
+            "kind".into(),
+            json!(if success { "success" } else { "error" }),
+        );
+        if !text.is_empty() {
+            done.insert("text".into(), json!(text));
+        }
+        let done_error = session
+            .append(
+                SessionEventData::Extension {
+                    type_name: "command/done".into(),
+                    data: Value::Object(done),
+                },
+                None,
+            )
+            .err();
+        if let Some(error) = done_error {
+            if success {
+                return Some(Err(error.to_string()));
+            }
+        }
+        Some(outcome.map(|text| CommandExecution {
+            command_id,
+            text,
+            success,
+        }))
+    }
 }
 
 impl Service for CommandRegistry {
@@ -109,6 +234,7 @@ mod tests {
             name: "goal".into(),
             description: "Set a same-session goal".into(),
             model_visible: false,
+            record_input: true,
             handler: Arc::new(StaticHandler {
                 text: "ok".into(),
             }),
@@ -124,12 +250,64 @@ mod tests {
             name: "goal".into(),
             description: "Set a same-session goal".into(),
             model_visible: false,
+            record_input: true,
             handler: Arc::new(StaticHandler {
                 text: "ok".into(),
             }),
         });
         let goal = registry.get("goal").unwrap();
         assert!(!goal.model_visible);
+    }
+
+    #[tokio::test]
+    async fn execute_logs_run_and_done_and_omits_args_when_unrecorded() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(dsh_session::SessionStore::new()))
+            .unwrap();
+        let registry = CommandRegistry::new();
+        registry.insert(Command {
+            name: "echo".into(),
+            description: "echo".into(),
+            model_visible: false,
+            record_input: true,
+            handler: Arc::new(StaticHandler {
+                text: "heard".into(),
+            }),
+        });
+        registry.insert(Command {
+            name: "quiet".into(),
+            description: "quiet".into(),
+            model_visible: false,
+            record_input: false,
+            handler: Arc::new(StaticHandler {
+                text: "ok".into(),
+            }),
+        });
+        let session = ctx
+            .service::<dsh_session::SessionStore>()
+            .unwrap()
+            .create_fresh();
+        let recorded = registry
+            .execute(session.as_ref(), "/echo  please log this")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recorded.success);
+        assert_eq!(recorded.text, "heard");
+        let run = serde_json::to_value(&session.events()[0]).unwrap();
+        assert_eq!(run["type"], "command/run");
+        assert_eq!(run["data"]["args"], "please log this");
+        assert_eq!(run["data"]["source"]["kind"], "user");
+        let hidden = registry
+            .execute(session.as_ref(), "/quiet secret payload")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hidden.text, "ok");
+        let quiet_run = serde_json::to_value(&session.events()[2]).unwrap();
+        assert!(quiet_run["data"].get("args").is_none());
+        assert!(registry.execute(session.as_ref(), "not a slash").await.is_none());
+        assert!(registry.execute(session.as_ref(), "/missing").await.is_none());
     }
 
     #[test]

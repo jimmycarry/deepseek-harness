@@ -234,6 +234,7 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<Arc<PlanRunt
                 name: "plan".into(),
                 description: "Toggle plan mode".into(),
                 model_visible: false,
+                record_input: true,
                 handler: Arc::new(PlanCommand {
                     plan: Arc::clone(&plan),
                     lookup: ctx.clone(),

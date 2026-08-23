@@ -45,6 +45,7 @@ members = [
   "crates/credentials/credentials",
   "crates/credentials/credentials-local",
   "crates/credentials/authorization",
+  "crates/identity/anonymous-user-id",
   "crates/skill/skill",
   "crates/skill/skill-filesystem",
   "crates/skill/tool-skill",
@@ -87,6 +88,7 @@ members = [
   "crates/spill/spill-local",
   "crates/spill/spill-policy",
   "crates/interaction/commands",
+  "crates/feedback/command-feedback",
   "crates/interaction/user-questions",
   "crates/sdk/protocol",
   "crates/sdk/client",
@@ -211,6 +213,8 @@ dsh-spill = { path = "crates/spill/spill" }
 dsh-spill-local = { path = "crates/spill/spill-local" }
 dsh-spill-policy = { path = "crates/spill/spill-policy" }
 dsh-commands = { path = "crates/interaction/commands" }
+dsh-anonymous-user-id = { path = "crates/identity/anonymous-user-id" }
+dsh-command-feedback = { path = "crates/feedback/command-feedback" }
 dsh-user-questions = { path = "crates/interaction/user-questions" }
 dsh-sdk-protocol = { path = "crates/sdk/protocol" }
 dsh-sdk-client = { path = "crates/sdk/client" }

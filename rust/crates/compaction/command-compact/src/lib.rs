@@ -75,6 +75,7 @@ pub fn install(ctx: &Context) -> dsh_cordis::Result<()> {
             name: "compact".into(),
             description: "Compact older conversation history".into(),
             model_visible: false,
+            record_input: true,
             handler: Arc::new(CompactHandler {
                 compaction,
                 lookup: ctx.clone(),

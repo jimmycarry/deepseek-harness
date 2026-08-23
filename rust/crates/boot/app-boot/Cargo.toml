@@ -19,6 +19,7 @@ dsh-bundle-base.workspace = true
 dsh-bundle-headless.workspace = true
 dsh-bundle-jsonrpc.workspace = true
 dsh-command-compact.workspace = true
+dsh-command-feedback.workspace = true
 dsh-command-goal.workspace = true
 dsh-commands.workspace = true
 dsh-compaction-basic.workspace = true

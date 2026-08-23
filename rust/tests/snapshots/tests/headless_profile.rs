@@ -46,11 +46,7 @@ async fn run_profile_host(task: &str, overlay: Vec<EntryPatch>) -> (Context, Arc
     run_profile_host_in(&dir, task, overlay).await
 }
 
-async fn run_profile_host_in(
-    dir: &std::path::Path,
-    task: &str,
-    overlay: Vec<EntryPatch>,
-) -> (Context, Arc<Session>) {
+fn mount_profile_in(dir: &std::path::Path, task: &str, overlay: Vec<EntryPatch>) -> Context {
     std::env::set_var("DSH_HOME", dir);
     std::env::set_var("DSH_PERMISSION_MODE", "danger-full-access");
     let layers = shipped_bundles("headless").unwrap();
@@ -64,6 +60,15 @@ async fn run_profile_host_in(
     let loader = Loader::new();
     register_profile_plugins(&loader);
     loader.mount(&ctx, &entries).unwrap();
+    ctx
+}
+
+async fn run_profile_host_in(
+    dir: &std::path::Path,
+    task: &str,
+    overlay: Vec<EntryPatch>,
+) -> (Context, Arc<Session>) {
+    let ctx = mount_profile_in(dir, task, overlay);
     let session = dsh_bundle_headless::run_session(&ctx).await.unwrap();
     (ctx, session)
 }
@@ -1125,6 +1130,51 @@ async fn exit_plan_mode_outside_plan_mode_fails() {
         .as_str()
         .unwrap_or("");
     assert_eq!(text, "Error: exit_plan_mode is only available in plan mode");
+}
+
+#[tokio::test]
+async fn feedback_command_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-m-feedback-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(".anonymous-user-id"),
+        "01234567-89ab-4cde-8f01-23456789abcd\n",
+    )
+    .unwrap();
+    let ctx = mount_profile_in(&dir, "unused", vec![]);
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let outcome = ctx
+        .service::<dsh_commands::CommandRegistry>()
+        .unwrap()
+        .execute(session.as_ref(), "/feedback  the diff view is unreadable")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(outcome.success);
+    assert_eq!(
+        outcome.text,
+        format!(
+            "Feedback recorded for session {}\nAnonymous user: 01234567-89ab-4cde-8f01-23456789abcd. Session sharing is not configured.",
+            session.id()
+        )
+    );
+    let events = events_of(&session);
+    assert_eq!(
+        types_of(&events),
+        vec![
+            "command/run".to_string(),
+            "feedback/record".to_string(),
+            "command/done".to_string()
+        ]
+    );
+    assert!(events[0]["data"].get("args").is_none());
+    assert_eq!(events[1]["data"]["text"], "the diff view is unreadable");
+    assert!(session.derive_messages().is_empty());
 }
 
 #[test]

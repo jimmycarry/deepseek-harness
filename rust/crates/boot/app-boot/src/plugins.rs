@@ -80,6 +80,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
             Ok(())
         }
         "@deepseek-ai/dsh-commands" => ctx.provide(Arc::new(CommandRegistry::new())),
+        "@deepseek-ai/dsh-command-feedback" => dsh_command_feedback::install(ctx),
         "@deepseek-ai/dsh-fs-sandbox" => {
             dsh_fs_local::install(ctx)?;
             Ok(())

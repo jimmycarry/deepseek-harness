@@ -25,6 +25,7 @@ pub fn install(ctx: &Context) -> Result<()> {
             name: "goal".into(),
             description: "set or view the goal for a long-running task".into(),
             model_visible: false,
+            record_input: true,
             handler: Arc::new(GoalCommand { goals, agents }),
         },
     )

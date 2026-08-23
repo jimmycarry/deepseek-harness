@@ -11,6 +11,7 @@ publish = false
 dsh-acp.workspace = true
 dsh-app-boot.workspace = true
 dsh-bundle-headless.workspace = true
+dsh-commands.workspace = true
 dsh-sdk-protocol.workspace = true
 dsh-sdk-server.workspace = true
 dsh-cordis.workspace = true
