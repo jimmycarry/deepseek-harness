@@ -180,7 +180,7 @@ fn desired_instruction_message(
         .get(agent_id)
         .cloned();
     let snapshot = published_files(files);
-    let message = match previous {
+    let message = match previous.as_ref() {
         None => {
             let text = render_baseline(files, config.max_bytes, false);
             if text.is_empty() {
