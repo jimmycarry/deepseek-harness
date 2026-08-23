@@ -111,12 +111,25 @@ impl LoopAgent {
                 break;
             }
             let claimed = self.inbox.claim(target);
+            if self.ctx.has_service(dsh_session_checkpoint_policy::CheckpointPolicy::KEY) {
+                if let Err(error) =
+                    dsh_session_checkpoint_policy::flush_session(&self.ctx, self.session.as_ref())
+                        .await
+                {
+                    turn_end = Some(TurnEndReason::Error {
+                        message: error,
+                        code: "CHECKPOINT".into(),
+                    });
+                    break;
+                }
+            }
             let decision = self.ctx.waterfall(
                 "agent/pre-step",
                 serde_json::json!({
                     "agentId": self.session.id().as_str(),
                     "messages": claimed.iter().map(|message| serde_json::to_value(message).unwrap_or_default()).collect::<Vec<_>>(),
                     "turn": turn,
+                    "cwd": self.session.header().cwd,
                 }),
                 |payload| payload,
             );
@@ -267,16 +280,38 @@ impl LoopAgent {
             request.config.provider.clone(),
             request.config.model.clone(),
         );
+        if self.ctx.has_service(dsh_session_checkpoint_policy::CheckpointPolicy::KEY) {
+            if let Err(error) =
+                dsh_session_checkpoint_policy::flush_session(&self.ctx, self.session.as_ref()).await
+            {
+                return Some(TurnEndReason::Error {
+                    message: error,
+                    code: "CHECKPOINT".into(),
+                });
+            }
+        }
+        let _ = self.ctx.waterfall(
+            "llm/stream",
+            serde_json::json!({ "sessionId": self.session.id().as_str() }),
+            |payload| payload,
+        );
         let stream = match llm.stream(request).await {
             Ok(stream) => stream,
             Err(error) => {
+                let failure = match &error {
+                    dsh_llm::LlmError::Failure(failure) => failure.clone(),
+                };
                 let recovery = self.ctx.waterfall(
                     "agent/request-error",
                     serde_json::json!({
-                        "code": match &error {
-                            dsh_llm::LlmError::Failure(failure) => failure.code.clone(),
-                        },
-                        "message": error.to_string(),
+                        "agentId": self.session.id().as_str(),
+                        "turn": turn,
+                        "step": step,
+                        "provider": route.0,
+                        "code": failure.code,
+                        "message": failure.message,
+                        "failure": failure,
+                        "retryPolicy": dsh_llm::RetryPolicy::default(),
                     }),
                     |payload| payload,
                 );

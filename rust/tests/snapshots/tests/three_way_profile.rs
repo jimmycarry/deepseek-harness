@@ -44,8 +44,11 @@ fn mount_profile(profile: &str, provide_task: bool) -> Context {
     let entries = compose_profile(&layers, &[], &[], &replay_overlay(REPLY)).unwrap();
     let ctx = Context::new();
     if provide_task {
-        ctx.provide(Arc::new(HeadlessStartup { task: TASK.into() }))
-            .unwrap();
+        ctx.provide(Arc::new(HeadlessStartup {
+            task: TASK.into(),
+            cwd: Some(dir.to_string_lossy().into_owned()),
+        }))
+        .unwrap();
     }
     let loader = Loader::new();
     register_profile_plugins(&loader);

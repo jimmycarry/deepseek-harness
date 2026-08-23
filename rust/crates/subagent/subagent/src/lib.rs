@@ -8,6 +8,7 @@ use dsh_session::{
     Session, SessionEventData, SessionHeader, SessionId, SessionStore, TurnEndReason,
     SESSION_FORMAT_VERSION,
 };
+use dsh_session_projection::{subagent_identity_unit, SessionProjectionRegistry};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -125,6 +126,11 @@ impl SubagentRuntime {
     pub fn install(ctx: &Context) -> Result<Arc<Self>> {
         let runtime = Arc::new(Self::new());
         *runtime.ctx.lock().expect("subagents ctx") = Some(ctx.clone());
+        if let Some(projections) = ctx.get::<SessionProjectionRegistry>() {
+            projections
+                .register(subagent_identity_unit())
+                .map_err(|error| dsh_cordis::CordisError::Validation(error))?;
+        }
         ctx.provide(Arc::clone(&runtime))?;
         Ok(runtime)
     }
@@ -430,22 +436,24 @@ do not retry send_message with this id"
 
     /// Direct children of `parent_id` from the durable session catalog, in
     /// creation order, each carrying its descriptor mode and label.
-    pub fn list_children(&self, parent_id: &SessionId) -> Vec<SubagentListEntry> {
-        let Ok((sessions, _agents)) = self.host() else {
-            return Vec::new();
-        };
-        children_of(&sessions, parent_id, 1)
+    ///
+    /// # Errors
+    /// `sessionProjections` is not mounted.
+    pub fn list_children(&self, parent_id: &SessionId) -> std::result::Result<Vec<SubagentListEntry>, String> {
+        let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
+        children_of(self, &sessions, parent_id, 1)
     }
 
     /// The complete tree below `parent_id` in stable pre-order, each entry
     /// annotated with its durable direct parent and depth.
-    pub fn list_descendants(&self, parent_id: &SessionId) -> Vec<SubagentListEntry> {
-        let Ok((sessions, _agents)) = self.host() else {
-            return Vec::new();
-        };
+    ///
+    /// # Errors
+    /// `sessionProjections` is not mounted.
+    pub fn list_descendants(&self, parent_id: &SessionId) -> std::result::Result<Vec<SubagentListEntry>, String> {
+        let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
         let mut entries = Vec::new();
-        collect_descendants(&sessions, parent_id, 1, &mut entries);
-        entries
+        collect_descendants(self, &sessions, parent_id, 1, &mut entries)?;
+        Ok(entries)
     }
 
     /// Live status of one durable child: `running` for an active driver,
@@ -568,12 +576,22 @@ fn fold_descriptor(session: &Session) -> Option<Descriptor> {
     })
 }
 
+const PROJECTIONS_UNAVAILABLE: &str = "listing subagents requires the sessionProjections registry (load @deepseek-ai/dsh-session-projection)";
+
 /// Direct catalog children of `parent_id`, sorted by creation time then id.
 fn children_of(
+    runtime: &SubagentRuntime,
     sessions: &SessionStore,
     parent_id: &SessionId,
     depth: u32,
-) -> Vec<SubagentListEntry> {
+) -> std::result::Result<Vec<SubagentListEntry>, String> {
+    let projections = runtime
+        .ctx
+        .lock()
+        .expect("subagents ctx")
+        .as_ref()
+        .and_then(|ctx| ctx.get::<SessionProjectionRegistry>())
+        .ok_or_else(|| PROJECTIONS_UNAVAILABLE.to_string())?;
     let mut children: Vec<Arc<Session>> = sessions
         .live()
         .into_iter()
@@ -582,33 +600,46 @@ fn children_of(
     children.sort_by(|a, b| {
         (a.header().created_at, a.id().as_str()).cmp(&(b.header().created_at, b.id().as_str()))
     });
-    children
+    Ok(children
         .into_iter()
         .filter_map(|session| {
-            let descriptor = fold_descriptor(&session)?;
+            let identity = projections.snapshot(&session).values.get("subagent").cloned()?;
+            if identity.is_null() {
+                return None;
+            }
             Some(SubagentListEntry {
                 id: session.id().clone(),
-                label: descriptor.label,
-                mode: descriptor.mode,
+                label: identity
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                mode: identity
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 parent: parent_id.clone(),
                 depth,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Append the subtree below `parent_id` in stable pre-order.
 fn collect_descendants(
+    runtime: &SubagentRuntime,
     sessions: &SessionStore,
     parent_id: &SessionId,
     depth: u32,
     entries: &mut Vec<SubagentListEntry>,
-) {
-    for child in children_of(sessions, parent_id, depth) {
+) -> std::result::Result<(), String> {
+    for child in children_of(runtime, sessions, parent_id, depth)? {
         let child_id = child.id.clone();
         entries.push(child);
-        collect_descendants(sessions, &child_id, depth + 1, entries);
+        collect_descendants(runtime, sessions, &child_id, depth + 1, entries)?;
     }
+    Ok(())
 }
 
 /// Whether `target`'s durable parent chain contains `ancestor`.

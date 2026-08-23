@@ -231,6 +231,25 @@ pub enum MessageSource {
         #[serde(rename = "callId")]
         call_id: String,
     },
+    /// Workspace-instruction context from `agent-instructions`.
+    #[serde(rename = "agent-instructions")]
+    AgentInstructions {
+        /// Context form; always `instructions`.
+        form: String,
+        /// Present and `true` on a complete baseline replacement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        baseline: Option<bool>,
+        /// Discovery identity that produced this baseline.
+        #[serde(
+            rename = "baselineIdentity",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        baseline_identity: Option<String>,
+        /// Per-file set / replace / remove records for this message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<Value>,
+    },
 }
 
 impl MessageSource {
@@ -272,6 +291,20 @@ impl MessageSource {
             sections: Vec::new(),
             compaction_id: None,
             source_command_id: None,
+        }
+    }
+
+    /// Workspace-instruction source, optionally a complete baseline.
+    pub fn agent_instructions(
+        changes: Vec<Value>,
+        baseline: bool,
+        baseline_identity: Option<String>,
+    ) -> Self {
+        Self::AgentInstructions {
+            form: "instructions".into(),
+            baseline: baseline.then_some(true),
+            baseline_identity,
+            changes,
         }
     }
 
@@ -809,6 +842,107 @@ impl Default for LlmCallConfig {
             reasoning_effort: None,
             max_tokens: None,
         }
+    }
+}
+
+/// Default transient codes a `normal` retry policy accepts.
+pub const DEFAULT_RETRYABLE_CODES: &[&str] = &[
+    "EMPTY_RESPONSE",
+    "RATE_LIMIT",
+    "SERVER",
+    "TIMEOUT",
+    "TRANSPORT",
+];
+
+/// Provider-owned request-retry policy captured on the adapter route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetryPolicy {
+    /// `normal` (bounded, code-filtered) or `always` (unbounded).
+    pub mode: String,
+    /// Maximum eligible retries after the first request (`normal` only).
+    #[serde(rename = "maxRetries", default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Stable failure codes eligible under `normal`.
+    #[serde(rename = "retryableCodes", default = "default_retryable_codes")]
+    pub retryable_codes: Vec<String>,
+    /// Initial local exponential-backoff delay in milliseconds.
+    #[serde(rename = "initialDelayMs", default = "default_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    /// Maximum locally scheduled or accepted provider delay in milliseconds.
+    #[serde(rename = "maxDelayMs", default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+    /// Symmetric random multiplier range around one.
+    #[serde(rename = "jitterRatio", default = "default_jitter_ratio")]
+    pub jitter_ratio: f64,
+}
+
+fn default_max_retries() -> u32 {
+    5
+}
+fn default_retryable_codes() -> Vec<String> {
+    DEFAULT_RETRYABLE_CODES
+        .iter()
+        .map(|code| (*code).to_string())
+        .collect()
+}
+fn default_initial_delay_ms() -> u64 {
+    500
+}
+fn default_max_delay_ms() -> u64 {
+    10_000
+}
+fn default_jitter_ratio() -> f64 {
+    0.1
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            mode: "normal".into(),
+            max_retries: default_max_retries(),
+            retryable_codes: default_retryable_codes(),
+            initial_delay_ms: default_initial_delay_ms(),
+            max_delay_ms: default_max_delay_ms(),
+            jitter_ratio: default_jitter_ratio(),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Stable policy identity written on each `llm/retry` event.
+    pub fn policy_key(&self) -> String {
+        if self.mode == "always" {
+            serde_json::to_string(&[
+                serde_json::json!(self.mode),
+                serde_json::json!(self.initial_delay_ms),
+                serde_json::json!(self.max_delay_ms),
+                serde_json::json!(self.jitter_ratio),
+            ])
+            .unwrap_or_default()
+        } else {
+            let mut codes = self.retryable_codes.clone();
+            codes.sort();
+            serde_json::to_string(&[
+                serde_json::json!(self.mode),
+                serde_json::json!(self.max_retries),
+                serde_json::json!(codes),
+                serde_json::json!(self.initial_delay_ms),
+                serde_json::json!(self.max_delay_ms),
+                serde_json::json!(self.jitter_ratio),
+            ])
+            .unwrap_or_default()
+        }
+    }
+
+    /// Local exponential delay for `retry` (1-based), with optional jitter sample.
+    pub fn local_delay(&self, retry: u32, random: f64) -> u64 {
+        let exponent = u32::min(retry.saturating_sub(1), 1024);
+        let exponential = self
+            .initial_delay_ms
+            .saturating_mul(2u64.saturating_pow(exponent))
+            .min(self.max_delay_ms);
+        let jitter = 1.0 - self.jitter_ratio + 2.0 * self.jitter_ratio * random.clamp(0.0, 1.0);
+        ((exponential as f64) * jitter).min(self.max_delay_ms as f64) as u64
     }
 }
 

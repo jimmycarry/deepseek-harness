@@ -283,6 +283,21 @@ impl ToolRuntime {
             args: args.clone(),
             agent_id: agent_id.map(str::to_string),
         };
+        if let Some(agent_id) = agent_id {
+            if ctx.has_service(dsh_session_checkpoint_policy::CheckpointPolicy::KEY) {
+                if let Err(error) =
+                    dsh_session_checkpoint_policy::flush_agent_session(ctx, agent_id).await
+                {
+                    return Ok(post_execute(
+                        ctx,
+                        name,
+                        &args,
+                        Some(agent_id),
+                        ToolOutcome::error(format!("Error: {error}")),
+                    ));
+                }
+            }
+        }
         let outcome = run_body(ctx, &tool, &call).await?;
         Ok(post_execute(ctx, name, &args, agent_id, outcome))
     }
@@ -375,6 +390,32 @@ impl ToolRuntime {
                     )));
                 }
                 Prepared::Ready { .. } => {}
+            }
+        }
+
+        if let Some(agent_id) = agent_id {
+            if ctx.has_service(dsh_session_checkpoint_policy::CheckpointPolicy::KEY) {
+                if let Err(error) =
+                    dsh_session_checkpoint_policy::flush_agent_session(ctx, agent_id).await
+                {
+                    return prepared
+                        .into_iter()
+                        .map(|item| {
+                            let (name, args) = match &item {
+                                Prepared::Ready { name, args, .. }
+                                | Prepared::Denied { name, args }
+                                | Prepared::Unknown { name, args } => (name.as_str(), args),
+                            };
+                            Ok(post_execute(
+                                ctx,
+                                name,
+                                args,
+                                Some(agent_id),
+                                ToolOutcome::error(format!("Error: {error}")),
+                            ))
+                        })
+                        .collect();
+                }
             }
         }
 

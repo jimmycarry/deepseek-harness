@@ -1,12 +1,18 @@
 [package]
-name = "dsh-session-projection"
+name = "dsh-llm-retry"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Projection registry (ctx.sessionProjections)."
+description = "Provider-routed model-request retry on agent/request-error."
 
 [dependencies]
+dsh-agent.workspace = true
 dsh-cordis.workspace = true
+dsh-llm.workspace = true
 dsh-session.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

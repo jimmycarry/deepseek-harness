@@ -29,6 +29,8 @@ pub fn patches() -> Vec<EntryPatch> {
 pub struct HeadlessStartup {
     /// Positional task text.
     pub task: String,
+    /// Session working directory. `None` uses `std::env::current_dir`.
+    pub cwd: Option<String>,
 }
 
 impl Service for HeadlessStartup {
@@ -53,7 +55,7 @@ pub fn apply_startup(ctx: &Context, config: Option<Value>) -> Result<()> {
             "headless-startup: a task is required, for example: dsh --profile headless \"run the tests\"",
         ));
     }
-    ctx.provide(Arc::new(HeadlessStartup { task }))?;
+    ctx.provide(Arc::new(HeadlessStartup { task, cwd: None }))?;
     Ok(())
 }
 
@@ -73,15 +75,19 @@ pub async fn run(ctx: &Context) -> std::result::Result<(), String> {
 
 /// Drive the positional task and return the live session after flush.
 pub async fn run_session(ctx: &Context) -> std::result::Result<Arc<Session>, String> {
-    let task = ctx
+    let startup = ctx
         .service::<HeadlessStartup>()
-        .map_err(|error| error.to_string())?
-        .task
-        .clone();
+        .map_err(|error| error.to_string())?;
+    let task = startup.task.clone();
+    let cwd = startup.cwd.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+    });
     let session = ctx
         .service::<SessionStore>()
         .map_err(|error| error.to_string())?
-        .create_fresh();
+        .create_in(cwd);
     let handle = ctx
         .service::<AgentRegistry>()
         .map_err(|error| error.to_string())?

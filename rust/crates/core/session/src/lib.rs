@@ -416,25 +416,21 @@ pub enum SessionEventData {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// Plugin-merged log-only event.
-    ///
-    /// TODO: TypeScript logs extension payloads nested under a `data` key;
-    /// this untagged variant flattens them to the top level. Aligning the
-    /// wire format moves every extension writer (goal, workflow, web-search,
-    /// subagent descriptors) in one change.
+    /// Plugin-merged log-only event. Wire form is `{type, data}` like every
+    /// other member; the untagged arm is only the deserialize fallback for
+    /// names this build does not have a typed variant for.
     #[serde(untagged)]
     Extension {
         /// Event type name.
         #[serde(rename = "type")]
         type_name: String,
-        /// Payload.
-        #[serde(flatten)]
+        /// Payload nested under `data`, matching TypeScript JSONL.
         data: Value,
     },
 }
 
 /// Envelope stored in the log. `seq` and `time` are assigned by [`Session::append`].
-/// Wire order matches TypeScript: `type`, `seq`, `time`, payload keys,
+/// Wire order matches TypeScript: `type`, `seq`, `time`, `data`,
 /// `sourceEventSeqs`, `surfaceOp`, `ignorable`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionEvent {
@@ -577,6 +573,8 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "compaction/start",
     "compaction/summary",
     "goal/change",
+    "llm/retry",
+    "llm/retry-started",
     "permission/preset",
     "plan/mode",
     "request/context",
@@ -909,6 +907,14 @@ impl SessionStore {
         self.create(session_id(Uuid::new_v4().to_string()))
     }
 
+    /// Create a session with a fresh id and an explicit working directory.
+    pub fn create_in(&self, cwd: Option<String>) -> Arc<Session> {
+        self.publish(Session::with_header(SessionHeader::new(
+            session_id(Uuid::new_v4().to_string()),
+            cwd,
+        )))
+    }
+
     /// Look up a live session.
     pub fn get(&self, id: &SessionId) -> Option<Arc<Session>> {
         self.sessions
@@ -1090,6 +1096,37 @@ mod tests {
             serde_json::to_value(&events[1]).unwrap()["data"]["source"],
             serde_json::json!({"kind":"user"})
         );
+    }
+
+    #[test]
+    fn extension_events_nest_payload_under_data() {
+        let session = Session::new(session_id("s"));
+        session
+            .append(
+                SessionEventData::Extension {
+                    type_name: "goal/change".into(),
+                    data: serde_json::json!({"kind":"goal/change","version":1}),
+                },
+                None,
+            )
+            .unwrap();
+        let wire = serde_json::to_value(&session.events()[0]).unwrap();
+        assert_eq!(wire["type"], "goal/change");
+        assert_eq!(wire["data"], serde_json::json!({"kind":"goal/change","version":1}));
+        assert!(wire.get("kind").is_none());
+        let keys: Vec<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["type", "seq", "time", "data"]);
+        let parsed: SessionEvent = serde_json::from_value(wire).unwrap();
+        let SessionEventData::Extension { type_name, data } = parsed.data else {
+            panic!("expected extension");
+        };
+        assert_eq!(type_name, "goal/change");
+        assert_eq!(data["version"], 1);
     }
 
     #[test]

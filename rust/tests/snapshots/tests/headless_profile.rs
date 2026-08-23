@@ -43,13 +43,24 @@ async fn run_profile_host(task: &str, overlay: Vec<EntryPatch>) -> (Context, Arc
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("DSH_HOME", &dir);
+    run_profile_host_in(&dir, task, overlay).await
+}
+
+async fn run_profile_host_in(
+    dir: &std::path::Path,
+    task: &str,
+    overlay: Vec<EntryPatch>,
+) -> (Context, Arc<Session>) {
+    std::env::set_var("DSH_HOME", dir);
     std::env::set_var("DSH_PERMISSION_MODE", "danger-full-access");
     let layers = shipped_bundles("headless").unwrap();
     let entries = compose_profile(&layers, &[], &[], &overlay).unwrap();
     let ctx = Context::new();
-    ctx.provide(Arc::new(HeadlessStartup { task: task.into() }))
-        .unwrap();
+    ctx.provide(Arc::new(HeadlessStartup {
+        task: task.into(),
+        cwd: Some(dir.to_string_lossy().into_owned()),
+    }))
+    .unwrap();
     let loader = Loader::new();
     register_profile_plugins(&loader);
     loader.mount(&ctx, &entries).unwrap();
@@ -235,6 +246,50 @@ async fn text_turn_profile_types_and_payloads() {
             .and_then(|event| event["data"]["chunk"]["reason"]["kind"].as_str()),
         Some("stop")
     );
+}
+
+#[tokio::test]
+async fn agent_instructions_baseline_is_model_visible() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-instr-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "Prefer cargo test over ad-hoc scripts.").unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let (_ctx, session) = run_profile_host_in(
+        &dir,
+        "reply with the word pong",
+        replay_text_overlay("pong"),
+    )
+    .await;
+    let events = events_of(&session);
+    let instruction = events
+        .iter()
+        .find(|event| {
+            event["type"] == "user/message"
+                && event["data"]["source"]["kind"] == "agent-instructions"
+        })
+        .expect("agent-instructions baseline");
+    assert_eq!(instruction["data"]["source"]["form"], "instructions");
+    assert_eq!(instruction["data"]["source"]["baseline"], true);
+    let text = instruction["data"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.starts_with("<system-reminder>\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("The following workspace instructions may be relevant to your work."),
+        "{text}"
+    );
+    assert!(text.contains("Instructions from: AGENTS.md"), "{text}");
+    assert!(text.contains("Prefer cargo test over ad-hoc scripts."), "{text}");
+    assert!(text.ends_with("</system-reminder>"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -622,10 +677,10 @@ async fn continuable_settlement_turn_profile() {
         .iter()
         .find(|event| event["type"] == "subagent/descriptor")
         .expect("child descriptor");
-    assert_eq!(descriptor["version"], 2);
-    assert_eq!(descriptor["mode"], "continuable");
-    assert_eq!(descriptor["provider"], "spawn");
-    assert_eq!(descriptor["label"], "child task");
+    assert_eq!(descriptor["data"]["version"], 2);
+    assert_eq!(descriptor["data"]["mode"], "continuable");
+    assert_eq!(descriptor["data"]["provider"], "spawn");
+    assert_eq!(descriptor["data"]["label"], "child task");
     assert_eq!(turn_numbers(&child_events), vec![1]);
     assert_eq!(child.last_assistant_text().as_deref(), Some("CHILD_RESULT"));
 }

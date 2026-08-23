@@ -48,6 +48,13 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-session-persistence-jsonl" => apply_persistence(ctx, config),
         "@deepseek-ai/dsh-session-persistence-sqlite" => apply_persistence_sqlite(ctx, config),
         "@deepseek-ai/dsh-attachment-local" => apply_attachment(ctx, config),
+        "@deepseek-ai/dsh-session-projection" => {
+            dsh_session_projection::SessionProjectionRegistry::install(ctx)?;
+            Ok(())
+        }
+        "@deepseek-ai/dsh-session-checkpoint-policy" => dsh_session_checkpoint_policy::install(ctx),
+        "@deepseek-ai/dsh-llm-retry" => dsh_llm_retry::install(ctx, config.as_ref()),
+        "@deepseek-ai/dsh-agent-instructions" => apply_agent_instructions(ctx, config),
         "@deepseek-ai/dsh-session-query-sqlite" => apply_session_query(ctx, config),
         "@deepseek-ai/dsh-spill-local" => apply_spill_local(ctx, config),
         "@deepseek-ai/dsh-spill-policy" => apply_spill_policy(ctx, config),
@@ -667,6 +674,12 @@ fn apply_plan_mode(ctx: &Context, config: Option<Value>) -> Result<()> {
     ensure_system_prompt(ctx)?;
     dsh_plan_mode::apply(ctx, config.as_ref())?;
     Ok(())
+}
+
+fn apply_agent_instructions(ctx: &Context, config: Option<Value>) -> Result<()> {
+    let resolved =
+        dsh_agent_instructions::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_agent_instructions::install(ctx, resolved)
 }
 
 fn apply_skill(ctx: &Context) -> Result<()> {

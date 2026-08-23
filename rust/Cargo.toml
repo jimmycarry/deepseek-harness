@@ -17,6 +17,7 @@ members = [
   "crates/llm/llm-replay",
   "crates/llm/llm-deepseek",
   "crates/llm/token-meter",
+  "crates/llm/llm-retry",
   "crates/subprocess/subprocess",
   "crates/subprocess/subprocess-local",
   "crates/sandbox/sandbox",
@@ -36,6 +37,7 @@ members = [
   "crates/lsp/lsp",
   "crates/lsp/lsp-stdio",
   "crates/lsp/tool-lsp",
+  "crates/context/agent-instructions",
   "crates/compaction/compaction",
   "crates/compaction/compaction-basic",
   "crates/compaction/command-compact",
@@ -69,6 +71,7 @@ members = [
   "crates/workflow/tool-workflow",
   "crates/guard/timeout-policy",
   "crates/guard/repeat-tool-reminder",
+  "crates/session/session-checkpoint-policy",
   "crates/session/session-persistence",
   "crates/session/session-persistence-jsonl",
   "crates/session/session-title",
@@ -137,6 +140,9 @@ dsh-llm = { path = "crates/llm/llm" }
 dsh-llm-replay = { path = "crates/llm/llm-replay" }
 dsh-llm-deepseek = { path = "crates/llm/llm-deepseek" }
 dsh-token-meter = { path = "crates/llm/token-meter" }
+dsh-llm-retry = { path = "crates/llm/llm-retry" }
+dsh-agent-instructions = { path = "crates/context/agent-instructions" }
+dsh-session-checkpoint-policy = { path = "crates/session/session-checkpoint-policy" }
 dsh-subprocess = { path = "crates/subprocess/subprocess" }
 dsh-subprocess-local = { path = "crates/subprocess/subprocess-local" }
 dsh-sandbox = { path = "crates/sandbox/sandbox" }

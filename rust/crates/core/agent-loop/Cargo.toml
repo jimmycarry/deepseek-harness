@@ -12,6 +12,7 @@ dsh-agent.workspace = true
 dsh-cordis.workspace = true
 dsh-llm.workspace = true
 dsh-session.workspace = true
+dsh-session-checkpoint-policy.workspace = true
 dsh-session-title.workspace = true
 dsh-system-prompt.workspace = true
 dsh-tools.workspace = true

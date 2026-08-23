@@ -245,7 +245,8 @@ candidates for `interrupt_agent` only."
         let entries = match scope {
             "descendants" => self.subagents.list_descendants(parent.id()),
             _ => self.subagents.list_children(parent.id()),
-        };
+        }
+        .map_err(|error| ToolError::Body(format!("Error: {error}")))?;
         // One-shot children cannot be continued by send_message, so the model
         // never selects them; discovery still traversed them for descendants.
         let lines: Vec<String> = entries

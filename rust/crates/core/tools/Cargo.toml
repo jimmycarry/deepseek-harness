@@ -10,6 +10,7 @@ description = "Scoped tool registry and guarded execution pipeline (ctx.tools)."
 async-trait.workspace = true
 dsh-cordis.workspace = true
 dsh-llm.workspace = true
+dsh-session-checkpoint-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -56,6 +56,7 @@ mod tests {
         let ctx = Context::new();
         ctx.provide(std::sync::Arc::new(dsh_bundle_headless::HeadlessStartup {
             task: "ping".into(),
+            cwd: None,
         }))
         .unwrap();
         loader.mount(&ctx, &entries).unwrap();
@@ -91,6 +92,8 @@ mod tests {
         assert!(ctx.has_service("attachments"));
         assert!(ctx.has_service("sessionQuery"));
         assert!(ctx.has_service("spillStore"));
+        assert!(ctx.has_service("sessionProjections"));
+        assert!(ctx.has_service("sessionCheckpointPolicy"));
     }
 
     #[test]

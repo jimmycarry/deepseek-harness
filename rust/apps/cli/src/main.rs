@@ -39,6 +39,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
     if let Some(task) = task {
         ctx.provide(Arc::new(HeadlessStartup {
             task: task.to_string(),
+            cwd: None,
         }))
         .map_err(|error| error.to_string())?;
     }
