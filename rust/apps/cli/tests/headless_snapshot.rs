@@ -41,6 +41,7 @@ const TOOL_TURN_TYPES: &[&str] = &[
     "agent/inbox/spliced",
     "step/start",
     "user/message",
+    "user/message",
     "session/title",
     "request/header",
     "request/context",
