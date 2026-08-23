@@ -1,0 +1,15 @@
+[package]
+name = "dsh-session-telemetry-otel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Default-off session telemetry backend that discloses sharing status."
+
+[dependencies]
+dsh-command-feedback.workspace = true
+dsh-cordis.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

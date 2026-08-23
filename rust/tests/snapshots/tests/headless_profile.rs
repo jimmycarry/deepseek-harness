@@ -1159,7 +1159,7 @@ async fn feedback_command_profile() {
     assert_eq!(
         outcome.text,
         format!(
-            "Feedback recorded for session {}\nAnonymous user: 01234567-89ab-4cde-8f01-23456789abcd. Session sharing is not configured.",
+            "Feedback recorded for session {}\nAnonymous user: 01234567-89ab-4cde-8f01-23456789abcd. Session sharing is disabled.",
             session.id()
         )
     );
@@ -1178,7 +1178,7 @@ async fn feedback_command_profile() {
 }
 
 #[tokio::test]
-async fn write_file_requires_prior_observation_profile() {
+async fn write_requires_prior_observation_profile() {
     let dir = std::env::current_dir()
         .unwrap()
         .join("target")
@@ -1198,8 +1198,8 @@ async fn write_file_requires_prior_observation_profile() {
     let denied = tools
         .execute_for(
             &ctx,
-            "write_file",
-            serde_json::json!({ "path": path_str, "content": "new" }),
+            "write",
+            serde_json::json!({ "file_path": path_str, "content": "new" }),
             Some(session.id().as_str()),
         )
         .await
@@ -1221,8 +1221,8 @@ async fn write_file_requires_prior_observation_profile() {
     let read = tools
         .execute_for(
             &ctx,
-            "read_file",
-            serde_json::json!({ "path": path_str }),
+            "read",
+            serde_json::json!({ "file_path": path_str }),
             Some(session.id().as_str()),
         )
         .await
@@ -1231,14 +1231,71 @@ async fn write_file_requires_prior_observation_profile() {
     let wrote = tools
         .execute_for(
             &ctx,
-            "write_file",
-            serde_json::json!({ "path": path_str, "content": "new" }),
+            "write",
+            serde_json::json!({ "file_path": path_str, "content": "new" }),
             Some(session.id().as_str()),
         )
         .await
         .unwrap();
     assert!(!wrote.outcome.is_error, "{:?}", wrote.outcome.content);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    let edited = tools
+        .execute_for(
+            &ctx,
+            "edit",
+            serde_json::json!({
+                "file_path": path_str,
+                "old_string": "new",
+                "new_string": "edited"
+            }),
+            Some(session.id().as_str()),
+        )
+        .await
+        .unwrap();
+    assert!(!edited.outcome.is_error, "{:?}", edited.outcome.content);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn headless_runner_executes_slash_feedback() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "dsh-wave-o-slash-{}-{}",
+            std::process::id(),
+            uuid_stamp()
+        ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(".anonymous-user-id"),
+        "01234567-89ab-4cde-8f01-23456789abcd\n",
+    )
+    .unwrap();
+    let (_ctx, session) = run_profile_host_in(
+        &dir,
+        "/feedback the runner intercepted this",
+        vec![],
+    )
+    .await;
+    let events = events_of(&session);
+    let types = types_of(&events);
+    assert!(
+        types.iter().any(|name| name == "command/run"),
+        "{types:?}"
+    );
+    assert!(
+        types.iter().any(|name| name == "feedback/record"),
+        "{types:?}"
+    );
+    assert!(
+        types.iter().any(|name| name == "command/done"),
+        "{types:?}"
+    );
+    assert!(!types.iter().any(|name| name == "user/message"));
+    assert!(!types.iter().any(|name| name == "assistant/message"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

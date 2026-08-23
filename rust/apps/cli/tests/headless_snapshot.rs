@@ -166,9 +166,9 @@ async fn fs_edit_turn_snapshot() {
                 text: String::new(),
                 tool: Some(ReplayToolCall {
                     id: "c1".into(),
-                    name: "write_file".into(),
+                    name: "write".into(),
                     arguments: format!(
-                        r#"{{"path":"{}","content":"from-agent"}}"#,
+                        r#"{{"file_path":"{}","content":"from-agent"}}"#,
                         path_str.replace('\\', "\\\\")
                     ),
                 }),

@@ -19,7 +19,8 @@ use dsh_subprocess::SubprocessRuntime;
 use dsh_subprocess_local::LocalSubprocess;
 use dsh_system_prompt::SystemPrompt;
 use dsh_tool_bash::BashTool;
-use dsh_tool_fs::{ReadFileTool, WriteFileTool};
+use dsh_settings_file::SettingsRuntime;
+use dsh_tool_fs::{EditTool, ReadTool, WriteTool};
 use dsh_tools::ToolRuntime;
 use futures::stream::BoxStream;
 use serde_json::Value;
@@ -38,7 +39,10 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
             dsh_jobs_local::install(ctx, config.as_ref())?;
             Ok(())
         }
-        "@deepseek-ai/dsh-settings-file" => provide_marker::<SettingsRuntime>(ctx),
+        "@deepseek-ai/dsh-settings-file" => dsh_settings_file::install(ctx, config.as_ref()),
+        "@deepseek-ai/dsh-session-telemetry-otel" => {
+            dsh_session_telemetry_otel::install(ctx, config.as_ref())
+        }
         "@deepseek-ai/dsh-credentials-local" => {
             dsh_credentials_local::install(ctx)?;
             Ok(())
@@ -82,10 +86,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         }
         "@deepseek-ai/dsh-commands" => ctx.provide(Arc::new(CommandRegistry::new())),
         "@deepseek-ai/dsh-command-feedback" => dsh_command_feedback::install(ctx),
-        "@deepseek-ai/dsh-fs-sandbox" => {
-            dsh_fs_local::install(ctx)?;
-            Ok(())
-        }
+        "@deepseek-ai/dsh-fs-sandbox" => apply_fs_sandbox(ctx),
         "@deepseek-ai/dsh-llm-deepseek" => apply_llm_deepseek(ctx),
         "@deepseek-ai/dsh-llm-replay" => apply_llm_replay(ctx, config),
         "@deepseek-ai/dsh-goal" => apply_goal(ctx, config),
@@ -139,11 +140,6 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
 struct Timer;
 impl Service for Timer {
     const KEY: &'static str = "timer";
-}
-
-struct SettingsRuntime;
-impl Service for SettingsRuntime {
-    const KEY: &'static str = "settings";
 }
 
 struct CodeRuntime;
@@ -203,11 +199,6 @@ fn provide_marker<S: Service + Default + 'static>(ctx: &Context) -> Result<()> {
 }
 
 impl Default for Timer {
-    fn default() -> Self {
-        Self
-    }
-}
-impl Default for SettingsRuntime {
     fn default() -> Self {
         Self
     }
@@ -515,9 +506,31 @@ fn apply_tool_fs(ctx: &Context) -> Result<()> {
     }
     let tools = ensure_tools(ctx)?;
     let fs = ctx.service::<FsRuntime>()?;
-    tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs), ctx.clone())));
-    tools.insert(Arc::new(WriteFileTool::new(fs, ctx.clone())));
+    tools.insert(Arc::new(ReadTool::new(Arc::clone(&fs), ctx.clone())));
+    tools.insert(Arc::new(WriteTool::new(Arc::clone(&fs), ctx.clone())));
+    tools.insert(Arc::new(EditTool::new(fs, ctx.clone())));
     Ok(())
+}
+
+fn apply_fs_sandbox(ctx: &Context) -> Result<()> {
+    let (mode, workspace_root) = ctx
+        .get::<SandboxPolicyService>()
+        .map(|policy| (policy.mode.clone(), policy.workspace_root.clone()))
+        .unwrap_or_else(|| {
+            (
+                "workspace-write".into(),
+                std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| ".".into()),
+            )
+        });
+    dsh_fs_sandbox::install(
+        ctx,
+        dsh_fs_sandbox::Config {
+            mode,
+            workspace_root,
+        },
+    )
 }
 
 fn apply_tool_fs_search(ctx: &Context, config: Option<Value>) -> Result<()> {
@@ -806,10 +819,35 @@ fn apply_tool_web(ctx: &Context, config: Option<Value>) -> Result<()> {
 }
 
 fn apply_llm_deepseek(ctx: &Context) -> Result<()> {
-    match dsh_llm_deepseek::DeepSeekAdapter::from_env() {
-        Ok(adapter) => ctx.provide(Arc::new(LlmRuntime::new(Arc::new(adapter)))),
-        Err(_) => Ok(()),
-    }
+    let section = ctx
+        .get::<SettingsRuntime>()
+        .and_then(|settings| settings.section("llm-deepseek").cloned());
+    let api_key_env = section
+        .as_ref()
+        .and_then(|value| value.get("apiKeyEnv"))
+        .and_then(Value::as_str)
+        .unwrap_or("DEEPSEEK_API_KEY");
+    let api_key = std::env::var(api_key_env).unwrap_or_default();
+    let base_url = section
+        .as_ref()
+        .and_then(|value| value.get("baseURL"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| std::env::var("DEEPSEEK_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.deepseek.com".into());
+    let model = section
+        .as_ref()
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or("deepseek-chat")
+        .to_string();
+    ctx.provide(Arc::new(LlmRuntime::new(Arc::new(
+        dsh_llm_deepseek::DeepSeekAdapter {
+            api_key,
+            base_url,
+            model,
+        },
+    ))))
 }
 
 fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {

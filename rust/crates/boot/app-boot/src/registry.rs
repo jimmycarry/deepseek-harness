@@ -73,7 +73,12 @@ mod tests {
             .into_iter()
             .map(|schema| schema.name)
             .collect();
+        assert!(names.contains(&"read".into()));
+        assert!(names.contains(&"write".into()));
+        assert!(names.contains(&"edit".into()));
         assert!(names.contains(&"glob".into()));
+        assert!(ctx.has_service("settings"));
+        assert!(ctx.has_service("sessionTelemetry"));
         assert!(names.contains(&"grep".into()));
         assert!(names.contains(&"str_replace_editor".into()));
         assert!(names.contains(&"bash".into()));

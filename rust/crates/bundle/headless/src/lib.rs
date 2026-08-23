@@ -2,6 +2,7 @@
 
 use dsh_agent::AgentRegistry;
 use dsh_agent_loop::run_followup;
+use dsh_commands::CommandRegistry;
 use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_cordis_loader::{parse_patch_list, EntryPatch};
 use dsh_llm::UserMessage;
@@ -101,6 +102,30 @@ pub async fn run_session(ctx: &Context) -> std::result::Result<Arc<Session>, Str
     };
     append_session_knobs(handle.agent.session().as_ref(), &mode, &mode, policy)
         .map_err(|error| error.to_string())?;
+    if let Some(commands) = ctx.get::<CommandRegistry>() {
+        match commands
+            .execute(handle.agent.session().as_ref(), &task)
+            .await
+        {
+            Some(Ok(outcome)) => {
+                if !outcome.success {
+                    return Err(outcome.text);
+                }
+                if !outcome.text.is_empty() {
+                    println!("{}", outcome.text);
+                }
+                if let Some(persistence) = ctx.get::<PersistenceRuntime>() {
+                    persistence
+                        .save(handle.agent.session().as_ref())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                return Ok(handle.agent.session());
+            }
+            Some(Err(error)) => return Err(error),
+            None => {}
+        }
+    }
     run_followup(handle.agent.as_ref(), UserMessage::text(task))
         .await
         .map_err(|error| error.to_string())?;

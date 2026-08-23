@@ -584,7 +584,10 @@ pub fn event_type_name(data: &SessionEventData) -> &str {
 
 /// Event types this build reconstructs without an `ignorable` marker.
 pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
+    "agent-preset/selected",
     "agent/inbox/spliced",
+    "approval/asked",
+    "approval/decided",
     "approval/policy",
     "assistant/chunk",
     "assistant/message",
@@ -596,6 +599,8 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "command/run",
     "feedback/record",
     "goal/change",
+    "hook/invoked",
+    "hook/result",
     "llm/retry",
     "llm/retry-started",
     "permission/preset",
@@ -603,17 +608,25 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "request/context",
     "request/header",
     "sandbox/mode",
+    "schedule/change",
+    "session/end-seed",
     "session/title",
     "session/title-llm-request",
     "step/end",
     "step/start",
     "subagent/descriptor",
+    "team/member",
+    "team/message/delivered",
+    "team/message/queued",
+    "team/task",
     "tool-workflow/agent-end",
     "tool-workflow/agent-start",
     "tool-workflow/run-end",
     "tool-workflow/run-start",
     "todo/write",
     "tool/call",
+    "tool/code-dispatch",
+    "tool/code-dispatch-start",
     "tool/result",
     "turn/end",
     "turn/start",
@@ -1182,6 +1195,30 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, SessionError::UnexpectedSourceSeqs));
+    }
+
+    #[test]
+    fn known_types_cover_typescript_vocabulary() {
+        for name in [
+            "agent-preset/selected",
+            "approval/asked",
+            "approval/decided",
+            "hook/invoked",
+            "hook/result",
+            "schedule/change",
+            "session/end-seed",
+            "team/member",
+            "team/message/delivered",
+            "team/message/queued",
+            "team/task",
+            "tool/code-dispatch",
+            "tool/code-dispatch-start",
+        ] {
+            assert!(
+                is_known_session_event_type(name),
+                "{name} must be readable without ignorable"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,18 @@
+[package]
+name = "dsh-fs-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sandbox-enforcing filesystem provider over the local backend."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-fs.workspace = true
+dsh-fs-local.workspace = true
+dsh-sandbox-local.workspace = true
+
+[dev-dependencies]
+dsh-sandbox.workspace = true
+tokio.workspace = true

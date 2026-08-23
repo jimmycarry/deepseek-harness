@@ -15,7 +15,7 @@ use dsh_subprocess::SubprocessRuntime;
 use dsh_subprocess_local::LocalSubprocess;
 use dsh_system_prompt::SystemPrompt;
 use dsh_tool_bash::BashTool;
-use dsh_tool_fs::{ReadFileTool, WriteFileTool};
+use dsh_tool_fs::{EditTool, ReadTool, WriteTool};
 use dsh_tools::ToolRuntime;
 use std::sync::Arc;
 
@@ -60,8 +60,9 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
         let jobs = ctx.get::<JobRegistry>();
         tools.insert(Arc::new(BashTool::with_jobs(shell, jobs, true)));
         if let Some(fs) = ctx.get::<FsRuntime>() {
-            tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs), ctx.clone())));
-            tools.insert(Arc::new(WriteFileTool::new(fs, ctx.clone())));
+            tools.insert(Arc::new(ReadTool::new(Arc::clone(&fs), ctx.clone())));
+            tools.insert(Arc::new(WriteTool::new(Arc::clone(&fs), ctx.clone())));
+            tools.insert(Arc::new(EditTool::new(fs, ctx.clone())));
         }
         dsh_tool_fs_search::install(ctx, dsh_tool_fs_search::Config::with_sample_over_cap(false))?;
         dsh_tool_str_replace_editor::install(
@@ -186,8 +187,9 @@ mod tests {
             .map(|schema| schema.name)
             .collect();
         assert!(names.contains(&"bash".into()));
-        assert!(names.contains(&"read_file".into()));
-        assert!(names.contains(&"write_file".into()));
+        assert!(names.contains(&"read".into()));
+        assert!(names.contains(&"write".into()));
+        assert!(names.contains(&"edit".into()));
         assert!(names.contains(&"glob".into()));
         assert!(names.contains(&"grep".into()));
         assert!(names.contains(&"str_replace_editor".into()));
