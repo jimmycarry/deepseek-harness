@@ -1,5 +1,9 @@
 //! Compaction engine seam (`ctx.compaction`).
 
+mod tool_pairing;
+
+pub use tool_pairing::{tool_pairing_balanced_after, tool_pairing_balanced_before};
+
 use async_trait::async_trait;
 use dsh_agent::Agent;
 use dsh_cordis::Service;
@@ -40,6 +44,18 @@ pub enum ManualCompactionError {
     /// The summarizer produced no useful checkpoint.
     #[error("summary")]
     Summary,
+    /// Automatic pressure exhausted its retry budget above the threshold.
+    #[error(
+        "compaction still above threshold after {attempts} compaction attempts ({tokens} estimated tokens >= threshold {threshold})"
+    )]
+    StillAbove {
+        /// Number of compaction attempts that already landed.
+        attempts: u32,
+        /// Estimated tokens after the last attempt.
+        tokens: u64,
+        /// Routed threshold that was still unmet.
+        threshold: u64,
+    },
 }
 
 /// `ctx.compaction`.
@@ -86,6 +102,8 @@ impl Service for CompactionRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dsh_llm::{call_id, AssistantMessage, ContentBlock, ToolResultMessage, UserMessage};
+    use dsh_session::{session_id, Session, SessionEventData, SurfaceOp};
 
     #[test]
     fn trigger_names_stay_stable() {
@@ -93,5 +111,73 @@ mod tests {
             CompactionTrigger::Pressure,
             CompactionTrigger::ContextOverflow
         );
+    }
+
+    fn append_user(session: &Session, text: &str) {
+        session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text(text)),
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+    }
+
+    fn append_closed_tool_step(session: &Session, call: &str) {
+        session
+            .append(
+                SessionEventData::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    message: AssistantMessage::model(
+                        vec![ContentBlock::ToolCall {
+                            id: call_id(call),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        }],
+                        "mock",
+                        "mock",
+                    ),
+                    usage: None,
+                },
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+        session
+            .append(
+                SessionEventData::ToolResult {
+                    turn: 1,
+                    step: 1,
+                    message: ToolResultMessage::new(
+                        call_id(call),
+                        vec![ContentBlock::text("done")],
+                        false,
+                    ),
+                },
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn closed_tool_step_is_balanced_only_outside_the_pair() {
+        let session = Session::new(session_id("closed-tool-step"));
+        append_user(&session, "go");
+        append_closed_tool_step(&session, "c1");
+        let nodes = session.surface().nodes;
+        assert_eq!(nodes.len(), 3);
+        assert!(tool_pairing_balanced_before(&session, nodes[0]).unwrap());
+        assert!(tool_pairing_balanced_after(&session, nodes[0]).unwrap());
+        assert!(tool_pairing_balanced_before(&session, nodes[1]).unwrap());
+        assert!(!tool_pairing_balanced_after(&session, nodes[1]).unwrap());
+        assert!(!tool_pairing_balanced_before(&session, nodes[2]).unwrap());
+        assert!(tool_pairing_balanced_after(&session, nodes[2]).unwrap());
+    }
+
+    #[test]
+    fn missing_surface_seq_fails_loud() {
+        let session = Session::new(session_id("missing"));
+        append_user(&session, "go");
+        let err = tool_pairing_balanced_before(&session, 999).unwrap_err();
+        assert!(err.contains("surface seq 999 not found"), "{err}");
     }
 }

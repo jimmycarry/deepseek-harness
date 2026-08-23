@@ -96,6 +96,7 @@ impl CompactHandler {
                 "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."
                     .into(),
             ),
+            Err(error @ ManualCompactionError::StillAbove { .. }) => Err(error.to_string()),
         }
     }
 }

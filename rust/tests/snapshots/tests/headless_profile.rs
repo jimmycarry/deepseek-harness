@@ -6,7 +6,10 @@ use dsh_app_boot::{compose_profile, register_profile_plugins, shipped_bundles};
 use dsh_bundle_headless::HeadlessStartup;
 use dsh_cordis::Context;
 use dsh_cordis_loader::{Entry, EntryPatch, Loader};
-use dsh_llm::{ContentBlock, FinishReason, StreamChunk, UserMessage};
+use dsh_llm::{
+    call_id, AssistantMessage, ContentBlock, FinishReason, StreamChunk, ToolResultMessage,
+    UserMessage,
+};
 use dsh_session::{event_type_name, session_id, Session, SessionEventData, SessionStore, SurfaceOp};
 use dsh_settings_file::SettingsRuntime;
 use dsh_subagent::SubagentRuntime;
@@ -1617,6 +1620,111 @@ async fn compact_command_profile() {
         checkpoint.contains("keep the four notes"),
         "{checkpoint}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn compact_preserves_tool_pairing_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-q-compact-pair-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let overlay = replay_overlay(serde_json::json!({
+        "text": "pong",
+        "auxiliary": {
+            "compaction": "keep the closed tool step"
+        }
+    }));
+    let ctx = mount_profile_in(&dir, "unused", overlay);
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let _handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(Arc::clone(&session))
+        .unwrap();
+    session
+        .append(
+            SessionEventData::RequestContext {
+                provider: "replay".into(),
+                model: "script".into(),
+                context_window: None,
+            },
+            None,
+        )
+        .unwrap();
+    for label in ["alpha", "bravo"] {
+        session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text(format!(
+                    "{label} {}",
+                    "context ".repeat(40)
+                ))),
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+    }
+    session
+        .append(
+            SessionEventData::AssistantMessage {
+                turn: 1,
+                step: 1,
+                message: AssistantMessage::model(
+                    vec![ContentBlock::ToolCall {
+                        id: call_id("c1"),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    }],
+                    "replay",
+                    "script",
+                ),
+                usage: None,
+            },
+            Some(SurfaceOp::append()),
+        )
+        .unwrap();
+    session
+        .append(
+            SessionEventData::ToolResult {
+                turn: 1,
+                step: 1,
+                message: ToolResultMessage::new(
+                    call_id("c1"),
+                    vec![ContentBlock::text("done")],
+                    false,
+                ),
+            },
+            Some(SurfaceOp::append()),
+        )
+        .unwrap();
+    let outcome = ctx
+        .service::<dsh_commands::CommandRegistry>()
+        .unwrap()
+        .execute(session.as_ref(), "/compact")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(outcome.success, "{}", outcome.text);
+    let mut calls = std::collections::BTreeSet::new();
+    for message in session.derive_messages() {
+        match message {
+            dsh_llm::Message::Assistant(assistant) => {
+                for block in assistant.content {
+                    if let ContentBlock::ToolCall { id, .. } = block {
+                        calls.insert(id.as_str().to_string());
+                    }
+                }
+            }
+            dsh_llm::Message::Tool(tool) => {
+                let id = tool.tool_call_id().expect("call id");
+                assert!(calls.contains(id), "orphaned tool result {id}");
+            }
+            _ => {}
+        }
+    }
+    assert!(calls.contains("c1"), "{calls:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

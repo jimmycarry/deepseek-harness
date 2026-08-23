@@ -4,7 +4,8 @@
 use async_trait::async_trait;
 use dsh_agent::{Agent, AgentRegistry};
 use dsh_compaction::{
-    CompactionEngine, CompactionResult, CompactionRuntime, CompactionTrigger, ManualCompactionError,
+    tool_pairing_balanced_after, tool_pairing_balanced_before, CompactionEngine, CompactionResult,
+    CompactionRuntime, CompactionTrigger, ManualCompactionError,
 };
 use dsh_cordis::Context;
 use dsh_llm::{
@@ -635,22 +636,20 @@ impl BasicCompactionEngine {
         }) {
             return Err(ManualCompactionError::Busy);
         }
-        let surface = session.surface();
         let meter = self.meter.as_deref();
-        let total_tokens = meter
-            .map(|meter| meter.estimate_session(&session) as u64)
-            .unwrap_or(0);
-        let window = last_context_window(&session);
         let target = last_request_route(&session);
         let effective = target
             .as_ref()
             .map(|(provider, model)| self.policy.resolve_target(provider, model))
             .unwrap_or_else(|| self.policy.default_target());
         if !force {
-            let Some(window) = window else {
+            let Some(window) = last_context_window(&session) else {
                 return Ok(None);
             };
             let threshold = ((window as f64) * effective.threshold_ratio).floor() as u64;
+            let total_tokens = meter
+                .map(|meter| meter.estimate_session(&session) as u64)
+                .unwrap_or(0);
             if total_tokens < threshold {
                 return Ok(None);
             }
@@ -658,16 +657,18 @@ impl BasicCompactionEngine {
         let retain_tokens = if force {
             0
         } else {
-            effective.retain_tokens_for(window)
+            effective.retain_tokens_for(last_context_window(&session))
         };
-        let retain_tail = retain_tail_nodes(&session, meter, retain_tokens);
-        if surface.nodes.len() <= retain_tail + 1 {
+        let Some((start, end, shadowed)) =
+            select_compactable_span(&session, meter, retain_tokens)
+        else {
+            return Ok(None);
+        };
+        if !tool_pairing_balanced_before(&session, start).unwrap_or(false)
+            || !tool_pairing_balanced_after(&session, end).unwrap_or(false)
+        {
             return Ok(None);
         }
-        let end_idx = surface.nodes.len() - 1 - retain_tail;
-        let start = surface.nodes[0];
-        let end = surface.nodes[end_idx];
-        let shadowed = surface.nodes[..=end_idx].to_vec();
         let compaction_id = uuid::Uuid::new_v4().to_string();
         let source_command_id = source_command_id.map(str::to_string);
         let start_event = session
@@ -816,28 +817,42 @@ fn last_context_window(session: &Session) -> Option<u32> {
     })
 }
 
-fn retain_tail_nodes(session: &Session, meter: Option<&TokenMeter>, retain_tokens: u64) -> usize {
+fn select_compactable_span(
+    session: &Session,
+    meter: Option<&TokenMeter>,
+    retain_tokens: u64,
+) -> Option<(u64, u64, Vec<u64>)> {
     let nodes = session.surface().nodes;
     if nodes.is_empty() {
-        return 0;
+        return None;
     }
-    if retain_tokens == 0 {
-        return 1;
-    }
-    let Some(meter) = meter else {
-        return 1;
-    };
-    let mut kept = 0u64;
-    let mut count = 0usize;
-    for seq in nodes.iter().rev() {
-        let cost = node_tokens(session, meter, *seq);
-        if count > 0 && kept + cost > retain_tokens {
+    let mut accumulated = 0u64;
+    let mut keep_from = nodes.len();
+    for index in (0..nodes.len()).rev() {
+        accumulated += meter
+            .map(|meter| node_tokens(session, meter, nodes[index]))
+            .unwrap_or(0);
+        keep_from = index;
+        if accumulated >= retain_tokens {
             break;
         }
-        kept += cost;
-        count += 1;
     }
-    count.max(1)
+    if keep_from == 0 {
+        return None;
+    }
+    while keep_from > 0 {
+        match tool_pairing_balanced_before(session, nodes[keep_from]) {
+            Ok(true) => break,
+            Ok(false) => keep_from -= 1,
+            Err(_) => return None,
+        }
+    }
+    if keep_from == 0 {
+        return None;
+    }
+    let start = nodes[0];
+    let end = nodes[keep_from - 1];
+    Some((start, end, nodes[..=keep_from - 1].to_vec()))
 }
 
 fn node_tokens(session: &Session, meter: &TokenMeter, seq: u64) -> u64 {
@@ -1021,8 +1036,49 @@ impl CompactionEngine for BasicCompactionEngine {
         agent: &dyn Agent,
         trigger: CompactionTrigger,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
-        self.compact_session(agent, trigger == CompactionTrigger::ContextOverflow, None)
-            .await
+        if trigger == CompactionTrigger::ContextOverflow {
+            return self.compact_session(agent, true, None).await;
+        }
+        let session = agent.session();
+        let Some(window) = last_context_window(&session) else {
+            return Ok(None);
+        };
+        let target = last_request_route(&session);
+        let effective = target
+            .as_ref()
+            .map(|(provider, model)| self.policy.resolve_target(provider, model))
+            .unwrap_or_else(|| self.policy.default_target());
+        let threshold = ((window as f64) * effective.threshold_ratio).floor() as u64;
+        let mut total_tokens = self
+            .meter
+            .as_ref()
+            .map(|meter| meter.estimate_session(&session) as u64)
+            .unwrap_or(0);
+        if total_tokens < threshold {
+            return Ok(None);
+        }
+        let mut last = None;
+        for _attempt in 0..=effective.compaction_retries {
+            match self.compact_session(agent, false, None).await? {
+                None => return Ok(last),
+                Some(result) => {
+                    last = Some(result);
+                    total_tokens = self
+                        .meter
+                        .as_ref()
+                        .map(|meter| meter.estimate_session(&session) as u64)
+                        .unwrap_or(0);
+                    if total_tokens < threshold {
+                        return Ok(last);
+                    }
+                }
+            }
+        }
+        Err(ManualCompactionError::StillAbove {
+            attempts: effective.compaction_retries + 1,
+            tokens: total_tokens,
+            threshold,
+        })
     }
 
     async fn compact_now(
@@ -1038,7 +1094,9 @@ impl CompactionEngine for BasicCompactionEngine {
 mod tests {
     use super::*;
     use dsh_agent::{Agent, AgentCancelCause, AgentError, AgentStatus, Inbox, InboxTarget};
-    use dsh_llm::{LlmAdapter, LlmError, LlmFailure};
+    use dsh_llm::{
+        call_id, AssistantMessage, LlmAdapter, LlmError, LlmFailure, ToolResultMessage,
+    };
     use dsh_session::{session_id, Session, SessionStore};
     use futures::stream;
     use std::sync::{Arc, Mutex};
@@ -1549,5 +1607,130 @@ mod tests {
         assert_eq!(request.config.provider, "policy-summary");
         assert_eq!(request.config.model, "policy-summary");
         assert_eq!(request.config.max_tokens, Some(222));
+    }
+
+    fn append_closed_tool_step(session: &Session, call: &str) {
+        session
+            .append(
+                SessionEventData::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    message: AssistantMessage::model(
+                        vec![ContentBlock::ToolCall {
+                            id: call_id(call),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        }],
+                        "mock",
+                        "mock",
+                    ),
+                    usage: None,
+                },
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+        session
+            .append(
+                SessionEventData::ToolResult {
+                    turn: 1,
+                    step: 1,
+                    message: ToolResultMessage::new(
+                        call_id(call),
+                        vec![ContentBlock::text("done")],
+                        false,
+                    ),
+                },
+                Some(SurfaceOp::append()),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retain_cut_snaps_headward_to_keep_tool_pairs() {
+        let session = Arc::new(Session::new(session_id("pair")));
+        append_user(&session, &bulky("alpha"));
+        append_user(&session, &bulky("bravo"));
+        append_closed_tool_step(&session, "c1");
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let (engine, _) = scripted_engine("ok");
+        let result = engine.compact_now(&agent, None).await.unwrap().unwrap();
+        let messages = session.derive_messages();
+        let mut calls = std::collections::BTreeSet::new();
+        for message in &messages {
+            match message {
+                Message::Assistant(assistant) => {
+                    for block in &assistant.content {
+                        if let ContentBlock::ToolCall { id, .. } = block {
+                            calls.insert(id.as_str().to_string());
+                        }
+                    }
+                }
+                Message::Tool(tool) => {
+                    let id = tool.tool_call_id().expect("call id");
+                    assert!(calls.contains(id), "orphaned tool result {id}");
+                }
+                _ => {}
+            }
+        }
+        assert!(calls.contains("c1"));
+        assert!(!result.shadowed_seqs.is_empty());
+        let call_seq = session
+            .events()
+            .into_iter()
+            .find_map(|event| match event.data {
+                SessionEventData::AssistantMessage { .. } => Some(event.seq),
+                _ => None,
+            })
+            .expect("assistant");
+        assert!(
+            !result.shadowed_seqs.contains(&call_seq),
+            "tool-call must stay in the retained tail {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pressure_fails_when_retries_leave_session_above_threshold() {
+        let session = Arc::new(Session::new(session_id("still-above")));
+        session
+            .append(
+                SessionEventData::RequestContext {
+                    provider: "replay".into(),
+                    model: "script".into(),
+                    context_window: Some(100),
+                },
+                None,
+            )
+            .unwrap();
+        for label in ["alpha", "bravo", "charlie", "delta"] {
+            append_user(&session, &bulky(label));
+        }
+        let agent = StubAgent {
+            session: Arc::clone(&session),
+            inbox: Arc::new(Inbox::default()),
+        };
+        let (mut engine, _) = scripted_engine("ok");
+        engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
+            "thresholdRatio": 0.3,
+            "retainRatio": 0.05,
+            "compactionRetries": 0,
+            "summarizationProvider": "replay",
+            "summarizationModel": "script"
+        })))
+        .unwrap();
+        let err = engine
+            .compact_if_needed(&agent, CompactionTrigger::Pressure)
+            .await
+            .unwrap_err();
+        match err {
+            ManualCompactionError::StillAbove { attempts, .. } => assert_eq!(attempts, 1),
+            other => panic!("expected StillAbove, got {other:?}"),
+        }
+        assert!(session
+            .events()
+            .iter()
+            .any(|event| matches!(event.data, SessionEventData::CompactionSummary { .. })));
     }
 }

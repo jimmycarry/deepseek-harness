@@ -11,4 +11,5 @@ async-trait.workspace = true
 dsh-agent.workspace = true
 dsh-cordis.workspace = true
 dsh-llm.workspace = true
+dsh-session.workspace = true
 thiserror.workspace = true
