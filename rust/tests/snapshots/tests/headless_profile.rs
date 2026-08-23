@@ -1179,11 +1179,14 @@ async fn feedback_command_profile() {
 
 #[tokio::test]
 async fn write_file_requires_prior_observation_profile() {
-    let dir = std::env::temp_dir().join(format!(
-        "dsh-wave-n-fs-{}-{}",
-        std::process::id(),
-        uuid_stamp()
-    ));
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "dsh-wave-n-fs-{}-{}",
+            std::process::id(),
+            uuid_stamp()
+        ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("note.txt");
