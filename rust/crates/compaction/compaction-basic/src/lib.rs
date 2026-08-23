@@ -1425,7 +1425,7 @@ mod tests {
                 SessionEventData::RequestContext {
                     provider: "deepseek-official".into(),
                     model: "deepseek-v4-flash".into(),
-                    context_window: Some(20),
+                    context_window: Some(500),
                 },
                 None,
             )
@@ -1445,7 +1445,6 @@ mod tests {
             "summarizationModel": "script"
         })))
         .unwrap();
-        engine.meter = Some(Arc::new(TokenMeter::new(1)));
         let result = engine
             .compact_if_needed(&agent, CompactionTrigger::Pressure)
             .await
@@ -1557,7 +1556,7 @@ mod tests {
                 SessionEventData::RequestContext {
                     provider: "deepseek-official".into(),
                     model: "deepseek-v4-flash".into(),
-                    context_window: Some(1000),
+                    context_window: Some(2000),
                 },
                 None,
             )
@@ -1579,7 +1578,7 @@ mod tests {
             "modelPolicies": [{
                 "provider": "deepseek-official",
                 "model": "deepseek-v4-flash",
-                "thresholdRatio": 0.2,
+                "thresholdRatio": 0.15,
                 "retainRatio": 0.05,
                 "summarizationProvider": "policy-summary",
                 "summarizationModel": "policy-summary",
@@ -1587,7 +1586,7 @@ mod tests {
             }]
         })))
         .unwrap();
-        let default_threshold = ((1000.0_f64) * 0.95).floor() as u64;
+        let default_threshold = ((2000.0_f64) * 0.95).floor() as u64;
         let total = engine
             .meter
             .as_ref()
