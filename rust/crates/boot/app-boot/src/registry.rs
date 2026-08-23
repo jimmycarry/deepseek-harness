@@ -89,6 +89,7 @@ mod tests {
         assert!(names.contains(&"subagent".into()));
         assert!(names.contains(&"subagent_fork".into()));
         assert!(names.contains(&"workflow".into()));
+        assert!(names.contains(&"ralph".into()));
         assert!(ctx.has_service("goals"));
         assert!(ctx.has_service("subagents"));
         assert!(ctx.has_service("web"));

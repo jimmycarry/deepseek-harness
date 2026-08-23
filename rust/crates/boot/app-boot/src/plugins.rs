@@ -104,6 +104,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-tool-subagent-report" => apply_tool_subagent_report(ctx, config),
         "@deepseek-ai/dsh-workflow-worker-thread" => apply_workflow(ctx, config),
         "@deepseek-ai/dsh-tool-workflow" => apply_tool_workflow(ctx, config),
+        "@deepseek-ai/dsh-tool-ralph" => apply_tool_ralph(ctx, config),
         "@deepseek-ai/dsh-repeat-tool-reminder" => apply_repeat_tool_reminder(ctx, config),
         "@deepseek-ai/dsh-tool-todo" => apply_tool_todo(ctx, config),
         "@deepseek-ai/dsh-tool-call-timeout-policy" => dsh_timeout_policy::install(ctx),
@@ -656,6 +657,15 @@ fn apply_tool_workflow(ctx: &Context, config: Option<Value>) -> Result<()> {
     let resolved =
         dsh_tool_workflow::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     dsh_tool_workflow::install(ctx, resolved)
+}
+
+fn apply_tool_ralph(ctx: &Context, config: Option<Value>) -> Result<()> {
+    ensure_subagents(ctx)?;
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    let resolved =
+        dsh_tool_ralph::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_ralph::install(ctx, resolved)
 }
 
 fn apply_repeat_tool_reminder(ctx: &Context, config: Option<Value>) -> Result<()> {

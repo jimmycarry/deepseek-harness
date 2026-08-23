@@ -41,6 +41,7 @@ dsh-tool-goal.workspace = true
 dsh-tool-str-replace-editor.workspace = true
 dsh-tool-subagent.workspace = true
 dsh-tool-web.workspace = true
+dsh-tool-ralph.workspace = true
 dsh-tool-workflow.workspace = true
 dsh-tools.workspace = true
 dsh-web.workspace = true

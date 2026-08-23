@@ -121,6 +121,10 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
             ctx,
             dsh_tool_workflow::Config::resolve(None).expect("workflow defaults"),
         )?;
+        dsh_tool_ralph::install(
+            ctx,
+            dsh_tool_ralph::Config::resolve(None).expect("ralph defaults"),
+        )?;
         dsh_repeat_tool_reminder::install(
             ctx,
             dsh_repeat_tool_reminder::Config::resolve(None).expect("reminder defaults"),
@@ -191,6 +195,7 @@ mod tests {
         assert!(names.contains(&"web_search".into()));
         assert!(names.contains(&"subagent".into()));
         assert!(names.contains(&"workflow".into()));
+        assert!(names.contains(&"ralph".into()));
         assert!(names.contains(&"job_output".into()));
         assert!(names.contains(&"job_list".into()));
         assert!(names.contains(&"job_kill".into()));

@@ -575,6 +575,36 @@ async fn subagent_turn_profile() {
 }
 
 #[tokio::test]
+async fn ralph_turn_profile() {
+    let complete = "{\"status\":\"complete\",\"summary\":\"The objective is complete.\",\"evidence\":[\"All required gates pass.\"],\"nextSteps\":[],\"blocker\":\"\"}";
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "ralph",
+                "arguments": "{\"objective\":\"Finish the migration.\",\"maxRounds\":1}"
+            }
+        },
+        { "text": complete },
+        { "text": "parent-done" }
+    ]);
+    let events = run_profile("run ralph", replay_turns_overlay(turns)).await;
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("Ralph worker reported completion after 1 round."),
+        "{text}"
+    );
+    assert!(text.contains("All required gates pass."), "{text}");
+}
+
+#[tokio::test]
 async fn background_bash_job_turn_profile() {
     let turns = serde_json::json!([
         {

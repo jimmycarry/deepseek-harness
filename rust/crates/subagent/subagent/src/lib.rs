@@ -60,6 +60,13 @@ pub trait SubagentProvider: Send + Sync {
     fn supports_continuable(&self) -> bool {
         false
     }
+    /// Whether `start` can honor a structured-output schema.
+    ///
+    /// Spawn and fork advertise this; Ralph requires it so each round can
+    /// return a validated report object instead of free text.
+    fn supports_output_schema(&self) -> bool {
+        false
+    }
     /// Run one one-shot child.
     async fn start(
         &self,

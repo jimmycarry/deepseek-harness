@@ -246,6 +246,7 @@ dependencies = [
  "dsh-tool-fs-search",
  "dsh-tool-goal",
  "dsh-tool-jobs",
+ "dsh-tool-ralph",
  "dsh-tool-str-replace-editor",
  "dsh-tool-subagent",
  "dsh-tool-web",
@@ -331,6 +332,7 @@ dependencies = [
  "dsh-tool-fs-search",
  "dsh-tool-goal",
  "dsh-tool-jobs",
+ "dsh-tool-ralph",
  "dsh-tool-result-pruner",
  "dsh-tool-skill",
  "dsh-tool-str-replace-editor",
@@ -1191,6 +1193,22 @@ dependencies = [
  "dsh-cordis",
  "dsh-lsp",
  "dsh-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-tool-ralph"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-llm",
+ "dsh-session",
+ "dsh-subagent",
+ "dsh-system-prompt",
+ "dsh-tools",
+ "serde",
  "serde_json",
  "tokio",
 ]

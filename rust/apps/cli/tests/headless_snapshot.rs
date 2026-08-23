@@ -583,6 +583,67 @@ async fn subagent_turn_snapshot() {
 }
 
 #[tokio::test]
+async fn ralph_turn_snapshot() {
+    let complete = r#"{"status":"complete","summary":"The objective is complete.","evidence":["All required gates pass."],"nextSteps":[],"blocker":""}"#;
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "ralph".into(),
+                    arguments: r#"{"objective":"Finish the migration.","maxRounds":1}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: complete.into(),
+                tool: None,
+                finish: None,
+            },
+            ReplayTurn {
+                text: "parent-done".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("run ralph"))
+        .await
+        .unwrap();
+    let result = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("tool result");
+    let text = match &result.result_blocks()[0] {
+        ContentBlock::Text { text } => text,
+        _ => panic!("text"),
+    };
+    assert!(
+        text.contains("Ralph worker reported completion after 1 round."),
+        "{text}"
+    );
+    assert!(text.contains("All required gates pass."), "{text}");
+    assert!(!result.is_error());
+}
+
+#[tokio::test]
 async fn background_bash_job_snapshot() {
     let ctx = Context::new();
     apply(

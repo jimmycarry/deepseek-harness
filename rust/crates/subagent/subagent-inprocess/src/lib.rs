@@ -51,6 +51,10 @@ impl SubagentProvider for InProcessProvider {
         !self.inherits
     }
 
+    fn supports_output_schema(&self) -> bool {
+        true
+    }
+
     async fn start(
         &self,
         request: SubagentStartRequest,
@@ -168,6 +172,12 @@ mod tests {
         AgentLoop::install(&ctx).unwrap();
         SubagentRuntime::install(&ctx).unwrap();
         install(&ctx, "spawn", false).unwrap();
+        assert!(ctx
+            .service::<SubagentRuntime>()
+            .unwrap()
+            .get_provider("spawn")
+            .unwrap()
+            .supports_output_schema());
         let result = ctx
             .service::<SubagentRuntime>()
             .unwrap()
@@ -183,5 +193,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output, "child-done");
+        install(&ctx, "fork", true).unwrap();
+        assert!(ctx
+            .service::<SubagentRuntime>()
+            .unwrap()
+            .get_provider("fork")
+            .unwrap()
+            .supports_output_schema());
+        assert!(ctx
+            .service::<SubagentRuntime>()
+            .unwrap()
+            .get_provider("fork")
+            .unwrap()
+            .inherits_parent_context());
     }
 }

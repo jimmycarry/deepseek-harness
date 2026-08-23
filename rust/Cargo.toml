@@ -69,6 +69,7 @@ members = [
   "crates/workflow/workflow",
   "crates/workflow/workflow-local",
   "crates/workflow/tool-workflow",
+  "crates/workflow/tool-ralph",
   "crates/guard/timeout-policy",
   "crates/guard/repeat-tool-reminder",
   "crates/session/session-checkpoint-policy",
@@ -193,6 +194,7 @@ dsh-tool-subagent-report = { path = "crates/subagent/tool-subagent-report" }
 dsh-workflow = { path = "crates/workflow/workflow" }
 dsh-workflow-local = { path = "crates/workflow/workflow-local" }
 dsh-tool-workflow = { path = "crates/workflow/tool-workflow" }
+dsh-tool-ralph = { path = "crates/workflow/tool-ralph" }
 dsh-timeout-policy = { path = "crates/guard/timeout-policy" }
 dsh-repeat-tool-reminder = { path = "crates/guard/repeat-tool-reminder" }
 dsh-session-persistence = { path = "crates/session/session-persistence" }
