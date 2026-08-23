@@ -19,4 +19,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 dsh-agent-spine.workspace = true
+dsh-llm-replay.workspace = true
 tokio.workspace = true

@@ -481,7 +481,10 @@ async fn workflow_turn_snapshot() {
         .await
         .unwrap();
     let types = event_types(handle.agent.session().as_ref());
-    assert!(types.contains(&"tool-workflow/run-start".into()), "{types:?}");
+    assert!(
+        types.contains(&"tool-workflow/run-start".into()),
+        "{types:?}"
+    );
     assert!(types.contains(&"tool-workflow/run-end".into()), "{types:?}");
     let result = handle
         .agent
@@ -514,7 +517,9 @@ async fn subagent_turn_snapshot() {
                 tool: Some(ReplayToolCall {
                     id: "c1".into(),
                     name: "subagent".into(),
-                    arguments: r#"{"description":"child","prompt":"ping","run_in_background":false}"#.into(),
+                    arguments:
+                        r#"{"description":"child","prompt":"ping","run_in_background":false}"#
+                            .into(),
                 }),
                 finish: None,
             },
@@ -558,11 +563,90 @@ async fn subagent_turn_snapshot() {
     assert_eq!(text, "child-done");
     let store = ctx.service::<SessionStore>().unwrap();
     let child_has_descriptor = store.live().iter().any(|session| {
-        session.events().iter().any(|event| {
-            dsh_session::event_type_name(&event.data) == "subagent/descriptor"
-        })
+        session
+            .events()
+            .iter()
+            .any(|event| dsh_session::event_type_name(&event.data) == "subagent/descriptor")
     });
     assert!(child_has_descriptor, "child session missing descriptor");
+    let child = store
+        .live()
+        .into_iter()
+        .find(|session| session.header().parent_session.is_some())
+        .expect("child session");
+    assert_eq!(
+        child.header().parent_session.as_ref(),
+        Some(handle.agent.id())
+    );
+    assert_eq!(child.header().origin.as_deref(), Some("subagent"));
+}
+
+#[tokio::test]
+async fn background_bash_job_snapshot() {
+    let ctx = Context::new();
+    apply(
+        &ctx,
+        Arc::new(ReplayAdapter::new(vec![
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"echo hello","run_in_background":true}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: String::new(),
+                tool: Some(ReplayToolCall {
+                    id: "c2".into(),
+                    name: "job_output".into(),
+                    arguments: r#"{"job_id":"bash-1","wait":true}"#.into(),
+                }),
+                finish: None,
+            },
+            ReplayTurn {
+                text: "done".into(),
+                tool: None,
+                finish: None,
+            },
+        ])),
+    )
+    .unwrap();
+    apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+    let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(session)
+        .unwrap();
+    run_followup(handle.agent.as_ref(), UserMessage::text("bg echo"))
+        .await
+        .unwrap();
+    let texts: Vec<String> = handle
+        .agent
+        .session()
+        .events()
+        .into_iter()
+        .filter_map(|event| match event.data {
+            SessionEventData::ToolResult { message, .. } => match &message.result_blocks()[0] {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts[0], "started background job bash-1");
+    assert!(texts[1].contains("hello"), "{}", texts[1]);
+    assert!(
+        texts[1].contains("[status: completed, exit code: 0]"),
+        "{}",
+        texts[1]
+    );
+    assert_eq!(
+        handle.agent.session().last_assistant_text().as_deref(),
+        Some("done")
+    );
 }
 
 #[tokio::test]
@@ -616,8 +700,12 @@ async fn repeat_tool_reminder_snapshot() {
     run_followup(handle.agent.as_ref(), UserMessage::text("loop"))
         .await
         .unwrap();
-    let notice = handle.agent.session().events().iter().find_map(|event| {
-        match &event.data {
+    let notice = handle
+        .agent
+        .session()
+        .events()
+        .iter()
+        .find_map(|event| match &event.data {
             SessionEventData::UserMessage(message) => match &message.source {
                 dsh_llm::MessageSource::Plugin {
                     plugin,
@@ -630,8 +718,7 @@ async fn repeat_tool_reminder_snapshot() {
                 _ => None,
             },
             _ => None,
-        }
-    });
+        });
     let (form, summary, message) = notice.expect("repeat-tool-reminder notice");
     assert_eq!(form.as_deref(), Some("notice"));
     assert_eq!(summary.as_deref(), Some("bash × 3"));
@@ -689,10 +776,7 @@ async fn spill_policy_turn_snapshot() {
         ContentBlock::Text { text } => text,
         _ => panic!("text"),
     };
-    assert!(
-        text.contains("Full formatted result stored at:"),
-        "{text}"
-    );
+    assert!(text.contains("Full formatted result stored at:"), "{text}");
     assert!(text.contains("Omitted"), "{text}");
     assert!(text.len() <= 50_000, "{}", text.len());
     let locator = text

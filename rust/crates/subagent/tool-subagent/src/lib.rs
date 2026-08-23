@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use dsh_agent::AgentRegistry;
 use dsh_cordis::{Context, Result};
+use dsh_jobs::{JobHooks, JobOutcome, JobRegistry, JobStart, JobStatus};
 use dsh_llm::ContentBlock;
 use dsh_session::session_id;
 use dsh_subagent::{SubagentRuntime, SubagentStartRequest};
@@ -98,6 +99,7 @@ pub fn install(ctx: &Context, config: Config) -> Result<()> {
     let tools = ctx.service::<ToolRuntime>()?;
     let subagents = ctx.service::<SubagentRuntime>()?;
     let agents = ctx.get::<AgentRegistry>();
+    let jobs = ctx.get::<JobRegistry>();
     let provider = subagents.get_provider(&config.provider);
     let inherits = provider
         .as_ref()
@@ -133,6 +135,7 @@ you a notice containing its outcome and any final assistant message.",
     tools.insert(Arc::new(DelegateTool {
         subagents,
         agents,
+        jobs,
         config,
         inherits,
         description,
@@ -165,6 +168,7 @@ collect with `job_output` and stop with `job_kill`."
 struct DelegateTool {
     subagents: Arc<SubagentRuntime>,
     agents: Option<Arc<AgentRegistry>>,
+    jobs: Option<Arc<JobRegistry>>,
     config: Config,
     inherits: bool,
     description: String,
@@ -253,12 +257,29 @@ impl Tool for DelegateTool {
         };
         if background {
             if !continuable {
-                // One-shot background children need a job runtime that owns
-                // arbitrary tasks; the shipped jobs stub does not.
-                return Ok(ToolOutcome::error(
-                    "Error: background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs"
-                        .to_string(),
-                ));
+                let Some(jobs) = &self.jobs else {
+                    return Ok(ToolOutcome::error(
+                        "Error: background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs"
+                            .to_string(),
+                    ));
+                };
+                let parent_id = call.agent_id.clone().unwrap_or_else(|| "unknown".into());
+                let provider = self.config.provider.clone();
+                let label = description.to_string();
+                let prompt = prompt.to_string();
+                let subagents = Arc::clone(&self.subagents);
+                return match jobs.start(JobStart {
+                    kind: "subagent".into(),
+                    label: label.clone(),
+                    output_limit_bytes: None,
+                    owner_session: call.agent_id.clone(),
+                    run: Box::new(move || {
+                        start_one_shot_job(subagents, provider, label, prompt, parent_id)
+                    }),
+                }) {
+                    Ok(id) => Ok(ToolOutcome::text(format!("started background job {id}"))),
+                    Err(error) => Ok(ToolOutcome::error(format!("Error: {error}"))),
+                };
             }
             let parent = call
                 .agent_id
@@ -304,6 +325,65 @@ impl Tool for DelegateTool {
             Err(error) => Ok(ToolOutcome::error(format!("Error: {error}"))),
         }
     }
+}
+
+fn start_one_shot_job(
+    subagents: Arc<SubagentRuntime>,
+    provider: String,
+    label: String,
+    prompt: String,
+    parent_id: String,
+) -> std::result::Result<JobHooks, String> {
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_flag = Arc::clone(&cancel);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("dsh-subagent-job".into())
+        .spawn(move || {
+            let outcome = match futures::executor::block_on(subagents.start(
+                &provider,
+                SubagentStartRequest {
+                    label,
+                    prompt,
+                    parent_id: session_id(parent_id),
+                    seed: None,
+                },
+            )) {
+                Ok(result) => JobOutcome {
+                    status: if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        JobStatus::Killed
+                    } else {
+                        JobStatus::Completed
+                    },
+                    detail: Some(result.stop_reason),
+                    output: Some(result.output),
+                },
+                Err(error) => JobOutcome {
+                    status: JobStatus::Failed,
+                    detail: Some(error.to_string()),
+                    output: None,
+                },
+            };
+            let _ = tx.send(outcome);
+        })
+        .map_err(|error| error.to_string())?;
+    let rx = std::sync::Mutex::new(rx);
+    Ok(JobHooks {
+        cancel: Arc::new(move |_| {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+        wait_done: Arc::new(move || {
+            rx.lock()
+                .expect("subagent job")
+                .recv()
+                .unwrap_or(JobOutcome {
+                    status: JobStatus::Failed,
+                    detail: Some("background subagent waiter dropped".into()),
+                    output: None,
+                })
+        }),
+        read_output: None,
+    })
 }
 
 #[cfg(test)]

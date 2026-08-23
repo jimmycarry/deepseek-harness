@@ -6,14 +6,12 @@ use dsh_cordis::{Context, Result, Service};
 use dsh_llm::{ContentBlock, MessageSource, UserMessage};
 use dsh_session::{
     Session, SessionEventData, SessionHeader, SessionId, SessionStore, TurnEndReason,
-    SESSION_FORMAT_VERSION,
 };
 use dsh_session_projection::{subagent_identity_unit, SessionProjectionRegistry};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Registry failures.
 #[derive(Debug, Error)]
@@ -176,12 +174,40 @@ impl SubagentRuntime {
         let provider = self
             .get_provider(name)
             .ok_or_else(|| SubagentError::NoProvider(name.into()))?;
+        let parent_id = request.parent_id.clone();
         let result = provider.start(request).await?;
+        self.emit_end(name, &result, &parent_id, true);
         self.results
             .lock()
             .expect("subagents")
             .push(result.output.clone());
         Ok(result)
+    }
+
+    /// Publish `subagent/end` for an in-process child that has settled.
+    fn emit_end(
+        &self,
+        provider: &str,
+        result: &SubagentResult,
+        parent_id: &SessionId,
+        local: bool,
+    ) {
+        let Some(ctx) = self.ctx.lock().ok().and_then(|guard| guard.clone()) else {
+            return;
+        };
+        let mut payload = serde_json::json!({
+            "id": result.id.as_str(),
+            "provider": provider,
+            "local": local,
+            "stopReason": result.stop_reason,
+            "parentSessionId": parent_id.as_str(),
+        });
+        if !result.output.is_empty() {
+            payload["lastAssistantMessage"] = serde_json::json!([
+                { "type": "text", "text": result.output }
+            ]);
+        }
+        ctx.emit("subagent/end", payload);
     }
 
     /// Finished child texts in record order.
@@ -228,18 +254,19 @@ impl SubagentRuntime {
             ));
         }
         let (sessions, agents) = self.host()?;
-        let child_id = SessionId::new(Uuid::new_v4().to_string());
         let parent_header = parent.session().header().clone();
-        let child = sessions.publish(Session::with_header(SessionHeader {
-            version: SESSION_FORMAT_VERSION,
-            id: child_id.clone(),
-            created_at: dsh_session::now_ms(),
-            cwd: parent_header.cwd,
-            parent_session: Some(parent.id().clone()),
-            seed_length: None,
-            origin: Some("subagent".into()),
-            delegation_depth: parent_header.delegation_depth + 1,
-        }));
+        let header = SessionHeader::for_subagent_child(Some(&parent_header), parent.id().clone());
+        let child_id = header.id.clone();
+        let child = sessions.publish(Session::with_header(header));
+        if let Some(ctx) = self.ctx.lock().ok().and_then(|guard| guard.clone()) {
+            ctx.emit(
+                "session/created",
+                serde_json::json!({
+                    "id": child_id.as_str(),
+                    "parentSession": parent.id().as_str(),
+                }),
+            );
+        }
         child
             .append(
                 SessionEventData::Extension {
@@ -439,7 +466,10 @@ do not retry send_message with this id"
     ///
     /// # Errors
     /// `sessionProjections` is not mounted.
-    pub fn list_children(&self, parent_id: &SessionId) -> std::result::Result<Vec<SubagentListEntry>, String> {
+    pub fn list_children(
+        &self,
+        parent_id: &SessionId,
+    ) -> std::result::Result<Vec<SubagentListEntry>, String> {
         let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
         children_of(self, &sessions, parent_id, 1)
     }
@@ -449,7 +479,10 @@ do not retry send_message with this id"
     ///
     /// # Errors
     /// `sessionProjections` is not mounted.
-    pub fn list_descendants(&self, parent_id: &SessionId) -> std::result::Result<Vec<SubagentListEntry>, String> {
+    pub fn list_descendants(
+        &self,
+        parent_id: &SessionId,
+    ) -> std::result::Result<Vec<SubagentListEntry>, String> {
         let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
         let mut entries = Vec::new();
         collect_descendants(self, &sessions, parent_id, 1, &mut entries)?;
@@ -529,6 +562,30 @@ do not retry send_message with this id"
         let any = !settled.is_empty();
         for activation in settled {
             let notice = settlement_message(&activation);
+            let session = activation.handle.agent.session();
+            let reason = session
+                .events()
+                .into_iter()
+                .rev()
+                .find_map(|event| match event.data {
+                    SessionEventData::TurnEnd { reason, .. } => Some(reason),
+                    _ => None,
+                })
+                .unwrap_or(TurnEndReason::Completed);
+            let provider = fold_descriptor(session.as_ref())
+                .map(|descriptor| descriptor.provider)
+                .unwrap_or_else(|| "spawn".into());
+            let output = session.last_assistant_text().unwrap_or_default();
+            self.emit_end(
+                &provider,
+                &SubagentResult {
+                    output,
+                    id: activation.child_id.clone(),
+                    stop_reason: stop_reason_name(&reason).into(),
+                },
+                &activation.parent_id,
+                true,
+            );
             activation.handle.dispose();
             if let Some(parent) = agents.get(&activation.parent_id) {
                 if parent.status() == AgentStatus::Idle {
@@ -545,7 +602,9 @@ do not retry send_message with this id"
 /// Parsed `subagent/descriptor` fields continuation consults.
 struct Descriptor {
     mode: String,
+    #[allow(dead_code)]
     label: String,
+    provider: String,
 }
 
 /// Fold a child log to its first `subagent/descriptor` payload, requiring the
@@ -569,6 +628,11 @@ fn fold_descriptor(session: &Session) -> Option<Descriptor> {
                 .to_string(),
             label: data
                 .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            provider: data
+                .get("provider")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
@@ -603,7 +667,11 @@ fn children_of(
     Ok(children
         .into_iter()
         .filter_map(|session| {
-            let identity = projections.snapshot(&session).values.get("subagent").cloned()?;
+            let identity = projections
+                .snapshot(&session)
+                .values
+                .get("subagent")
+                .cloned()?;
             if identity.is_null() {
                 return None;
             }
@@ -656,6 +724,18 @@ fn is_descendant_of(sessions: &SessionStore, target: &SessionId, ancestor: &Sess
             .and_then(|session| session.header().parent_session.clone());
     }
     false
+}
+
+/// TypeScript `stopReason` string for one turn-end reason.
+fn stop_reason_name(reason: &TurnEndReason) -> &'static str {
+    match reason {
+        TurnEndReason::Completed => "completed",
+        TurnEndReason::MaxTokens => "max-tokens",
+        TurnEndReason::Blocked => "blocked",
+        TurnEndReason::Aborted { .. } => "aborted",
+        TurnEndReason::Error { .. } => "error",
+        TurnEndReason::Interrupted => "interrupted",
+    }
 }
 
 /// One line telling a parent that a background child is finished and why.

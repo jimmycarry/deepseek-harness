@@ -7,6 +7,8 @@
 //! server drives the turn to quiescence inside the request, so every
 //! notification for the turn precedes the response; the notification order
 //! itself (inbox splice, `running`, turn events, `idle`) matches TypeScript.
+//! `subagent.started` / `subagent.finished` collected during the driven turn
+//! land after `running` and before `idle`.
 
 use dsh_agent::{Agent, AgentHandle, AgentRegistry};
 use dsh_agent_loop::run_followup;
@@ -22,6 +24,7 @@ use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// One SDK-owned session: the live agent plus its registry disposer.
@@ -55,9 +58,22 @@ impl Default for State {
 
 /// SDK server over one booted harness context. Construction is stateless;
 /// `initialize` configures the route and `shutdown` disposes server-owned agents.
-#[derive(Default)]
 pub struct HarnessSdkJsonRpcServer {
     state: Mutex<State>,
+    pending: Arc<Mutex<Vec<JsonRpcNotification>>>,
+    subscribed: AtomicBool,
+    max_tokens_as_success: Arc<AtomicBool>,
+}
+
+impl Default for HarnessSdkJsonRpcServer {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            subscribed: AtomicBool::new(false),
+            max_tokens_as_success: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl Service for HarnessSdkJsonRpcServer {
@@ -72,7 +88,73 @@ impl HarnessSdkJsonRpcServer {
 
     /// Mount the server as `ctx.sdkJsonRpcServer`.
     pub fn install(ctx: &Context) -> dsh_cordis::Result<()> {
-        ctx.provide(Arc::new(Self::new()))
+        let server = Arc::new(Self::new());
+        server.subscribe(ctx);
+        ctx.provide(server)
+    }
+
+    /// Subscribe once for `subagent.started` / `subagent.finished`.
+    fn subscribe(&self, ctx: &Context) {
+        if self.subscribed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pending = Arc::clone(&self.pending);
+        let _ = ctx.on("session/created", move |payload| {
+            let Some(parent) = payload.get("parentSession").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(child) = payload.get("id").and_then(Value::as_str) else {
+                return;
+            };
+            pending
+                .lock()
+                .expect("sdk pending")
+                .push(JsonRpcNotification::new(
+                    methods::SUBAGENT_STARTED,
+                    Some(serde_json::json!({
+                        "parentSessionId": parent,
+                        "childSessionId": child,
+                    })),
+                ));
+        });
+        let pending = Arc::clone(&self.pending);
+        let max_tokens = Arc::clone(&self.max_tokens_as_success);
+        let _ = ctx.on("subagent/end", move |payload| {
+            if payload.get("local").and_then(Value::as_bool) != Some(true) {
+                return;
+            }
+            let Some(provider) = payload.get("provider").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(child) = payload.get("id").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(parent) = payload.get("parentSessionId").and_then(Value::as_str) else {
+                return;
+            };
+            let reason = payload
+                .get("stopReason")
+                .and_then(Value::as_str)
+                .unwrap_or("error");
+            let mut body = serde_json::json!({
+                "provider": provider,
+                "agentId": child,
+                "parentSessionId": parent,
+                "childSessionId": child,
+                "status": success_status(reason, max_tokens.load(Ordering::SeqCst)),
+                "stopReason": reason,
+            });
+            if let Some(message) = payload.get("lastAssistantMessage") {
+                body["lastAssistantMessage"] = message.clone();
+            }
+            pending
+                .lock()
+                .expect("sdk pending")
+                .push(JsonRpcNotification::new(
+                    methods::SUBAGENT_FINISHED,
+                    Some(body),
+                ));
+        });
     }
 
     /// Dispatch one incoming request to its typed handler, returning the
@@ -100,6 +182,7 @@ impl HarnessSdkJsonRpcServer {
 
     /// Configure the SDK route, mounting the DeepSeek fallback only when unowned.
     fn initialize(&self, ctx: &Context, id: Value, params: Option<Value>) -> JsonRpcResponse {
+        self.subscribe(ctx);
         let params: InitializeParams = match params
             .ok_or_else(|| "initialize requires params".to_string())
             .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
@@ -146,6 +229,7 @@ impl HarnessSdkJsonRpcServer {
         id: Value,
         params: Option<Value>,
     ) -> (Vec<JsonRpcNotification>, JsonRpcResponse) {
+        self.subscribe(ctx);
         let params: SessionPromptParams = match params
             .ok_or_else(|| "session/prompt requires params".to_string())
             .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
@@ -194,8 +278,21 @@ impl HarnessSdkJsonRpcServer {
                 );
             }
         }
-        let notifications =
+        let mut notifications =
             turn_notifications(&params.session_id, agent.session().as_ref(), watermark);
+        let extras: Vec<_> = self
+            .pending
+            .lock()
+            .expect("sdk pending")
+            .drain(..)
+            .collect();
+        if !extras.is_empty() {
+            let idle = notifications.pop();
+            notifications.extend(extras);
+            if let Some(idle) = idle {
+                notifications.push(idle);
+            }
+        }
         let receipt = SessionPromptResult { message_id };
         (
             notifications,
@@ -274,6 +371,17 @@ fn turn_notifications(
     }
     notifications.push(status_notification(session_id, "idle"));
     notifications
+}
+
+/// Deployment-specific status mapping for SDK turn and subagent outcomes.
+fn success_status(reason: &str, max_tokens_as_success: bool) -> &'static str {
+    if reason == "completed" {
+        "ok"
+    } else if reason == "max-tokens" && max_tokens_as_success {
+        "ok"
+    } else {
+        "error"
+    }
 }
 
 fn status_notification(session_id: &str, status: &str) -> JsonRpcNotification {
@@ -502,5 +610,88 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("positive safe integer"));
+    }
+
+    #[tokio::test]
+    async fn prompt_emits_subagent_started_and_finished() {
+        use dsh_agent_spine::{apply, apply_world};
+        use dsh_llm_replay::{ReplayAdapter, ReplayToolCall, ReplayTurn};
+
+        let ctx = Context::new();
+        apply(
+            &ctx,
+            Arc::new(ReplayAdapter::new(vec![
+                ReplayTurn {
+                    text: String::new(),
+                    tool: Some(ReplayToolCall {
+                        id: "c1".into(),
+                        name: "subagent".into(),
+                        arguments:
+                            r#"{"description":"child","prompt":"ping","run_in_background":false}"#
+                                .into(),
+                    }),
+                    finish: None,
+                },
+                ReplayTurn {
+                    text: "child-done".into(),
+                    tool: None,
+                    finish: None,
+                },
+                ReplayTurn {
+                    text: "parent-done".into(),
+                    tool: None,
+                    finish: None,
+                },
+            ])),
+        )
+        .unwrap();
+        apply_world(&ctx, std::env::temp_dir().display().to_string()).unwrap();
+        let server = HarnessSdkJsonRpcServer::new();
+        let (notifications, response) = server
+            .handle_request(
+                &ctx,
+                request(
+                    1,
+                    methods::SESSION_PROMPT,
+                    serde_json::json!({
+                        "sessionId": "44444444-4444-4444-4444-444444444444",
+                        "contentBlocks": [{ "type": "text", "text": "delegate" }],
+                    }),
+                ),
+            )
+            .await;
+        assert!(response.result.unwrap()["messageId"].is_string());
+        let methods_seen: Vec<&str> = notifications
+            .iter()
+            .map(|notification| notification.method.as_str())
+            .collect();
+        assert!(methods_seen.contains(&methods::SUBAGENT_STARTED));
+        assert!(methods_seen.contains(&methods::SUBAGENT_FINISHED));
+        assert_eq!(*methods_seen.last().unwrap(), methods::SESSION_STATUS);
+        let started = notifications
+            .iter()
+            .find(|notification| notification.method == methods::SUBAGENT_STARTED)
+            .unwrap()
+            .params
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            started["parentSessionId"],
+            "44444444-4444-4444-4444-444444444444"
+        );
+        assert!(started["childSessionId"].as_str().is_some());
+        let finished = notifications
+            .iter()
+            .find(|notification| notification.method == methods::SUBAGENT_FINISHED)
+            .unwrap()
+            .params
+            .as_ref()
+            .unwrap();
+        assert_eq!(finished["provider"], "spawn");
+        assert_eq!(finished["status"], "ok");
+        assert_eq!(finished["stopReason"], "completed");
+        assert_eq!(finished["parentSessionId"], started["parentSessionId"]);
+        assert_eq!(finished["childSessionId"], started["childSessionId"]);
+        assert_eq!(finished["lastAssistantMessage"][0]["text"], "child-done");
     }
 }

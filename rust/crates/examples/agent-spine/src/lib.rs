@@ -6,6 +6,7 @@ use dsh_bash_local::BashLocal;
 use dsh_commands::CommandRegistry;
 use dsh_cordis::{Context, Result};
 use dsh_fs::FsRuntime;
+use dsh_jobs::JobRegistry;
 use dsh_llm::{LlmAdapter, LlmRuntime};
 use dsh_llm_replay::ReplayAdapter;
 use dsh_session::SessionStore;
@@ -51,8 +52,13 @@ pub fn apply_world(ctx: &Context, workspace: impl Into<String>) -> Result<()> {
     ctx.provide(Arc::clone(&subprocess))?;
     let shell = Arc::new(ShellRuntime::new(Arc::new(BashLocal::new(subprocess))));
     ctx.provide(Arc::clone(&shell))?;
+    dsh_jobs_local::install(ctx, None)?;
+    if ctx.has_service("tools") && ctx.has_service("agents") && ctx.has_service("systemPrompt") {
+        dsh_tool_jobs::install(ctx, None)?;
+    }
     if let Some(tools) = ctx.get::<ToolRuntime>() {
-        tools.insert(Arc::new(BashTool::new(shell)));
+        let jobs = ctx.get::<JobRegistry>();
+        tools.insert(Arc::new(BashTool::with_jobs(shell, jobs, true)));
         if let Some(fs) = ctx.get::<FsRuntime>() {
             tools.insert(Arc::new(ReadFileTool::new(Arc::clone(&fs))));
             tools.insert(Arc::new(WriteFileTool::new(fs)));
@@ -185,6 +191,10 @@ mod tests {
         assert!(names.contains(&"web_search".into()));
         assert!(names.contains(&"subagent".into()));
         assert!(names.contains(&"workflow".into()));
+        assert!(names.contains(&"job_output".into()));
+        assert!(names.contains(&"job_list".into()));
+        assert!(names.contains(&"job_kill".into()));
+        assert!(ctx.has_service("jobs"));
         assert!(ctx.has_service("goals"));
         assert!(ctx.has_service("subagents"));
         assert!(ctx.has_service("web"));

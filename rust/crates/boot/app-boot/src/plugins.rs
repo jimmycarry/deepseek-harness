@@ -35,7 +35,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-agent" => ctx.provide(Arc::new(AgentRegistry::new())),
         "@deepseek-ai/dsh-agent-default-model" => apply_default_model(ctx, config),
         "@deepseek-ai/dsh-jobs-local" => {
-            dsh_jobs_local::install(ctx)?;
+            dsh_jobs_local::install(ctx, config.as_ref())?;
             Ok(())
         }
         "@deepseek-ai/dsh-settings-file" => provide_marker::<SettingsRuntime>(ctx),
@@ -65,7 +65,8 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-user-approval" => apply_approval(ctx, config),
         "@deepseek-ai/dsh-permission-presets" => apply_permission(ctx, config),
         "@deepseek-ai/dsh-shell-env" => apply_shell(ctx),
-        "@deepseek-ai/dsh-tool-bash" => apply_tool_bash(ctx),
+        "@deepseek-ai/dsh-tool-bash" => apply_tool_bash(ctx, config),
+        "@deepseek-ai/dsh-tool-jobs" => apply_tool_jobs(ctx, config),
         "@deepseek-ai/dsh-tool-fs" => apply_tool_fs(ctx),
         "@deepseek-ai/dsh-tool-fs-search" => apply_tool_fs_search(ctx, config),
         "@deepseek-ai/dsh-tool-str-replace-editor" => apply_tool_str_replace_editor(ctx, config),
@@ -484,12 +485,25 @@ fn ensure_tools(ctx: &Context) -> Result<Arc<ToolRuntime>> {
     Ok(tools)
 }
 
-fn apply_tool_bash(ctx: &Context) -> Result<()> {
+fn apply_tool_bash(ctx: &Context, config: Option<Value>) -> Result<()> {
     apply_shell(ctx)?;
     let tools = ensure_tools(ctx)?;
     let shell = ctx.service::<ShellRuntime>()?;
-    tools.insert(Arc::new(BashTool::new(shell)));
+    let resolved =
+        dsh_tool_bash::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    let jobs = ctx.get::<dsh_jobs::JobRegistry>();
+    tools.insert(Arc::new(BashTool::with_jobs(
+        shell,
+        jobs,
+        resolved.enable_run_in_background,
+    )));
     Ok(())
+}
+
+fn apply_tool_jobs(ctx: &Context, config: Option<Value>) -> Result<()> {
+    ensure_tools(ctx)?;
+    ensure_system_prompt(ctx)?;
+    dsh_tool_jobs::install(ctx, config.as_ref())
 }
 
 fn apply_tool_fs(ctx: &Context) -> Result<()> {
@@ -677,8 +691,8 @@ fn apply_plan_mode(ctx: &Context, config: Option<Value>) -> Result<()> {
 }
 
 fn apply_agent_instructions(ctx: &Context, config: Option<Value>) -> Result<()> {
-    let resolved =
-        dsh_agent_instructions::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
+    let resolved = dsh_agent_instructions::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
     dsh_agent_instructions::install(ctx, resolved)
 }
 

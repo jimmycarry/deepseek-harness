@@ -9,6 +9,7 @@ description = "Model-facing bash tool."
 [dependencies]
 async-trait.workspace = true
 dsh-cordis.workspace = true
+dsh-jobs.workspace = true
 dsh-shell.workspace = true
 dsh-tools.workspace = true
 serde_json.workspace = true

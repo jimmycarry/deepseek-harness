@@ -73,6 +73,26 @@ impl SessionHeader {
             delegation_depth: 0,
         }
     }
+
+    /// Header for a child session created by a subagent provider.
+    pub fn for_subagent_child(parent: Option<&SessionHeader>, parent_id: SessionId) -> Self {
+        Self {
+            version: SESSION_FORMAT_VERSION,
+            id: session_id(Uuid::new_v4().to_string()),
+            created_at: now_ms(),
+            cwd: parent.and_then(|header| header.cwd.clone()).or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().to_string())
+            }),
+            parent_session: Some(parent_id),
+            seed_length: None,
+            origin: Some("subagent".into()),
+            delegation_depth: parent
+                .map(|header| header.delegation_depth + 1)
+                .unwrap_or(1),
+        }
+    }
 }
 
 /// Current Unix epoch milliseconds; the envelope `time` and header `createdAt` source.
@@ -1112,7 +1132,10 @@ mod tests {
             .unwrap();
         let wire = serde_json::to_value(&session.events()[0]).unwrap();
         assert_eq!(wire["type"], "goal/change");
-        assert_eq!(wire["data"], serde_json::json!({"kind":"goal/change","version":1}));
+        assert_eq!(
+            wire["data"],
+            serde_json::json!({"kind":"goal/change","version":1})
+        );
         assert!(wire.get("kind").is_none());
         let keys: Vec<&str> = wire
             .as_object()

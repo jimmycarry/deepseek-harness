@@ -5,7 +5,7 @@ use dsh_agent::AgentRegistry;
 use dsh_agent_loop::run_followup;
 use dsh_cordis::{Context, Result};
 use dsh_llm::UserMessage;
-use dsh_session::{event_type_name, SessionEventData, SessionStore};
+use dsh_session::{event_type_name, SessionEventData, SessionHeader, SessionStore};
 use dsh_subagent::{
     SubagentError, SubagentProvider, SubagentResult, SubagentRuntime, SubagentStartRequest,
 };
@@ -63,7 +63,20 @@ impl SubagentProvider for InProcessProvider {
             .ctx
             .get::<AgentRegistry>()
             .ok_or_else(|| SubagentError::NoProvider("agents".into()))?;
-        let child = store.create_fresh();
+        let parent = store.get(&request.parent_id);
+        let header = SessionHeader::for_subagent_child(
+            parent.as_ref().map(|session| session.header()),
+            request.parent_id.clone(),
+        );
+        let child_id = header.id.clone();
+        let child = store.publish(dsh_session::Session::with_header(header));
+        self.ctx.emit(
+            "session/created",
+            serde_json::json!({
+                "id": child_id.as_str(),
+                "parentSession": request.parent_id.as_str(),
+            }),
+        );
         let _ = child.append(
             SessionEventData::Extension {
                 type_name: "subagent/descriptor".into(),

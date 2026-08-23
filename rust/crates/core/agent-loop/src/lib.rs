@@ -111,6 +111,16 @@ impl LoopAgent {
                 break;
             }
             let claimed = self.inbox.claim(target);
+            for message in &claimed {
+                self.ctx.emit(
+                    "agent/inbox/claimed",
+                    serde_json::json!({
+                        "agentId": self.session.id().as_str(),
+                        "message": message,
+                        "turn": turn,
+                    }),
+                );
+            }
             if self.ctx.has_service(dsh_session_checkpoint_policy::CheckpointPolicy::KEY) {
                 if let Err(error) =
                     dsh_session_checkpoint_policy::flush_session(&self.ctx, self.session.as_ref())

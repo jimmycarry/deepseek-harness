@@ -250,14 +250,15 @@ async fn text_turn_profile_types_and_payloads() {
 
 #[tokio::test]
 async fn agent_instructions_baseline_is_model_visible() {
-    let dir = std::env::temp_dir().join(format!(
-        "dsh-instr-{}-{}",
-        std::process::id(),
-        uuid_stamp()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("dsh-instr-{}-{}", std::process::id(), uuid_stamp()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("AGENTS.md"), "Prefer cargo test over ad-hoc scripts.").unwrap();
+    std::fs::write(
+        dir.join("AGENTS.md"),
+        "Prefer cargo test over ad-hoc scripts.",
+    )
+    .unwrap();
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     let (_ctx, session) = run_profile_host_in(
         &dir,
@@ -278,16 +279,16 @@ async fn agent_instructions_baseline_is_model_visible() {
     let text = instruction["data"]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
-    assert!(
-        text.starts_with("<system-reminder>\n"),
-        "{text}"
-    );
+    assert!(text.starts_with("<system-reminder>\n"), "{text}");
     assert!(
         text.contains("The following workspace instructions may be relevant to your work."),
         "{text}"
     );
     assert!(text.contains("Instructions from: AGENTS.md"), "{text}");
-    assert!(text.contains("Prefer cargo test over ad-hoc scripts."), "{text}");
+    assert!(
+        text.contains("Prefer cargo test over ad-hoc scripts."),
+        "{text}"
+    );
     assert!(text.ends_with("</system-reminder>"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -571,6 +572,39 @@ async fn subagent_turn_profile() {
         .as_str()
         .unwrap_or("");
     assert_eq!(text, "child-done");
+}
+
+#[tokio::test]
+async fn background_bash_job_turn_profile() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hello\",\"run_in_background\":true}"
+            }
+        },
+        {
+            "text": "",
+            "tool": {
+                "id": "c2",
+                "name": "job_output",
+                "arguments": "{\"job_id\":\"bash-1\",\"wait\":true}"
+            }
+        },
+        { "text": "done" }
+    ]);
+    let events = run_profile("bg echo", replay_turns_overlay(turns)).await;
+    let texts = tool_result_texts(&events);
+    assert_eq!(texts[0].0, "started background job bash-1");
+    assert!(!texts[0].1);
+    assert!(texts[1].0.contains("hello"), "{}", texts[1].0);
+    assert!(
+        texts[1].0.contains("[status: completed, exit code: 0]"),
+        "{}",
+        texts[1].0
+    );
 }
 
 /// Every tool/result in log order as (text, isError).

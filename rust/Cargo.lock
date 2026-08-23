@@ -225,6 +225,8 @@ dependencies = [
  "dsh-fs-local",
  "dsh-goal",
  "dsh-goal-round-driver",
+ "dsh-jobs",
+ "dsh-jobs-local",
  "dsh-llm",
  "dsh-llm-replay",
  "dsh-repeat-tool-reminder",
@@ -243,6 +245,7 @@ dependencies = [
  "dsh-tool-fs",
  "dsh-tool-fs-search",
  "dsh-tool-goal",
+ "dsh-tool-jobs",
  "dsh-tool-str-replace-editor",
  "dsh-tool-subagent",
  "dsh-tool-web",
@@ -292,6 +295,7 @@ dependencies = [
  "dsh-fs-local",
  "dsh-goal",
  "dsh-goal-round-driver",
+ "dsh-jobs",
  "dsh-jobs-local",
  "dsh-llm",
  "dsh-llm-deepseek",
@@ -326,6 +330,7 @@ dependencies = [
  "dsh-tool-fs",
  "dsh-tool-fs-search",
  "dsh-tool-goal",
+ "dsh-tool-jobs",
  "dsh-tool-result-pruner",
  "dsh-tool-skill",
  "dsh-tool-str-replace-editor",
@@ -626,15 +631,22 @@ version = "0.1.1-rc.2"
 name = "dsh-jobs"
 version = "0.1.1-rc.2"
 dependencies = [
+ "dsh-agent",
  "dsh-cordis",
+ "dsh-session",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "dsh-jobs-local"
 version = "0.1.1-rc.2"
 dependencies = [
+ "dsh-agent",
  "dsh-cordis",
  "dsh-jobs",
+ "serde_json",
 ]
 
 [[package]]
@@ -805,6 +817,7 @@ dependencies = [
  "dsh-agent-spine",
  "dsh-cordis",
  "dsh-llm",
+ "dsh-llm-replay",
  "dsh-sdk-protocol",
  "dsh-session",
  "dsh-session-persistence",
@@ -1010,7 +1023,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -1107,6 +1119,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
  "dsh-cordis",
+ "dsh-jobs",
  "dsh-shell",
  "dsh-tools",
  "serde_json",
@@ -1159,8 +1172,12 @@ name = "dsh-tool-jobs"
 version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
+ "dsh-agent",
  "dsh-cordis",
  "dsh-jobs",
+ "dsh-llm",
+ "dsh-session",
+ "dsh-system-prompt",
  "dsh-tools",
  "serde_json",
  "tokio",
@@ -1225,11 +1242,13 @@ dependencies = [
  "async-trait",
  "dsh-agent",
  "dsh-cordis",
+ "dsh-jobs",
  "dsh-llm",
  "dsh-session",
  "dsh-subagent",
  "dsh-system-prompt",
  "dsh-tools",
+ "futures",
  "serde_json",
  "tokio",
 ]

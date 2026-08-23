@@ -7,4 +7,9 @@ rust-version.workspace = true
 description = "Jobs seam (ctx.jobs)."
 
 [dependencies]
+dsh-agent.workspace = true
 dsh-cordis.workspace = true
+dsh-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

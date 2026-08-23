@@ -77,6 +77,10 @@ mod tests {
         assert!(names.contains(&"grep".into()));
         assert!(names.contains(&"str_replace_editor".into()));
         assert!(names.contains(&"bash".into()));
+        assert!(names.contains(&"job_output".into()));
+        assert!(names.contains(&"job_list".into()));
+        assert!(names.contains(&"job_kill".into()));
+        assert!(ctx.has_service("jobs"));
         assert!(names.contains(&"create_goal".into()));
         assert!(names.contains(&"get_goal".into()));
         assert!(names.contains(&"update_goal".into()));

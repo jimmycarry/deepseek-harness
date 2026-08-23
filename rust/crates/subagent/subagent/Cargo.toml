@@ -15,7 +15,6 @@ dsh-session.workspace = true
 dsh-session-projection.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
