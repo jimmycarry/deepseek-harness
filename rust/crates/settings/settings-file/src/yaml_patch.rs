@@ -269,6 +269,9 @@ fn patch_nodes(nodes: &mut Vec<Node>, indent: usize, key: &str, current: Option<
             }
         }
         _ => {
+            if position.is_some() && current.is_some_and(|value| json_equal(value, next)) {
+                return;
+            }
             if let Some(index) = position {
                 if !next.is_object() && !next.is_array() {
                     if let Node::Pair {
