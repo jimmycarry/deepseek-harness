@@ -8,7 +8,10 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
     Blank,
-    Comment(String),
+    Comment {
+        indent: usize,
+        text: String,
+    },
     Pair {
         indent: usize,
         key: String,
@@ -30,7 +33,7 @@ pub fn patch_namespace(text: Option<&str>, ns: &str, section: &Value) -> String 
         .into_iter()
         .filter(|node| !matches!(node, Node::Blank) || text.is_some())
         .collect::<Vec<_>>();
-    if nodes.iter().all(|node| matches!(node, Node::Blank | Node::Comment(_)))
+    if nodes.iter().all(|node| matches!(node, Node::Blank | Node::Comment { .. }))
         && text.map(str::trim).unwrap_or("").is_empty()
     {
         nodes.clear();
@@ -71,7 +74,10 @@ fn parse_block<'a>(lines: &[&'a str], start: usize, indent: usize) -> (Vec<Node>
             break;
         }
         if content.starts_with('#') {
-            nodes.push(Node::Comment(content.to_string()));
+            nodes.push(Node::Comment {
+                indent: line_indent,
+                text: content.to_string(),
+            });
             i += 1;
             continue;
         }
@@ -96,7 +102,10 @@ fn parse_block<'a>(lines: &[&'a str], start: usize, indent: usize) -> (Vec<Node>
             continue;
         }
         let Some((key, rest)) = split_pair(content) else {
-            nodes.push(Node::Comment(content.to_string()));
+            nodes.push(Node::Comment {
+                indent: line_indent,
+                text: content.to_string(),
+            });
             i += 1;
             continue;
         };
@@ -310,7 +319,7 @@ fn remove_pair(nodes: &mut Vec<Node>, index: usize) {
     let mut start = index;
     while start > 0 {
         match &nodes[start - 1] {
-            Node::Comment(_) => start -= 1,
+            Node::Comment { .. } => start -= 1,
             _ => break,
         }
     }
@@ -428,7 +437,9 @@ fn render_into(nodes: &[Node], lines: &mut Vec<String>) {
     for node in nodes {
         match node {
             Node::Blank => lines.push(String::new()),
-            Node::Comment(comment) => lines.push(comment.clone()),
+            Node::Comment { indent, text } => {
+                lines.push(format!("{}{text}", " ".repeat(*indent)));
+            }
             Node::Pair {
                 indent,
                 key,
