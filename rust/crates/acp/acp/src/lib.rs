@@ -743,6 +743,110 @@ mod tests {
         assert_eq!(first.result.unwrap()["stopReason"], "cancelled");
     }
 
+    struct ChannelRead {
+        rx: std::sync::mpsc::Receiver<Option<String>>,
+        leftover: Vec<u8>,
+    }
+
+    impl std::io::Read for ChannelRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.leftover.is_empty() {
+                match self.rx.recv() {
+                    Ok(Some(line)) => {
+                        self.leftover.extend_from_slice(line.as_bytes());
+                        self.leftover.push(b'\n');
+                    }
+                    Ok(None) | Err(_) => return Ok(0),
+                }
+            }
+            let n = self.leftover.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.leftover[..n]);
+            self.leftover.drain(..n);
+            Ok(n)
+        }
+    }
+
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_cancels_an_in_flight_prompt_from_a_later_frame() {
+        let ctx = Context::new();
+        dsh_agent_spine::apply(&ctx, Arc::new(SlowAdapter)).unwrap();
+        let server = Arc::new(AcpServer::new());
+        let (_, response) = server
+            .handle_request(
+                &ctx,
+                request(1, "session/new", serde_json::json!({"cwd": "/tmp"})),
+            )
+            .await;
+        let session_id = response.result.unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serve_task = {
+            let ctx = ctx.clone();
+            let server = Arc::clone(&server);
+            let captured = Arc::clone(&captured);
+            tokio::spawn(async move {
+                serve(
+                    ctx,
+                    server,
+                    std::io::BufReader::new(ChannelRead {
+                        rx,
+                        leftover: Vec::new(),
+                    }),
+                    Capture(captured),
+                )
+                .await
+            })
+        };
+        tx.send(Some(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": "go" }],
+                },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send(Some(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": { "sessionId": session_id },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        tx.send(None).unwrap();
+        serve_task.await.unwrap().unwrap();
+        let body = String::from_utf8(captured.lock().expect("capture").clone()).unwrap();
+        let prompt = body
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|frame| frame.get("id") == Some(&Value::from(2)))
+            .expect("prompt response");
+        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{body}");
+    }
+
     #[tokio::test]
     async fn cancel_of_an_unknown_session_is_a_noop() {
         let server = AcpServer::new();
