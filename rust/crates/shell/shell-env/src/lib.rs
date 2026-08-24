@@ -78,6 +78,7 @@ impl ShellEnvRegistry {
     /// # Errors
     /// Empty name, duplicate name, invalid or reserved key, empty description,
     /// or a key already owned by another contributor.
+    #[must_use = "the disposer unregisters the contributor"]
     pub fn register(
         &self,
         contributor: BashEnvContributor,
@@ -216,7 +217,7 @@ pub fn install(ctx: &Context, config: Option<&Value>) -> Result<()> {
         .and_then(Value::as_str);
     let registry = Arc::new(ShellEnvRegistry::new(resolve_dsh_home(dsh_home)));
     let lookup = ctx.clone();
-    registry.register(BashEnvContributor {
+    let dispose = registry.register(BashEnvContributor {
         name: "session-persistence".into(),
         variables: BTreeMap::from([(
             DSH_SESSION_JSONL_KEY.into(),
@@ -238,6 +239,7 @@ pub fn install(ctx: &Context, config: Option<&Value>) -> Result<()> {
             }
         }),
     })?;
+    ctx.effect("shellEnv.register(session-persistence)", move || dispose)?;
     ctx.provide(registry)
 }
 
