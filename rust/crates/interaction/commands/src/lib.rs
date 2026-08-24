@@ -153,8 +153,9 @@ impl CommandRegistry {
     /// Parse and execute a known command, appending log-only `command/run`
     /// then `command/done`. Admission misses (not a slash line, unknown name)
     /// return `None` and write nothing. A handler `Err` settles as
-    /// `success: false` with that text; `Err` on this `Result` is a lifecycle
-    /// append failure after `command/run`.
+    /// `success: false` with that text; this `Result`'s `Err` is a
+    /// `command/run` append failure, or a `command/done` append failure after
+    /// a successful handler.
     pub async fn execute(
         &self,
         session: &Session,
