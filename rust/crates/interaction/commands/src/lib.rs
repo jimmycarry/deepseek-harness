@@ -152,7 +152,9 @@ impl CommandRegistry {
 
     /// Parse and execute a known command, appending log-only `command/run`
     /// then `command/done`. Admission misses (not a slash line, unknown name)
-    /// return `None` and write nothing.
+    /// return `None` and write nothing. A handler `Err` settles as
+    /// `success: false` with that text; `Err` on this `Result` is a lifecycle
+    /// append failure after `command/run`.
     pub async fn execute(
         &self,
         session: &Session,
@@ -228,11 +230,11 @@ impl CommandRegistry {
                 return Some(Err(error.to_string()));
             }
         }
-        Some(outcome.map(|result| CommandExecution {
+        Some(Ok(CommandExecution {
             command_id,
-            text: result.text,
+            text,
             success,
-            source_event_seq: result.source_event_seq,
+            source_event_seq,
         }))
     }
 }
@@ -340,6 +342,45 @@ mod tests {
         assert!(quiet_run["data"].get("args").is_none());
         assert!(registry.execute(session.as_ref(), "not a slash").await.is_none());
         assert!(registry.execute(session.as_ref(), "/missing").await.is_none());
+    }
+
+    struct FailHandler;
+
+    #[async_trait]
+    impl CommandHandler for FailHandler {
+        async fn handle(&self, _args: &str) -> Result<String, String> {
+            Err("nope".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_settles_handler_err_as_unsuccessful() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(dsh_session::SessionStore::new()))
+            .unwrap();
+        let registry = CommandRegistry::new();
+        registry.insert(Command {
+            name: "fail".into(),
+            description: "fail".into(),
+            model_visible: false,
+            record_input: true,
+            handler: Arc::new(FailHandler),
+        });
+        let session = ctx
+            .service::<dsh_session::SessionStore>()
+            .unwrap()
+            .create_fresh();
+        let recorded = registry
+            .execute(session.as_ref(), "/fail")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!recorded.success);
+        assert_eq!(recorded.text, "nope");
+        let done = serde_json::to_value(&session.events()[1]).unwrap();
+        assert_eq!(done["type"], "command/done");
+        assert_eq!(done["data"]["kind"], "error");
+        assert_eq!(done["data"]["text"], "nope");
     }
 
     #[test]

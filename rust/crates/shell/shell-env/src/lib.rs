@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn collects_declared_contributor_variables() {
         let registry = registry();
-        registry
+        let _dispose = registry
             .register(BashEnvContributor {
                 name: "always-available-fact".into(),
                 variables: BTreeMap::from([(
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_and_reserved_keys() {
         let registry = registry();
-        registry
+        let _first = registry
             .register(BashEnvContributor {
                 name: "first".into(),
                 variables: BTreeMap::from([("DSH_SHARED".into(), "First owner.".into())]),

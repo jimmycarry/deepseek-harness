@@ -2195,7 +2195,7 @@ mod tests {
     async fn persistence_failure_after_a_successful_replacement() {
         let session = compactable_session("persist");
         let agent = StubAgent::new(Arc::clone(&session));
-        let (mut engine, _) = scripted_engine("ok");
+        let (engine, _) = scripted_engine("ok");
         struct FailSave;
         #[async_trait]
         impl dsh_session_persistence::SessionStoreBackend for FailSave {
