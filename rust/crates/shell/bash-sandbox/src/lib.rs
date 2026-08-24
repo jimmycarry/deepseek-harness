@@ -87,6 +87,7 @@ impl ShellExecutor for BashSandbox {
             program,
             args,
             cwd: spec.cwd,
+            dsh_env: spec.dsh_env,
         });
         let output = self
             .subprocess
@@ -147,6 +148,7 @@ mod tests {
             .run(resolve_shell(ShellRequest {
                 command: "echo hello".into(),
                 cwd: None,
+                dsh_env: None,
             }))
             .await
             .unwrap();
@@ -161,6 +163,7 @@ mod tests {
             .run(resolve_shell(ShellRequest {
                 command: "echo hello".into(),
                 cwd: None,
+                dsh_env: None,
             }))
             .await;
         match result {

@@ -24,7 +24,7 @@ use dsh_tool_fs::{EditTool, ReadTool, WriteTool};
 use dsh_tools::ToolRuntime;
 use futures::stream::BoxStream;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Dispatch one composed row.
 pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<()> {
@@ -68,7 +68,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-bash-sandbox" => apply_bash_sandbox(ctx),
         "@deepseek-ai/dsh-user-approval" => apply_approval(ctx, config),
         "@deepseek-ai/dsh-permission-presets" => apply_permission(ctx, config),
-        "@deepseek-ai/dsh-shell-env" => apply_shell(ctx),
+        "@deepseek-ai/dsh-shell-env" => dsh_shell_env::install(ctx, config.as_ref()),
         "@deepseek-ai/dsh-tool-bash" => apply_tool_bash(ctx, config),
         "@deepseek-ai/dsh-tool-jobs" => apply_tool_jobs(ctx, config),
         "@deepseek-ai/dsh-tool-fs" => apply_tool_fs(ctx),
@@ -87,7 +87,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-commands" => ctx.provide(Arc::new(CommandRegistry::new())),
         "@deepseek-ai/dsh-command-feedback" => dsh_command_feedback::install(ctx),
         "@deepseek-ai/dsh-fs-sandbox" => apply_fs_sandbox(ctx),
-        "@deepseek-ai/dsh-llm-deepseek" => apply_llm_deepseek(ctx),
+        "@deepseek-ai/dsh-llm-deepseek" => apply_llm_deepseek(ctx, config),
         "@deepseek-ai/dsh-llm-replay" => apply_llm_replay(ctx, config),
         "@deepseek-ai/dsh-goal" => apply_goal(ctx, config),
         "@deepseek-ai/dsh-goal-round-driver" => dsh_goal_round_driver::install(ctx),
@@ -486,11 +486,15 @@ fn apply_tool_bash(ctx: &Context, config: Option<Value>) -> Result<()> {
     let resolved =
         dsh_tool_bash::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     let jobs = ctx.get::<dsh_jobs::JobRegistry>();
-    tools.insert(Arc::new(BashTool::with_jobs(
+    let mut tool = BashTool::with_jobs(
         shell,
         jobs,
         resolved.enable_run_in_background,
-    )));
+    );
+    if let Some(shell_env) = ctx.get::<dsh_shell_env::ShellEnvRegistry>() {
+        tool = tool.with_shell_env(shell_env);
+    }
+    tools.insert(Arc::new(tool));
     Ok(())
 }
 
@@ -804,38 +808,74 @@ fn apply_tool_web(ctx: &Context, config: Option<Value>) -> Result<()> {
     dsh_tool_web::install(ctx, resolved)
 }
 
-fn apply_llm_deepseek(ctx: &Context) -> Result<()> {
+fn apply_llm_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
+    if let Some(settings) = ctx.get::<SettingsRuntime>() {
+        settings.register("llm-deepseek")?;
+    }
+    let catalog = dsh_llm_deepseek::resolve_catalog(config.as_ref()).map_err(CordisError::Validation)?;
     ctx.provide(Arc::new(LlmRuntime::new(Arc::new(LiveDeepSeekAdapter {
         settings: ctx.get::<SettingsRuntime>(),
+        plugin_config: config,
+        last_good: Mutex::new(Some(catalog)),
     }))))
 }
 
 struct LiveDeepSeekAdapter {
     settings: Option<Arc<SettingsRuntime>>,
+    plugin_config: Option<Value>,
+    last_good: Mutex<Option<(u32, Vec<dsh_llm_deepseek::CatalogModel>)>>,
 }
 
-fn resolve_deepseek(settings: Option<&SettingsRuntime>) -> (String, String, String) {
-    let section = settings.and_then(|settings| settings.section("llm-deepseek"));
+fn resolve_deepseek(settings: Option<&SettingsRuntime>, plugin: Option<&Value>) -> (String, String, String) {
+    let section = dsh_llm_deepseek::merge_connection_config(
+        plugin,
+        settings.and_then(|settings| settings.section("llm-deepseek")).as_ref(),
+    );
     let api_key_env = section
-        .as_ref()
-        .and_then(|value| value.get("apiKeyEnv"))
+        .get("apiKeyEnv")
         .and_then(Value::as_str)
         .unwrap_or("DEEPSEEK_API_KEY");
     let api_key = std::env::var(api_key_env).unwrap_or_default();
     let base_url = section
-        .as_ref()
-        .and_then(|value| value.get("baseURL"))
+        .get("baseURL")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| std::env::var("DEEPSEEK_BASE_URL").ok())
         .unwrap_or_else(|| "https://api.deepseek.com".into());
     let model = section
-        .as_ref()
-        .and_then(|value| value.get("model"))
+        .get("model")
         .and_then(Value::as_str)
         .unwrap_or("deepseek-chat")
         .to_string();
     (api_key, base_url, model)
+}
+
+fn catalog_for(adapter: &LiveDeepSeekAdapter) -> Result<(u32, Vec<dsh_llm_deepseek::CatalogModel>), LlmError> {
+    let section = dsh_llm_deepseek::merge_connection_config(
+        adapter.plugin_config.as_ref(),
+        adapter
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.section("llm-deepseek"))
+            .as_ref(),
+    );
+    match dsh_llm_deepseek::resolve_catalog(Some(&section)) {
+        Ok(catalog) => {
+            *adapter.last_good.lock().expect("llm-deepseek catalog") = Some(catalog.clone());
+            Ok(catalog)
+        }
+        Err(error) => {
+            if let Some(good) = adapter.last_good.lock().expect("llm-deepseek catalog").clone() {
+                Ok(good)
+            } else {
+                Err(LlmError::Failure(dsh_llm::LlmFailure {
+                    message: error,
+                    code: "CONFIG".into(),
+                    status: None,
+                }))
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -844,7 +884,8 @@ impl LlmAdapter for LiveDeepSeekAdapter {
         &self,
         request: LlmRequest,
     ) -> std::result::Result<BoxStream<'static, StreamChunk>, LlmError> {
-        let (api_key, base_url, model) = resolve_deepseek(self.settings.as_deref());
+        let (api_key, base_url, model) =
+            resolve_deepseek(self.settings.as_deref(), self.plugin_config.as_ref());
         dsh_llm_deepseek::DeepSeekAdapter {
             api_key,
             base_url,
@@ -859,13 +900,17 @@ impl LlmAdapter for LiveDeepSeekAdapter {
         provider: &str,
         model: &str,
     ) -> std::result::Result<dsh_llm::LlmResolvedModelInfo, LlmError> {
-        dsh_llm_deepseek::DeepSeekAdapter {
-            api_key: String::new(),
-            base_url: String::new(),
-            model: String::new(),
-        }
-        .resolve_model(provider, model)
-        .await
+        let (default_window, models) = catalog_for(self)?;
+        Ok(dsh_llm::LlmResolvedModelInfo {
+            context: Some(dsh_llm::LlmModelContext {
+                context_window: dsh_llm_deepseek::context_window_for(
+                    model,
+                    default_window,
+                    &models,
+                ),
+            }),
+            ..dsh_llm::LlmResolvedModelInfo::identity(provider, model)
+        })
     }
 }
 

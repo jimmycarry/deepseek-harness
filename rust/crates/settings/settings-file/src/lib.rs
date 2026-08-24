@@ -2,11 +2,15 @@
 //! path) at mount. A missing file is an empty document. Invalid YAML at mount
 //! fails loud. When `watch` is on (the default), later reads re-load the
 //! document after the debounce window; an unreadable or invalid live edit
-//! keeps the last good document.
+//! keeps the last good document. `update` / `replace` persist one namespace
+//! as a comment-preserving leaf-level YAML diff.
+
+mod yaml_patch;
 
 use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_home_paths::resolve_dsh_home;
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,6 +33,8 @@ pub struct SettingsRuntime {
     debounce_ms: u64,
     last_probe: Mutex<Option<Instant>>,
     state: Mutex<DocumentState>,
+    namespaces: Mutex<HashSet<String>>,
+    revision: Mutex<u64>,
 }
 
 impl Service for SettingsRuntime {
@@ -94,6 +100,178 @@ impl SettingsRuntime {
             },
         }
     }
+
+    /// Whether this backend writes `update` / `replace` to disk.
+    pub fn writable(&self) -> bool {
+        true
+    }
+
+    /// Register a namespace so later `update` / `replace` calls can persist it.
+    ///
+    /// @param namespace Settings namespace id (`^[a-z][a-z0-9-]*$`).
+    pub fn register(&self, namespace: &str) -> Result<()> {
+        if !is_settings_namespace(namespace) {
+            return Err(CordisError::Validation(format!(
+                "invalid settings namespace \"{namespace}\""
+            )));
+        }
+        self.namespaces
+            .lock()
+            .expect("settings")
+            .insert(namespace.to_string());
+        Ok(())
+    }
+
+    /// Merge `patch` into `namespace` and persist when the document changes.
+    ///
+    /// @param namespace Registered settings namespace.
+    /// @param patch Object merged into the existing section.
+    /// @returns The next revision after a write, or the current revision when unchanged.
+    pub fn update(&self, namespace: &str, patch: &Value) -> Result<u64> {
+        self.write_section(namespace, |current| merge_objects(current, patch))
+    }
+
+    /// Replace `namespace` with `next` and persist when the document changes.
+    ///
+    /// @param namespace Registered settings namespace.
+    /// @param next Replacement section (must be a JSON object).
+    /// @returns The next revision after a write, or the current revision when unchanged.
+    pub fn replace(&self, namespace: &str, next: &Value) -> Result<u64> {
+        if !next.is_object() {
+            return Err(CordisError::Validation(
+                "settings replace value must be an object".into(),
+            ));
+        }
+        self.write_section(namespace, |_| next.clone())
+    }
+
+    fn write_section(
+        &self,
+        namespace: &str,
+        compute_next: impl FnOnce(&Value) -> Value,
+    ) -> Result<u64> {
+        if !self
+            .namespaces
+            .lock()
+            .expect("settings")
+            .contains(namespace)
+        {
+            return Err(CordisError::Validation(format!(
+                "settings namespace \"{namespace}\" is not registered"
+            )));
+        }
+        self.refresh();
+        let mut state = self.state.lock().expect("settings");
+        let current = state
+            .document
+            .get(namespace)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let next = compute_next(&current);
+        if current == next {
+            return Ok(*self.revision.lock().expect("settings"));
+        }
+        match &mut state.document {
+            Value::Object(map) => {
+                map.insert(namespace.to_string(), next.clone());
+            }
+            other => {
+                let mut map = Map::new();
+                map.insert(namespace.to_string(), next.clone());
+                *other = Value::Object(map);
+            }
+        }
+        let rendered = render_persist(&self.path, state.text.as_deref(), &state.document, namespace, &next)?;
+        write_document_atomic(&self.path, &rendered)?;
+        state.text = Some(rendered);
+        drop(state);
+        *self.last_probe.lock().expect("settings probe") = Some(Instant::now());
+        let mut revision = self.revision.lock().expect("settings");
+        *revision += 1;
+        Ok(*revision)
+    }
+}
+
+fn is_settings_namespace(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {
+            chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        }
+        _ => false,
+    }
+}
+
+fn merge_objects(current: &Value, patch: &Value) -> Value {
+    match (current, patch) {
+        (Value::Object(cur), Value::Object(p)) => {
+            let mut out = cur.clone();
+            for (k, v) in p {
+                match (out.get(k), v) {
+                    (Some(existing), Value::Object(_)) if existing.is_object() => {
+                        out.insert(k.clone(), merge_objects(existing, v));
+                    }
+                    _ => {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        (_, patch) => patch.clone(),
+    }
+}
+
+fn render_persist(
+    path: &Path,
+    source: Option<&str>,
+    document: &Value,
+    namespace: &str,
+    next: &Value,
+) -> Result<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("yaml")
+        .to_ascii_lowercase();
+    if ext == "json" {
+        let mut text = serde_json::to_string_pretty(document)
+            .map_err(|e| CordisError::Validation(format!("settings JSON persist: {e}")))?;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        return Ok(text);
+    }
+    Ok(yaml_patch::patch_namespace(source, namespace, next))
+}
+
+fn write_document_atomic(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CordisError::plugin(format!("settings persist mkdir: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings.yaml"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&tmp, contents)
+        .map_err(|e| CordisError::plugin(format!("settings persist write: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| CordisError::plugin(format!("settings persist rename: {e}")))?;
+    Ok(())
 }
 
 /// Resolve the document path from plugin config.
@@ -288,6 +466,8 @@ pub fn install(ctx: &Context, config: Option<&Value>) -> Result<()> {
         debounce_ms,
         last_probe: Mutex::new(None),
         state: Mutex::new(DocumentState { document, text }),
+        namespaces: Mutex::new(HashSet::new()),
+        revision: Mutex::new(0),
     }))
 }
 
@@ -412,6 +592,102 @@ mod tests {
                 .and_then(|value| value.get("baseURL").cloned()),
             Some(serde_json::json!("https://first.test"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_persists_a_registered_namespace_and_keeps_comments() {
+        let dir = stamp_dir("persist");
+        let path = dir.join("settings.yaml");
+        std::fs::write(
+            &path,
+            "# personal settings\nllm-deepseek:\n  baseURL: https://first.test  # lab gateway\n",
+        )
+        .unwrap();
+        let ctx = Context::new();
+        install(
+            &ctx,
+            Some(&serde_json::json!({
+                "path": path.to_string_lossy(),
+                "watch": false
+            })),
+        )
+        .unwrap();
+        let settings = ctx.service::<SettingsRuntime>().unwrap();
+        assert!(settings.writable());
+        let missing = settings
+            .update("llm-deepseek", &serde_json::json!({ "baseURL": "https://second.test" }))
+            .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("settings namespace \"llm-deepseek\" is not registered"),
+            "{missing}"
+        );
+        settings.register("llm-deepseek").unwrap();
+        let revision = settings
+            .update(
+                "llm-deepseek",
+                &serde_json::json!({ "baseURL": "https://second.test" }),
+            )
+            .unwrap();
+        assert_eq!(revision, 1);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# personal settings"), "{written}");
+        assert!(written.contains("# lab gateway"), "{written}");
+        assert!(written.contains("https://second.test"), "{written}");
+        assert_eq!(
+            settings
+                .section("llm-deepseek")
+                .and_then(|value| value.get("baseURL").cloned()),
+            Some(serde_json::json!("https://second.test"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_an_invalid_namespace_id() {
+        let dir = stamp_dir("badns");
+        let ctx = Context::new();
+        install(
+            &ctx,
+            Some(&serde_json::json!({
+                "path": dir.join("settings.yaml").to_string_lossy(),
+                "watch": false
+            })),
+        )
+        .unwrap();
+        let settings = ctx.service::<SettingsRuntime>().unwrap();
+        let err = settings.register("LLM_DeepSeek").unwrap_err();
+        assert!(err.to_string().contains("invalid settings namespace"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_document_persists_pretty() {
+        let dir = stamp_dir("json");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let ctx = Context::new();
+        install(
+            &ctx,
+            Some(&serde_json::json!({
+                "path": path.to_string_lossy(),
+                "watch": false
+            })),
+        )
+        .unwrap();
+        let settings = ctx.service::<SettingsRuntime>().unwrap();
+        settings.register("llm-deepseek").unwrap();
+        settings
+            .update(
+                "llm-deepseek",
+                &serde_json::json!({ "baseURL": "https://json.test" }),
+            )
+            .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"baseURL\": \"https://json.test\""), "{written}");
+        assert!(written.ends_with('\n'), "{written:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

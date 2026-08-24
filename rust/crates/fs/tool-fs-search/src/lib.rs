@@ -509,6 +509,7 @@ async fn run_ripgrep(
             program,
             args,
             cwd: Some(workdir.clone()),
+            dsh_env: None,
         }))
         .await
         .map_err(|error| format!("{tool_name} search failed: {error}"))?;

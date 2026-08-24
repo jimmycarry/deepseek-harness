@@ -57,6 +57,7 @@ dsh-session-query-sqlite.workspace = true
 dsh-spill-local.workspace = true
 dsh-spill-policy.workspace = true
 dsh-shell.workspace = true
+dsh-shell-env.workspace = true
 dsh-skill.workspace = true
 dsh-skill-filesystem.workspace = true
 dsh-subprocess.workspace = true

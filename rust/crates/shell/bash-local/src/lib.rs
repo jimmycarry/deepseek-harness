@@ -24,6 +24,7 @@ impl ShellExecutor for BashLocal {
             program: "/bin/bash".into(),
             args: vec!["-lc".into(), spec.command],
             cwd: spec.cwd,
+            dsh_env: spec.dsh_env,
         });
         let output = self
             .subprocess

@@ -1,16 +1,14 @@
 [package]
-name = "dsh-settings-file"
+name = "dsh-shell-env"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "File-backed user settings document ($DSH_HOME/settings.yaml)."
+description = "Trusted DSH_* environment registry (ctx.shellEnv)."
 
 [dependencies]
 dsh-cordis.workspace = true
 dsh-home-paths.workspace = true
+dsh-session.workspace = true
+dsh-session-persistence.workspace = true
 serde_json.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true

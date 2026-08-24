@@ -2,10 +2,14 @@
 
 use async_trait::async_trait;
 use dsh_cordis::Service;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// Prefix of every managed `DSH_*` environment key.
+pub const DSH_ENV_PREFIX: &str = "DSH_";
+
 /// Resolved spawn request. Defaulting happens in `resolve`, never inside `run`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnSpec {
     /// Program path.
     pub program: String,
@@ -13,10 +17,12 @@ pub struct SpawnSpec {
     pub args: Vec<String>,
     /// Working directory.
     pub cwd: Option<String>,
+    /// Trusted managed environment overlay. `None` keeps the inherited environment.
+    pub dsh_env: Option<BTreeMap<String, String>>,
 }
 
 /// Caller-facing request before resolve.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnRequest {
     /// Program path.
     pub program: String,
@@ -24,6 +30,8 @@ pub struct SpawnRequest {
     pub args: Vec<String>,
     /// Optional cwd.
     pub cwd: Option<String>,
+    /// Trusted managed environment overlay.
+    pub dsh_env: Option<BTreeMap<String, String>>,
 }
 
 /// Completed process output.
@@ -51,6 +59,7 @@ pub fn resolve(request: SpawnRequest) -> SpawnSpec {
         program: request.program,
         args: request.args,
         cwd: request.cwd,
+        dsh_env: request.dsh_env,
     }
 }
 
@@ -92,6 +101,7 @@ mod tests {
             program: "echo".into(),
             args: vec![],
             cwd: None,
+            dsh_env: None,
         });
         assert!(spec.cwd.is_none());
     }

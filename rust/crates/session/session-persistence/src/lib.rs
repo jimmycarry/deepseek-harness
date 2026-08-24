@@ -3,8 +3,19 @@
 use async_trait::async_trait;
 use dsh_cordis::Service;
 use dsh_session::{Session, SessionError, SessionId};
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Absolute per-session artifact target, when the backend has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLocation {
+    /// JSONL transcript path. The file may not exist yet.
+    Jsonl {
+        /// Absolute target path.
+        path: PathBuf,
+    },
+}
 
 /// Failures from a session-store backend.
 #[derive(Debug, Error)]
@@ -29,6 +40,12 @@ pub trait SessionStoreBackend: Send + Sync {
     async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError>;
     /// Session ids currently stored by this backend.
     async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError>;
+    /// Resolve an absolute per-session artifact without I/O. Backends without
+    /// an independent local artifact return `None`.
+    fn locate(&self, id: &SessionId) -> Option<SessionLocation> {
+        let _ = id;
+        None
+    }
 }
 
 /// `ctx.sessionPersistence`.
@@ -55,6 +72,11 @@ impl PersistenceRuntime {
     /// Session ids currently stored by the backend.
     pub async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
         self.backend.list_ids().await
+    }
+
+    /// Resolve an absolute per-session artifact without I/O.
+    pub fn locate(&self, id: &SessionId) -> Option<SessionLocation> {
+        self.backend.locate(id)
     }
 }
 

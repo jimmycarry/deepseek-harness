@@ -64,6 +64,18 @@ pub enum ManualCompactionError {
         /// Routed threshold that was still unmet.
         threshold: u64,
     },
+    /// The caller cancelled before the replacement committed.
+    #[error("manual compaction was cancelled")]
+    Cancelled,
+    /// The selected surface changed while the summarizer was running.
+    #[error("the compacted history changed during manual compaction")]
+    Changed,
+    /// A session append required to close the compaction bracket failed.
+    #[error("manual compaction did not commit cleanly")]
+    Commit,
+    /// The in-memory bracket closed but the durability checkpoint failed.
+    #[error("manual compaction durability checkpoint failed")]
+    Persistence,
 }
 
 /// `ctx.compaction`.

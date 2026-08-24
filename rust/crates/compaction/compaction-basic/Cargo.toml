@@ -13,6 +13,7 @@ dsh-compaction.workspace = true
 dsh-cordis.workspace = true
 dsh-llm.workspace = true
 dsh-session.workspace = true
+dsh-session-persistence.workspace = true
 dsh-token-meter.workspace = true
 dsh-tool-result-pruner.workspace = true
 futures.workspace = true

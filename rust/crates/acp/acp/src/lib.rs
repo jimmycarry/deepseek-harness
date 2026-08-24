@@ -4,11 +4,25 @@
 //! modules.
 //!
 //! The TypeScript bridge streams `session/update` while the turn runs and
-//! answers `session/prompt` at quiescence. This server drives the turn inside
-//! the request, so the observable stdio order is identical: every
-//! `agent_message_chunk` update precedes the prompt response.
+//! answers `session/prompt` at quiescence. This server also answers at
+//! quiescence, but reads stdin on a dedicated thread so `session/cancel` can
+//! reach an in-flight prompt; every `agent_message_chunk` update still
+//! precedes that prompt's response.
 
-use dsh_agent::{Agent, AgentHandle, AgentRegistry};
+use dsh_agent::{Agent, AgentCancelCause, AgentHandle, AgentRegistry};
+use dsh_agent_loop::run_followup;
+use dsh_cordis::{Context, Service};
+use dsh_llm::{ContentBlock, UserMessage};
+use dsh_sdk_protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use dsh_session::{Session, SessionEventData, SessionHeader, SessionStore, TurnEndReason};
+use dsh_session_persistence::PersistenceRuntime;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 use dsh_agent_loop::run_followup;
 use dsh_cordis::{Context, Service};
 use dsh_llm::{ContentBlock, UserMessage};
@@ -49,6 +63,23 @@ pub fn turn_end_to_stop_reason(reason: &TurnEndReason) -> &'static str {
 struct SessionRecord {
     agent: Arc<dyn Agent>,
     handle: Option<AgentHandle>,
+    inflight: bool,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+struct InflightGuard<'a> {
+    server: &'a AcpServer,
+    session_id: String,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.server.sessions.lock() {
+            if let Some(record) = sessions.get_mut(&self.session_id) {
+                record.inflight = false;
+            }
+        }
+    }
 }
 
 /// Automation-only ACP server state (`ctx.acp`).
@@ -103,10 +134,28 @@ impl AcpServer {
         }
     }
 
-    /// Handle the `session/cancel` notification. This synchronous server has
-    /// no prompt in flight between frames, so cancellation is a no-op for a
-    /// known session and silently ignores an unknown one.
-    pub fn handle_cancel(&self, _params: Option<Value>) {}
+    /// Handle the `session/cancel` notification. Unknown sessions are no-ops.
+    /// A known session is cancelled with `{ kind: "user" }` so an in-flight
+    /// prompt can settle as `cancelled` once the current step returns.
+    pub fn handle_cancel(&self, params: Option<Value>) {
+        let Some(session_id) = params
+            .as_ref()
+            .and_then(|value| value.get("sessionId"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let sessions = self.sessions.lock().expect("acp sessions");
+        let Some(record) = sessions.get(session_id) else {
+            return;
+        };
+        record
+            .cancel_requested
+            .store(true, Ordering::SeqCst);
+        record.agent.cancel(AgentCancelCause {
+            kind: "user".into(),
+        });
+    }
 
     /// Dispose every bridge-owned agent. Runs when the connection closes;
     /// later requests against the drained map report unknown sessions.
@@ -163,6 +212,8 @@ impl AcpServer {
             SessionRecord {
                 agent: Arc::clone(&handle.agent),
                 handle: Some(handle),
+                inflight: false,
+                cancel_requested: Arc::new(AtomicBool::new(false)),
             },
         );
         JsonRpcResponse::result(id, serde_json::json!({ "sessionId": session_id }))
@@ -182,18 +233,6 @@ impl AcpServer {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let agent = {
-            let sessions = self.sessions.lock().expect("acp sessions");
-            match sessions.get(&session_id) {
-                Some(record) => Arc::clone(&record.agent),
-                None => {
-                    return (
-                        Vec::new(),
-                        invalid_params(id, &format!("unknown session: {session_id}")),
-                    )
-                }
-            }
-        };
         let blocks = params
             .get("prompt")
             .and_then(Value::as_array)
@@ -234,6 +273,35 @@ impl AcpServer {
                 }
             }
         }
+        let (agent, cancel_requested) = {
+            let mut sessions = self.sessions.lock().expect("acp sessions");
+            match sessions.get_mut(&session_id) {
+                None => {
+                    return (
+                        Vec::new(),
+                        invalid_params(id, &format!("unknown session: {session_id}")),
+                    )
+                }
+                Some(record) if record.inflight => {
+                    return (
+                        Vec::new(),
+                        invalid_params(id, "a prompt is already in flight for this session"),
+                    )
+                }
+                Some(record) => {
+                    record.inflight = true;
+                    record.cancel_requested.store(false, Ordering::SeqCst);
+                    (
+                        Arc::clone(&record.agent),
+                        Arc::clone(&record.cancel_requested),
+                    )
+                }
+            }
+        };
+        let _guard = InflightGuard {
+            server: self,
+            session_id: session_id.clone(),
+        };
         let message = UserMessage::from_parts(content, dsh_llm::MessageSource::User);
         let watermark = agent.session().events().len();
         if let Err(error) = run_followup(agent.as_ref(), message).await {
@@ -262,6 +330,12 @@ impl AcpServer {
                 _ => {}
             }
         }
+        if cancel_requested.load(Ordering::SeqCst) {
+            return (
+                notifications,
+                JsonRpcResponse::result(id, serde_json::json!({ "stopReason": "cancelled" })),
+            );
+        }
         let response = match end_reason {
             Some(TurnEndReason::Error { message, .. }) => {
                 internal_error(id, &format!("turn failed: {message}"))
@@ -270,7 +344,6 @@ impl AcpServer {
                 id,
                 serde_json::json!({ "stopReason": turn_end_to_stop_reason(&reason) }),
             ),
-            // A turn that produced no ending is out-of-band cancellation.
             None => JsonRpcResponse::result(id, serde_json::json!({ "stopReason": "cancelled" })),
         };
         (notifications, response)
@@ -306,38 +379,80 @@ fn agent_message_chunk(session_id: &str, text: &str) -> JsonRpcNotification {
     )
 }
 
-/// Serve newline-delimited ACP JSON-RPC over the given reader/writer until
-/// EOF. Notifications for a request are written before its response;
-/// `session/cancel` frames (no id) produce no output.
-pub async fn serve<R: BufRead, W: Write>(
-    ctx: &Context,
-    server: &AcpServer,
+/// Serve newline-delimited ACP JSON-RPC until EOF. `session/prompt` runs as a
+/// background task so later frames — including `session/cancel` — can be read
+/// while the turn is in flight. Notifications for a request are written
+/// before its response; `session/cancel` frames (no id) produce no output.
+pub async fn serve<R, W>(
+    ctx: Context,
+    server: Arc<AcpServer>,
     reader: R,
-    writer: &mut W,
-) -> Result<(), String> {
-    for line in reader.lines() {
-        let line = line.map_err(|error| error.to_string())?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-            // Malformed peer lines are ignored, matching the TS transport.
-            continue;
-        };
-        if frame.get("id").is_none() {
-            if frame.get("method").and_then(Value::as_str) == Some("session/cancel") {
-                server.handle_cancel(frame.get("params").cloned());
+    mut writer: W,
+) -> Result<(), String>
+where
+    R: BufRead + Send + 'static,
+    W: Write,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(Some(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
-            continue;
         }
-        let Ok(request) = serde_json::from_value::<JsonRpcRequest>(frame) else {
-            continue;
-        };
-        let (notifications, response) = server.handle_request(ctx, request).await;
-        for notification in notifications {
-            write_frame(writer, &notification)?;
+        let _ = tx.send(None);
+    });
+    let mut prompts = tokio::task::JoinSet::new();
+    let mut stdin_open = true;
+    while stdin_open || !prompts.is_empty() {
+        tokio::select! {
+            biased;
+            msg = rx.recv(), if stdin_open => {
+                match msg {
+                    None | Some(None) => stdin_open = false,
+                    Some(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        if frame.get("id").is_none() {
+                            if frame.get("method").and_then(Value::as_str) == Some("session/cancel") {
+                                server.handle_cancel(frame.get("params").cloned());
+                            }
+                            continue;
+                        }
+                        let Ok(request) = serde_json::from_value::<JsonRpcRequest>(frame) else {
+                            continue;
+                        };
+                        if request.method == "session/prompt" {
+                            let ctx = ctx.clone();
+                            let server = Arc::clone(&server);
+                            prompts.spawn(async move { server.handle_request(&ctx, request).await });
+                        } else {
+                            let (notifications, response) = server.handle_request(&ctx, request).await;
+                            for notification in notifications {
+                                write_frame(&mut writer, &notification)?;
+                            }
+                            write_frame(&mut writer, &response)?;
+                        }
+                    }
+                }
+            }
+            Some(joined) = prompts.join_next(), if !prompts.is_empty() => {
+                let (notifications, response) = joined.map_err(|error| error.to_string())?;
+                for notification in notifications {
+                    write_frame(&mut writer, &notification)?;
+                }
+                write_frame(&mut writer, &response)?;
+            }
         }
-        write_frame(writer, &response)?;
     }
     server.quiesce();
     Ok(())
@@ -348,9 +463,13 @@ pub async fn serve_stdio(ctx: &Context) -> Result<(), String> {
     let server = ctx
         .service::<AcpServer>()
         .map_err(|error| error.to_string())?;
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    serve(ctx, server.as_ref(), stdin.lock(), &mut stdout).await
+    serve(
+        ctx.clone(),
+        server,
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::stdout(),
+    )
+    .await
 }
 
 fn write_frame<W: Write>(writer: &mut W, frame: &impl serde::Serialize) -> Result<(), String> {
@@ -583,5 +702,80 @@ mod tests {
             turn_end_to_stop_reason(&TurnEndReason::Interrupted),
             "cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_second_prompt_while_one_is_in_flight() {
+        let ctx = Context::new();
+        dsh_agent_spine::apply(&ctx, Arc::new(SlowAdapter)).unwrap();
+        let server = Arc::new(AcpServer::new());
+        let (_, response) = server
+            .handle_request(
+                &ctx,
+                request(1, "session/new", serde_json::json!({"cwd": "/tmp"})),
+            )
+            .await;
+        let session_id = response.result.unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first = {
+            let server = Arc::clone(&server);
+            let ctx = ctx.clone();
+            let prompt = request(
+                2,
+                "session/prompt",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": "go" }],
+                }),
+            );
+            tokio::spawn(async move { server.handle_request(&ctx, prompt).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_, second) = server
+            .handle_request(
+                &ctx,
+                request(
+                    3,
+                    "session/prompt",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "prompt": [{ "type": "text", "text": "again" }],
+                    }),
+                ),
+            )
+            .await;
+        assert_eq!(
+            second.error.unwrap()["message"],
+            "Invalid params: a prompt is already in flight for this session"
+        );
+        server.handle_cancel(Some(serde_json::json!({ "sessionId": session_id })));
+        let (_, first) = first.await.unwrap();
+        assert_eq!(first.result.unwrap()["stopReason"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_of_an_unknown_session_is_a_noop() {
+        let server = AcpServer::new();
+        server.handle_cancel(Some(serde_json::json!({ "sessionId": "missing" })));
+    }
+
+    struct SlowAdapter;
+
+    #[async_trait::async_trait]
+    impl dsh_llm::LlmAdapter for SlowAdapter {
+        async fn stream(
+            &self,
+            _: dsh_llm::LlmRequest,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<'static, dsh_llm::StreamChunk>,
+            dsh_llm::LlmError,
+        > {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            Ok(Box::pin(futures::stream::iter(
+                dsh_llm::StreamChunk::text_stream("late"),
+            )))
+        }
     }
 }

@@ -4,8 +4,10 @@
 use async_trait::async_trait;
 use dsh_jobs::{JobHooks, JobOutcome, JobRegistry, JobStart, JobStatus};
 use dsh_shell::{resolve, ShellRequest, ShellRuntime};
+use dsh_shell_env::ShellEnvRegistry;
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -40,6 +42,7 @@ pub struct BashTool {
     shell: Arc<ShellRuntime>,
     jobs: Option<Arc<JobRegistry>>,
     enable_run_in_background: bool,
+    shell_env: Option<Arc<ShellEnvRegistry>>,
 }
 
 impl BashTool {
@@ -49,6 +52,7 @@ impl BashTool {
             shell,
             jobs: None,
             enable_run_in_background: true,
+            shell_env: None,
         }
     }
 
@@ -62,7 +66,14 @@ impl BashTool {
             shell,
             jobs,
             enable_run_in_background,
+            shell_env: None,
         }
+    }
+
+    /// Collect trusted `DSH_*` facts for each model bash call.
+    pub fn with_shell_env(mut self, shell_env: Arc<ShellEnvRegistry>) -> Self {
+        self.shell_env = Some(shell_env);
+        self
     }
 }
 
@@ -127,12 +138,13 @@ impl Tool for BashTool {
             };
             let command = command.to_string();
             let owner = call.agent_id.clone();
+            let dsh_env = collect_dsh_env(self.shell_env.as_deref(), call.agent_id.as_deref())?;
             match jobs.start(JobStart {
                 kind: "bash".into(),
                 label: command.clone(),
                 output_limit_bytes: None,
                 owner_session: owner,
-                run: Box::new(move || spawn_bash(command, None)),
+                run: Box::new(move || spawn_bash(command, None, dsh_env)),
             }) {
                 Ok(id) => Ok(ToolOutcome::text(format!("started background job {id}"))),
                 Err(error) => Ok(ToolOutcome::error(format!("Error: {error}"))),
@@ -141,6 +153,7 @@ impl Tool for BashTool {
             let spec = resolve(ShellRequest {
                 command: command.into(),
                 cwd: None,
+                dsh_env: collect_dsh_env(self.shell_env.as_deref(), call.agent_id.as_deref())?,
             });
             match self.shell.run(spec).await {
                 Ok(stdout) => Ok(ToolOutcome::text(stdout)),
@@ -150,7 +163,36 @@ impl Tool for BashTool {
     }
 }
 
-fn spawn_bash(command: String, cwd: Option<String>) -> Result<JobHooks, String> {
+fn collect_dsh_env(
+    registry: Option<&ShellEnvRegistry>,
+    session_id: Option<&str>,
+) -> Result<Option<BTreeMap<String, String>>, ToolError> {
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    registry
+        .collect(session_id)
+        .map(Some)
+        .map_err(|error| ToolError::Body(error.to_string()))
+}
+
+fn apply_dsh_env(command: &mut Command, dsh_env: &Option<BTreeMap<String, String>>) {
+    let Some(overlay) = dsh_env else {
+        return;
+    };
+    let mut env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(key, _)| !key.to_ascii_uppercase().starts_with("DSH_"))
+        .collect();
+    env.extend(overlay.iter().map(|(key, value)| (key.clone(), value.clone())));
+    command.env_clear();
+    command.envs(env);
+}
+
+fn spawn_bash(
+    command: String,
+    cwd: Option<String>,
+    dsh_env: Option<BTreeMap<String, String>>,
+) -> Result<JobHooks, String> {
     let mut cmd = Command::new("/bin/bash");
     cmd.arg("-lc")
         .arg(&command)
@@ -159,6 +201,7 @@ fn spawn_bash(command: String, cwd: Option<String>) -> Result<JobHooks, String> 
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
+    apply_dsh_env(&mut cmd, &dsh_env);
     let mut child = cmd.spawn().map_err(|error| error.to_string())?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

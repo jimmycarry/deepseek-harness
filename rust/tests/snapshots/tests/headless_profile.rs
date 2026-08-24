@@ -1482,6 +1482,82 @@ async fn settings_file_reloads_after_external_edit() {
 }
 
 #[tokio::test]
+async fn bash_injects_dsh_env_profile() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-r-env-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "bash",
+                "arguments": "{\"command\":\"printf '%s\\n' DSH_HOME=$DSH_HOME DSH_SHELL=$DSH_SHELL DSH_SESSION_ID=$DSH_SESSION_ID\"}"
+            }
+        },
+        { "text": "done" }
+    ]);
+    let (_ctx, session) = run_profile_host_in(&dir, "echo env", replay_turns_overlay(turns)).await;
+    let events = events_of(&session);
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool/result")
+        .expect("tool result");
+    let text = result["data"]["message"]["content"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains(&format!("DSH_HOME={}", dir.display())),
+        "{text}"
+    );
+    assert!(text.contains("DSH_SHELL=1"), "{text}");
+    assert!(
+        text.lines().any(|line| {
+            line.starts_with("DSH_SESSION_ID=") && line.len() > "DSH_SESSION_ID=".len()
+        }),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn settings_file_persists_comment_preserving_update() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-wave-s-persist-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("settings.yaml"),
+        "# personal settings\nllm-deepseek:\n  baseURL: https://first.test  # lab gateway\n",
+    )
+    .unwrap();
+    let mut overlay = Vec::new();
+    let mut settings_row = EntryPatch::replace("settings");
+    settings_row.config = Some(serde_json::json!({ "watch": false }));
+    overlay.push(settings_row);
+    let ctx = mount_profile_in(&dir, "unused", overlay);
+    let settings = ctx.service::<SettingsRuntime>().unwrap();
+    settings
+        .update(
+            "llm-deepseek",
+            &serde_json::json!({ "baseURL": "https://second.test" }),
+        )
+        .unwrap();
+    let written = std::fs::read_to_string(dir.join("settings.yaml")).unwrap();
+    assert!(written.contains("# personal settings"), "{written}");
+    assert!(written.contains("# lab gateway"), "{written}");
+    assert!(written.contains("https://second.test"), "{written}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn compact_command_profile() {
     let dir = std::env::temp_dir().join(format!(
         "dsh-wave-q-compact-{}-{}",

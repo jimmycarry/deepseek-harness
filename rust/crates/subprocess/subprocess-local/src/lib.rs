@@ -2,10 +2,24 @@
 
 use async_trait::async_trait;
 use dsh_subprocess::{ProcessOutput, SpawnSpec, SubprocessError, SubprocessExecutor};
+use std::collections::BTreeMap;
 use tokio::process::Command;
 
 /// Host process-tree backend.
 pub struct LocalSubprocess;
+
+/// Apply a trusted `DSH_*` overlay: drop inherited managed keys, then merge.
+pub fn apply_dsh_env(command: &mut Command, dsh_env: &Option<BTreeMap<String, String>>) {
+    let Some(overlay) = dsh_env else {
+        return;
+    };
+    let mut env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(key, _)| !key.to_ascii_uppercase().starts_with("DSH_"))
+        .collect();
+    env.extend(overlay.iter().map(|(key, value)| (key.clone(), value.clone())));
+    command.env_clear();
+    command.envs(env);
+}
 
 #[async_trait]
 impl SubprocessExecutor for LocalSubprocess {
@@ -15,6 +29,7 @@ impl SubprocessExecutor for LocalSubprocess {
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
+        apply_dsh_env(&mut command, &spec.dsh_env);
         let output = command
             .output()
             .await
@@ -38,6 +53,7 @@ mod tests {
                 program: "echo".into(),
                 args: vec!["ok".into()],
                 cwd: None,
+                dsh_env: None,
             })
             .await
             .unwrap();

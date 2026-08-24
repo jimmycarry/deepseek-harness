@@ -7,7 +7,9 @@ use dsh_session::{
     now_ms, refuse_unknown, session_event_from_value, Session, SessionEvent, SessionEventData,
     SessionHeader, SessionId, TurnEndReason, SESSION_FORMAT_VERSION,
 };
-use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
+use dsh_session_persistence::{
+    PersistenceError, PersistenceRuntime, SessionLocation, SessionStoreBackend,
+};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +60,12 @@ impl SessionStoreBackend for JsonlBackend {
         }
         ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         Ok(ids)
+    }
+
+    fn locate(&self, id: &SessionId) -> Option<SessionLocation> {
+        Some(SessionLocation::Jsonl {
+            path: self.path_for(id),
+        })
     }
 }
 

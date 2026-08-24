@@ -195,6 +195,10 @@ pub trait Agent: Send + Sync {
     }
     /// Cancel the active turn.
     fn cancel(&self, cause: AgentCancelCause);
+    /// Whether `cancel` has already won for this agent.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
     /// Resolve after quiescence.
     async fn when_idle(&self);
     /// Drive until idle (used by the loop implementation).

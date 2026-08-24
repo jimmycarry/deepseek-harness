@@ -2,24 +2,32 @@
 
 use async_trait::async_trait;
 use dsh_cordis::Service;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// Prefix of every managed `DSH_*` environment key.
+pub const DSH_ENV_PREFIX: &str = "DSH_";
+
 /// Resolved shell spec.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ShellSpec {
     /// Command string.
     pub command: String,
     /// Working directory.
     pub cwd: Option<String>,
+    /// Trusted managed environment overlay. `None` means inherit ambient `DSH_*`.
+    pub dsh_env: Option<BTreeMap<String, String>>,
 }
 
 /// Shell request before resolve.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ShellRequest {
     /// Command string.
     pub command: String,
     /// Optional cwd.
     pub cwd: Option<String>,
+    /// Trusted managed environment overlay.
+    pub dsh_env: Option<BTreeMap<String, String>>,
 }
 
 /// Explicit resolve.
@@ -27,6 +35,7 @@ pub fn resolve(request: ShellRequest) -> ShellSpec {
     ShellSpec {
         command: request.command,
         cwd: request.cwd,
+        dsh_env: request.dsh_env,
     }
 }
 

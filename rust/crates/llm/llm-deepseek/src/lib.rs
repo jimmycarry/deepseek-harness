@@ -6,9 +6,131 @@ use dsh_llm::{
     LlmRequest, Message, StreamChunk,
 };
 use futures::stream::{self, BoxStream};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// Positive context capacity used when a catalog entry has none (TypeScript default).
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 1_000_000;
+
+/// One advisory catalog entry used by `resolve_model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogModel {
+    /// Wire model id.
+    pub id: String,
+    /// Combined request/response context when configured.
+    pub context_window: Option<u32>,
+}
+
+/// Default V4 Flash / Pro / Flash-Vision catalog.
+pub fn default_models() -> Vec<CatalogModel> {
+    vec![
+        CatalogModel {
+            id: "deepseek-v4-flash".into(),
+            context_window: Some(DEFAULT_CONTEXT_WINDOW),
+        },
+        CatalogModel {
+            id: "deepseek-v4-pro".into(),
+            context_window: Some(DEFAULT_CONTEXT_WINDOW),
+        },
+        CatalogModel {
+            id: "deepseek-v4-flash-vision-exp".into(),
+            context_window: Some(DEFAULT_CONTEXT_WINDOW),
+        },
+    ]
+}
+
+/// Validate `defaultContextWindow` and `models` from plugin config or a settings section.
+///
+/// # Errors
+/// A non-positive `defaultContextWindow`, a non-array `models` value, an empty or
+/// duplicate catalog id, or a non-positive per-model `contextWindow`.
+pub fn resolve_catalog(config: Option<&Value>) -> Result<(u32, Vec<CatalogModel>), String> {
+    let default_context_window = match config.and_then(|value| value.get("defaultContextWindow")) {
+        None => DEFAULT_CONTEXT_WINDOW,
+        Some(value) => positive_u32(value).ok_or_else(|| {
+            "llm-deepseek: defaultContextWindow must be a positive integer".to_string()
+        })?,
+    };
+    let models = match config.and_then(|value| value.get("models")) {
+        None => default_models(),
+        Some(value) => resolve_models(value)?,
+    };
+    Ok((default_context_window, models))
+}
+
+/// Context capacity for `model`: exact catalog value, else `default_context_window`.
+pub fn context_window_for(model: &str, default_context_window: u32, models: &[CatalogModel]) -> u32 {
+    models
+        .iter()
+        .find(|entry| entry.id == model)
+        .and_then(|entry| entry.context_window)
+        .unwrap_or(default_context_window)
+}
+
+fn resolve_models(value: &Value) -> Result<Vec<CatalogModel>, String> {
+    let Some(items) = value.as_array() else {
+        return Err("llm-deepseek: models must be an array".into());
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut models = Vec::with_capacity(items.len());
+    for item in items {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            return Err("llm-deepseek: catalog model ids must be non-empty".into());
+        }
+        if !seen.insert(id.clone()) {
+            return Err(format!("llm-deepseek: duplicate catalog model \"{id}\""));
+        }
+        let context_window = match item.get("contextWindow") {
+            None => None,
+            Some(value) => Some(positive_u32(value).ok_or_else(|| {
+                format!(
+                    "llm-deepseek: catalog model \"{id}\" contextWindow must be a positive integer"
+                )
+            })?),
+        };
+        models.push(CatalogModel { id, context_window });
+    }
+    Ok(models)
+}
+
+fn positive_u32(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .filter(|number| *number > 0)
+}
+
+fn overlay_section(plugin: Option<&Value>, settings: Option<&Value>) -> Value {
+    let mut map = match plugin {
+        Some(Value::Object(map)) => map.clone(),
+        _ => Map::new(),
+    };
+    if let Some(Value::Object(section)) = settings {
+        for (key, value) in section {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(map)
+}
+
+/// Layer a live `llm-deepseek` settings section over plugin config.
+pub fn merge_connection_config(plugin: Option<&Value>, settings: Option<&Value>) -> Value {
+    overlay_section(plugin, settings)
+}
+
+fn catalog_error(message: String) -> LlmError {
+    LlmError::Failure(LlmFailure {
+        message,
+        code: "CONFIG".into(),
+        status: None,
+    })
+}
 
 /// DeepSeek chat adapter.
 pub struct DeepSeekAdapter {
@@ -79,9 +201,11 @@ impl LlmAdapter for DeepSeekAdapter {
         provider: &str,
         model: &str,
     ) -> Result<LlmResolvedModelInfo, LlmError> {
+        let (default_window, models) =
+            resolve_catalog(None).map_err(catalog_error)?;
         Ok(LlmResolvedModelInfo {
             context: Some(LlmModelContext {
-                context_window: 1_000_000,
+                context_window: context_window_for(model, default_window, &models),
             }),
             ..LlmResolvedModelInfo::identity(provider, model)
         })
@@ -307,5 +431,53 @@ mod tests {
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /chat/completions HTTP/1.1"));
         assert!(request.contains("Authorization: Bearer test-key"));
+    }
+
+    #[test]
+    fn default_catalog_windows_and_settings_overrides() {
+        let (default_window, models) = resolve_catalog(None).unwrap();
+        assert_eq!(default_window, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(
+            context_window_for("deepseek-v4-flash", default_window, &models),
+            DEFAULT_CONTEXT_WINDOW
+        );
+        assert_eq!(
+            context_window_for("unlisted-pass-through", default_window, &models),
+            DEFAULT_CONTEXT_WINDOW
+        );
+        let (default_window, models) = resolve_catalog(Some(&json!({
+            "defaultContextWindow": 256_000,
+            "models": [
+                { "id": "private-fast", "contextWindow": 32_000 },
+                { "id": "inherits-default" }
+            ]
+        })))
+        .unwrap();
+        assert_eq!(default_window, 256_000);
+        assert_eq!(
+            context_window_for("private-fast", default_window, &models),
+            32_000
+        );
+        assert_eq!(
+            context_window_for("inherits-default", default_window, &models),
+            256_000
+        );
+        assert_eq!(
+            context_window_for("unlisted-pass-through", default_window, &models),
+            256_000
+        );
+        let err = resolve_catalog(Some(&json!({ "defaultContextWindow": 0 }))).unwrap_err();
+        assert!(err.contains("defaultContextWindow must be a positive integer"), "{err}");
+        let err = resolve_catalog(Some(&json!({
+            "models": [{ "id": "m", "contextWindow": 0 }]
+        })))
+        .unwrap_err();
+        assert!(err.contains("contextWindow must be a positive integer"), "{err}");
+        let merged = merge_connection_config(
+            Some(&json!({ "defaultContextWindow": 1000, "baseURL": "https://plugin.test" })),
+            Some(&json!({ "defaultContextWindow": 2000 })),
+        );
+        assert_eq!(merged["defaultContextWindow"], 2000);
+        assert_eq!(merged["baseURL"], "https://plugin.test");
     }
 }

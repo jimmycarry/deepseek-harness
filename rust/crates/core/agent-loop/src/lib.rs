@@ -578,6 +578,10 @@ impl Agent for LoopAgent {
         }
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
     async fn when_idle(&self) {
         loop {
             if self.status() == AgentStatus::Idle && !self.inbox.has_pending() {

@@ -13,6 +13,7 @@ use dsh_llm::{
     MessageSource, StreamChunk, UserMessage,
 };
 use dsh_session::{session_id, derive_event_message, Session, SessionEventData, SurfaceOp};
+use dsh_session_persistence::PersistenceRuntime;
 use dsh_token_meter::TokenMeter;
 use futures::executor::block_on;
 use futures::StreamExt;
@@ -742,7 +743,8 @@ impl BasicCompactionEngine {
                 },
                 None,
             )
-            .ok();
+            .map_err(|_| ManualCompactionError::Commit)?;
+        let snapshot = session.surface().nodes;
         let shadowed_token_count = self
             .meter
             .as_ref()
@@ -767,17 +769,12 @@ impl BasicCompactionEngine {
         {
             Ok(summarized) => summarized,
             Err(error) => {
-                session
-                    .append(
-                        SessionEventData::CompactionEnd {
-                            compaction_id,
-                            source_command_id,
-                            turn: None,
-                            error: Some(error),
-                        },
-                        None,
-                    )
-                    .ok();
+                close_failed(
+                    &session,
+                    compaction_id,
+                    source_command_id,
+                    error,
+                )?;
                 return Err(ManualCompactionError::Summary);
             }
         };
@@ -791,19 +788,32 @@ impl BasicCompactionEngine {
                 let error = format!(
                     "summary is not smaller than the shadowed content ({framed_tokens} estimated framed tokens >= {shadowed_token_count})"
                 );
-                session
-                    .append(
-                        SessionEventData::CompactionEnd {
-                            compaction_id,
-                            source_command_id,
-                            turn: None,
-                            error: Some(error),
-                        },
-                        None,
-                    )
-                    .ok();
+                close_failed(
+                    &session,
+                    compaction_id,
+                    source_command_id,
+                    error,
+                )?;
                 return Err(ManualCompactionError::Summary);
             }
+        }
+        if agent.is_cancelled() {
+            close_failed(
+                &session,
+                compaction_id,
+                source_command_id,
+                "manual compaction was cancelled".into(),
+            )?;
+            return Err(ManualCompactionError::Cancelled);
+        }
+        if session.surface().nodes != snapshot {
+            close_failed(
+                &session,
+                compaction_id,
+                source_command_id,
+                "the compacted history changed during manual compaction".into(),
+            )?;
+            return Err(ManualCompactionError::Changed);
         }
         let summary_event = session
             .append(
@@ -823,15 +833,11 @@ impl BasicCompactionEngine {
                 },
                 None,
             )
-            .ok();
+            .map_err(|_| ManualCompactionError::Commit)?;
         let summary = framed;
         let mut cited: Vec<u64> = Vec::new();
-        if let Some(event) = &start_event {
-            cited.push(event.seq);
-        }
-        if let Some(event) = &summary_event {
-            cited.push(event.seq);
-        }
+        cited.push(start_event.seq);
+        cited.push(summary_event.seq);
         cited.extend(shadowed.iter().copied());
         session
             .append_cited(
@@ -849,7 +855,7 @@ impl BasicCompactionEngine {
                 SurfaceOp::Replace { start, end },
                 cited,
             )
-            .ok();
+            .map_err(|_| ManualCompactionError::Commit)?;
         session
             .append(
                 SessionEventData::CompactionEnd {
@@ -860,14 +866,39 @@ impl BasicCompactionEngine {
                 },
                 None,
             )
-            .ok();
+            .map_err(|_| ManualCompactionError::Commit)?;
+        if let Some(persistence) = self.lookup.get::<PersistenceRuntime>() {
+            if persistence.save(session.as_ref()).await.is_err() {
+                return Err(ManualCompactionError::Persistence);
+            }
+        }
         Ok(Some(CompactionResult {
             shadowed_seqs: shadowed,
             shadowed_token_count,
             summary,
-            summary_seq: summary_event.map(|event| event.seq).unwrap_or(0),
+            summary_seq: summary_event.seq,
         }))
     }
+}
+
+fn close_failed(
+    session: &Session,
+    compaction_id: String,
+    source_command_id: Option<String>,
+    error: String,
+) -> Result<(), ManualCompactionError> {
+    session
+        .append(
+            SessionEventData::CompactionEnd {
+                compaction_id,
+                source_command_id,
+                turn: None,
+                error: Some(error),
+            },
+            None,
+        )
+        .map(|_| ())
+        .map_err(|_| ManualCompactionError::Commit)
 }
 
 fn missing_capacity(target: &str) -> ManualCompactionError {
@@ -1213,6 +1244,7 @@ mod tests {
         last: Mutex<Option<LlmRequest>>,
         fail: bool,
         context_window: Option<u32>,
+        during: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
 
     #[async_trait]
@@ -1225,6 +1257,9 @@ mod tests {
             LlmError,
         > {
             *self.last.lock().expect("last") = Some(request);
+            if let Some(hook) = self.during.lock().expect("during").take() {
+                hook();
+            }
             if self.fail {
                 return Err(LlmError::Failure(LlmFailure {
                     message: "summarizer boom".into(),
@@ -1260,6 +1295,7 @@ mod tests {
             last: Mutex::new(None),
             fail: false,
             context_window,
+            during: Mutex::new(None),
         });
         let engine = BasicCompactionEngine {
             policy: CompactionPolicy::resolve(Some(&serde_json::json!({
@@ -1282,6 +1318,17 @@ mod tests {
     struct StubAgent {
         session: Arc<Session>,
         inbox: Arc<Inbox>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StubAgent {
+        fn new(session: Arc<Session>) -> Self {
+            Self {
+                session,
+                inbox: Arc::new(Inbox::default()),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
     }
 
     #[async_trait]
@@ -1299,7 +1346,13 @@ mod tests {
             AgentStatus::Idle
         }
         fn send(&self, _: dsh_llm::UserMessage, _: InboxTarget, _: bool) {}
-        fn cancel(&self, _: AgentCancelCause) {}
+        fn cancel(&self, _: AgentCancelCause) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        }
         async fn when_idle(&self) {}
         async fn run(&self) -> Result<(), AgentError> {
             Ok(())
@@ -1330,10 +1383,7 @@ mod tests {
     #[tokio::test]
     async fn replace_removes_shadowed_nodes_from_derive() {
         let session = compactable_session("c");
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let (engine, adapter) = scripted_engine("condensed checkpoint");
         let result = engine.compact_now(&agent, None).await.unwrap().unwrap();
         let request = adapter.last.lock().expect("last").clone().expect("request");
@@ -1411,10 +1461,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let engine = BasicCompactionEngine::new(CompactionPolicy::resolve(None).unwrap());
         let err = engine.compact_now(&agent, None).await.unwrap_err();
         assert!(matches!(err, ManualCompactionError::Busy));
@@ -1424,10 +1471,7 @@ mod tests {
 
     impl AgentFactory for StubFactory {
         fn create(&self, session: Arc<Session>) -> Arc<dyn Agent> {
-            Arc::new(StubAgent {
-                session,
-                inbox: Arc::new(Inbox::default()),
-            })
+            Arc::new(StubAgent::new(session))
         }
     }
 
@@ -1443,6 +1487,7 @@ mod tests {
             last: Mutex::new(None),
             fail: false,
             context_window: None,
+            during: Mutex::new(None),
         });
         ctx.provide(Arc::new(LlmRuntime::new(
             Arc::clone(&adapter) as Arc<dyn LlmAdapter>,
@@ -1705,10 +1750,7 @@ mod tests {
         for text in ["aaaa", "bbbb", "cccc", "dddd"] {
             append_user(&session, text);
         }
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let engine = BasicCompactionEngine {
             policy: CompactionPolicy::resolve(Some(&serde_json::json!({
                 "thresholdRatio": 0.1,
@@ -1746,10 +1788,7 @@ mod tests {
         for text in ["aaaa", "bbbb", "cccc", "dddd"] {
             append_user(&session, text);
         }
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let (engine, _) = scripted_engine("ok");
         let err = engine
             .compact_if_needed(&agent, CompactionTrigger::Pressure)
@@ -1783,10 +1822,7 @@ mod tests {
         for label in ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"] {
             append_user(&session, &bulky(label));
         }
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let (mut engine, _) = scripted_engine_with_window("ok", Some(500));
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.5,
@@ -1809,15 +1845,13 @@ mod tests {
         for text in ["a", "b", "c", "d"] {
             append_user(&session, text);
         }
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let adapter = Arc::new(ScriptedSummarizer {
             text: String::new(),
             last: Mutex::new(None),
             fail: true,
             context_window: None,
+            during: Mutex::new(None),
         });
         let engine = BasicCompactionEngine {
             policy: CompactionPolicy::resolve(Some(&serde_json::json!({
@@ -1865,10 +1899,7 @@ mod tests {
         append_user(&session, "a");
         append_user(&session, "b");
         append_user(&session, "c");
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let verbose = (0..80)
             .map(|index| format!("verbose {index}"))
             .collect::<Vec<_>>()
@@ -1916,10 +1947,7 @@ mod tests {
         for label in ["alpha", "bravo", "charlie", "delta"] {
             append_user(&session, &bulky(label));
         }
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let (mut engine, adapter) = scripted_engine_with_window("policy summary", Some(2000));
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.95,
@@ -2002,10 +2030,7 @@ mod tests {
         append_user(&session, &bulky("alpha"));
         append_user(&session, &bulky("bravo"));
         append_closed_tool_step(&session, "c1");
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let (engine, _) = scripted_engine("ok");
         let result = engine.compact_now(&agent, None).await.unwrap().unwrap();
         let messages = session.derive_messages();
@@ -2058,10 +2083,7 @@ mod tests {
         for label in ["alpha", "bravo", "charlie", "delta"] {
             append_user(&session, &bulky(label));
         }
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let (mut engine, _) = scripted_engine_with_window("ok", Some(100));
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.3,
@@ -2099,10 +2121,7 @@ mod tests {
             )
             .unwrap();
         append_user(&session, &bulky("alpha"));
-        let agent = StubAgent {
-            session: Arc::clone(&session),
-            inbox: Arc::new(Inbox::default()),
-        };
+        let agent = StubAgent::new(Arc::clone(&session));
         let (mut engine, _) = scripted_engine_with_window("ok", Some(1000));
         engine.policy = CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.5,
@@ -2124,5 +2143,94 @@ mod tests {
             }
             other => panic!("expected PressureConfig, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn abort_when_the_agent_is_cancelled_during_summary() {
+        let session = compactable_session("cancel");
+        let agent = StubAgent::new(Arc::clone(&session));
+        let (engine, adapter) = scripted_engine("ok");
+        *adapter.during.lock().expect("during") = Some(Arc::new({
+            let cancelled = Arc::clone(&agent.cancelled);
+            move || cancelled.store(true, std::sync::atomic::Ordering::SeqCst)
+        }));
+        let err = engine.compact_now(&agent, None).await.unwrap_err();
+        assert!(matches!(err, ManualCompactionError::Cancelled));
+        assert!(session
+            .derive_messages()
+            .iter()
+            .any(|message| match message {
+                Message::User(user) => user
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))),
+                _ => false,
+            }));
+    }
+
+    #[tokio::test]
+    async fn abort_when_the_surface_changes_during_summary() {
+        let session = compactable_session("changed");
+        let agent = StubAgent::new(Arc::clone(&session));
+        let (engine, adapter) = scripted_engine("ok");
+        *adapter.during.lock().expect("during") = Some(Arc::new({
+            let session = Arc::clone(&session);
+            move || append_user(&session, "late arrival")
+        }));
+        let err = engine.compact_now(&agent, None).await.unwrap_err();
+        assert!(matches!(err, ManualCompactionError::Changed));
+        assert!(session
+            .derive_messages()
+            .iter()
+            .any(|message| match message {
+                Message::User(user) => user
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))),
+                _ => false,
+            }));
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_after_a_successful_replacement() {
+        let session = compactable_session("persist");
+        let agent = StubAgent::new(Arc::clone(&session));
+        let (mut engine, _) = scripted_engine("ok");
+        struct FailSave;
+        #[async_trait]
+        impl dsh_session_persistence::SessionStoreBackend for FailSave {
+            async fn save(
+                &self,
+                _: &Session,
+            ) -> std::result::Result<(), dsh_session_persistence::PersistenceError> {
+                Err(dsh_session_persistence::PersistenceError::Format(
+                    "disk full".into(),
+                ))
+            }
+            async fn load(
+                &self,
+                _: &dsh_session::SessionId,
+            ) -> std::result::Result<Session, dsh_session_persistence::PersistenceError> {
+                Err(dsh_session_persistence::PersistenceError::Format("nope".into()))
+            }
+            async fn list_ids(
+                &self,
+            ) -> std::result::Result<Vec<dsh_session::SessionId>, dsh_session_persistence::PersistenceError>
+            {
+                Ok(Vec::new())
+            }
+        }
+        engine
+            .lookup
+            .provide(Arc::new(dsh_session_persistence::PersistenceRuntime::new(
+                Arc::new(FailSave),
+            )))
+            .unwrap();
+        let err = engine.compact_now(&agent, None).await.unwrap_err();
+        assert!(matches!(err, ManualCompactionError::Persistence));
+        assert!(session
+            .events()
+            .iter()
+            .any(|event| matches!(event.data, SessionEventData::CompactionSummary { .. })));
     }
 }

@@ -23,6 +23,7 @@ members = [
   "crates/sandbox/sandbox",
   "crates/sandbox/sandbox-local",
   "crates/shell/shell",
+  "crates/shell/shell-env",
   "crates/shell/bash-local",
   "crates/shell/bash-sandbox",
   "crates/shell/tool-bash",
@@ -155,6 +156,7 @@ dsh-subprocess-local = { path = "crates/subprocess/subprocess-local" }
 dsh-sandbox = { path = "crates/sandbox/sandbox" }
 dsh-sandbox-local = { path = "crates/sandbox/sandbox-local" }
 dsh-shell = { path = "crates/shell/shell" }
+dsh-shell-env = { path = "crates/shell/shell-env" }
 dsh-bash-local = { path = "crates/shell/bash-local" }
 dsh-bash-sandbox = { path = "crates/shell/bash-sandbox" }
 dsh-tool-bash = { path = "crates/shell/tool-bash" }

@@ -91,10 +91,22 @@ impl CompactHandler {
                 "Compaction is unavailable because this process has an active compaction, or the agent is not idle."
                     .into(),
             ),
+            Err(ManualCompactionError::Cancelled) => Err("Compaction cancelled.".into()),
+            Err(ManualCompactionError::Changed) => Err(
+                "The history selected for compaction changed before it could be replaced. The conversation is unchanged; the attempt is recorded in the session log."
+                    .into(),
+            ),
             Err(ManualCompactionError::NoRange) => Ok(("No compactable history yet.".into(), None)),
             Err(ManualCompactionError::Summary) => Err(
                 "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."
                     .into(),
+            ),
+            Err(ManualCompactionError::Commit) => Err(
+                "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying."
+                    .into(),
+            ),
+            Err(ManualCompactionError::Persistence) => Err(
+                "Compaction finished, but the session could not be saved.".into(),
             ),
             Err(error @ ManualCompactionError::StillAbove { .. })
             | Err(error @ ManualCompactionError::PressureConfig { .. }) => {
@@ -276,5 +288,99 @@ mod tests {
             })
             .collect();
         assert_eq!(types, vec!["command/run".to_string(), "command/done".to_string()]);
+    }
+
+    struct CodedEngine(ManualCompactionError);
+
+    impl CodedEngine {
+        fn clone_error(&self) -> ManualCompactionError {
+            match &self.0 {
+                ManualCompactionError::Busy => ManualCompactionError::Busy,
+                ManualCompactionError::Cancelled => ManualCompactionError::Cancelled,
+                ManualCompactionError::Changed => ManualCompactionError::Changed,
+                ManualCompactionError::NoRange => ManualCompactionError::NoRange,
+                ManualCompactionError::Summary => ManualCompactionError::Summary,
+                ManualCompactionError::Commit => ManualCompactionError::Commit,
+                ManualCompactionError::Persistence => ManualCompactionError::Persistence,
+                ManualCompactionError::StillAbove {
+                    attempts,
+                    tokens,
+                    threshold,
+                } => ManualCompactionError::StillAbove {
+                    attempts: *attempts,
+                    tokens: *tokens,
+                    threshold: *threshold,
+                },
+                ManualCompactionError::PressureConfig { target, message } => {
+                    ManualCompactionError::PressureConfig {
+                        target: target.clone(),
+                        message: message.clone(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CompactionEngine for CodedEngine {
+        async fn compact_if_needed(
+            &self,
+            _: &dyn Agent,
+            _: CompactionTrigger,
+        ) -> Result<Option<CompactionResult>, ManualCompactionError> {
+            Err(self.clone_error())
+        }
+
+        async fn compact_now(
+            &self,
+            _: &dyn Agent,
+            _: Option<&str>,
+        ) -> Result<Option<CompactionResult>, ManualCompactionError> {
+            Err(self.clone_error())
+        }
+    }
+
+    async fn dispatch_error(error: ManualCompactionError) -> String {
+        let ctx = Context::new();
+        let commands = Arc::new(CommandRegistry::new());
+        ctx.provide(Arc::clone(&commands)).unwrap();
+        ctx.provide(Arc::new(CompactionRuntime::new(Arc::new(CodedEngine(error)))))
+            .unwrap();
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        ctx.provide(Arc::new(agents)).unwrap();
+        install(&ctx).unwrap();
+        let session = Arc::new(Session::new(session_id("err")));
+        let _handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(Arc::clone(&session))
+            .unwrap();
+        commands
+            .execute(session.as_ref(), "/compact")
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+    }
+
+    #[tokio::test]
+    async fn maps_expected_failures_to_user_sentences() {
+        assert_eq!(
+            dispatch_error(ManualCompactionError::Cancelled).await,
+            "Compaction cancelled."
+        );
+        assert_eq!(
+            dispatch_error(ManualCompactionError::Changed).await,
+            "The history selected for compaction changed before it could be replaced. The conversation is unchanged; the attempt is recorded in the session log."
+        );
+        assert_eq!(
+            dispatch_error(ManualCompactionError::Commit).await,
+            "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying."
+        );
+        assert_eq!(
+            dispatch_error(ManualCompactionError::Persistence).await,
+            "Compaction finished, but the session could not be saved."
+        );
     }
 }
