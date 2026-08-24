@@ -301,18 +301,22 @@ mod tests {
                 resolve: Arc::new(|_| BTreeMap::new()),
             })
             .unwrap();
-        let duplicate = registry.register(BashEnvContributor {
+        let Err(duplicate) = registry.register(BashEnvContributor {
             name: "second".into(),
             variables: BTreeMap::from([("DSH_SHARED".into(), "Second owner.".into())]),
             resolve: Arc::new(|_| BTreeMap::new()),
-        });
-        assert!(duplicate.unwrap_err().to_string().contains("DSH_SHARED"));
-        let reserved = registry.register(BashEnvContributor {
+        }) else {
+            panic!("expected duplicate key error");
+        };
+        assert!(duplicate.to_string().contains("DSH_SHARED"));
+        let Err(reserved) = registry.register(BashEnvContributor {
             name: "reserved-key".into(),
             variables: BTreeMap::from([("DSH_HOME".into(), "Reserved key.".into())]),
             resolve: Arc::new(|_| BTreeMap::new()),
-        });
-        assert!(reserved.unwrap_err().to_string().contains("reserved key"));
+        }) else {
+            panic!("expected reserved key error");
+        };
+        assert!(reserved.to_string().contains("reserved key"));
     }
 
     #[test]
