@@ -11,8 +11,8 @@ async-trait.workspace = true
 dsh-cordis.workspace = true
 dsh-fs.workspace = true
 dsh-fs-local.workspace = true
+dsh-sandbox.workspace = true
 dsh-sandbox-local.workspace = true
 
 [dev-dependencies]
-dsh-sandbox.workspace = true
 tokio.workspace = true

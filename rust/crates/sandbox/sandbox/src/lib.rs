@@ -8,8 +8,16 @@ use dsh_cordis::Service;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod escalation;
+
+pub use escalation::{
+    approve_escalation, escalation_audit_reason, escalation_hint_marker, sandbox_denial_marker,
+    validate_escalation_args, wider_modes, EscalationIngredients, EscalationRequest,
+    ESCALATION_TARGETS,
+};
+
 /// File-effect mode for one execution. Matches the TypeScript `SandboxMode` strings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
     /// Required sinks only (for example `/dev/null`).
     ReadOnly,

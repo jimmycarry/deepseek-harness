@@ -412,6 +412,7 @@ fn apply_tool_bash(ctx: &Context, config: Option<Value>) -> Result<()> {
     apply_shell(ctx)?;
     let tools = ensure_tools(ctx)?;
     let shell = ctx.service::<ShellRuntime>()?;
+    dsh_tool_bash::require_confining_policy(ctx, shell.as_ref()).map_err(CordisError::Validation)?;
     let resolved =
         dsh_tool_bash::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     let jobs = ctx.get::<dsh_jobs::JobRegistry>();
@@ -441,8 +442,12 @@ fn apply_tool_fs(ctx: &Context) -> Result<()> {
     let tools = ensure_tools(ctx)?;
     let fs = ctx.service::<FsRuntime>()?;
     tools.insert(Arc::new(ReadTool::new(Arc::clone(&fs), ctx.clone())));
-    tools.insert(Arc::new(WriteTool::new(Arc::clone(&fs), ctx.clone())));
-    tools.insert(Arc::new(EditTool::new(fs, ctx.clone())));
+    tools.insert(Arc::new(
+        WriteTool::try_new(Arc::clone(&fs), ctx.clone()).map_err(CordisError::Validation)?,
+    ));
+    tools.insert(Arc::new(
+        EditTool::try_new(fs, ctx.clone()).map_err(CordisError::Validation)?,
+    ));
     Ok(())
 }
 

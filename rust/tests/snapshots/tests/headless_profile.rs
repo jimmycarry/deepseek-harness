@@ -1449,10 +1449,103 @@ async fn permission_read_only_denies_write() {
         _ => "",
     };
     assert!(
-        denied_text.contains("file access denied under read-only mode"),
+        denied_text.contains("[sandbox: file access denied under read-only mode]"),
+        "{denied_text}"
+    );
+    assert!(
+        denied_text.contains("retry this exact operation once with sandbox_permissions"),
         "{denied_text}"
     );
     assert!(!path.exists(), "read-only write must not create the file");
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sandbox_escalation_grants_a_read_only_write() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "dsh-esc-write-{}-{}",
+            std::process::id(),
+            uuid_stamp()
+        ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = mount_profile_in(&dir, "unused", vec![]);
+    ctx.on_waterfall("approval/request", |_payload, _next| {
+        serde_json::json!("allowed-once")
+    })
+    .unwrap();
+    let session = ctx
+        .service::<SessionStore>()
+        .unwrap()
+        .create_in(Some(dir.to_string_lossy().into_owned()));
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(Arc::clone(&session))
+        .unwrap();
+    ctx.service::<PermissionPresetService>()
+        .unwrap()
+        .pin_initial(handle.agent.session().as_ref())
+        .unwrap();
+    let commands = ctx.service::<dsh_commands::CommandRegistry>().unwrap();
+    let switched = commands
+        .execute(handle.agent.session().as_ref(), "/permission read-only")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(switched.success, "{}", switched.text);
+    session
+        .append(SessionEventData::TurnStart { turn: 1 }, None)
+        .unwrap();
+    let path = dir.join("granted.txt");
+    let path_str = path.to_string_lossy().into_owned();
+    let tools = ctx.service::<ToolRuntime>().unwrap();
+    let missing = tools
+        .execute_for(
+            &ctx,
+            "write",
+            serde_json::json!({
+                "file_path": path_str,
+                "content": "secret",
+                "sandbox_permissions": "workspace-write"
+            }),
+            Some(handle.agent.session().id().as_str()),
+        )
+        .await
+        .unwrap();
+    let missing_text = match &missing.outcome.content[0] {
+        ContentBlock::Text { text } => text.as_str(),
+        _ => "",
+    };
+    assert!(
+        missing_text.contains("sandbox_permissions requires a justification"),
+        "{missing_text}"
+    );
+    assert!(!path.exists());
+    let granted = tools
+        .execute_for(
+            &ctx,
+            "write",
+            serde_json::json!({
+                "file_path": path_str,
+                "content": "secret",
+                "sandbox_permissions": "workspace-write",
+                "justification": "the snapshot needs a workspace write"
+            }),
+            Some(handle.agent.session().id().as_str()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !granted.outcome.is_error,
+        "{:?}",
+        granted.outcome.content
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
     drop(handle);
     let _ = std::fs::remove_dir_all(&dir);
 }

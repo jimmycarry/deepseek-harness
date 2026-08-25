@@ -9,6 +9,7 @@ use dsh_fs::{
     FsWritePolicy,
 };
 use dsh_fs_local::LocalFs;
+use dsh_sandbox::SandboxMode;
 use dsh_sandbox_local::allow_path;
 use std::sync::Arc;
 
@@ -55,7 +56,7 @@ impl SandboxedFs {
     ) -> std::result::Result<(), FsError> {
         match mode {
             "danger-full-access" => Ok(()),
-            "read-only" => Err(FsError::Denied(format!(
+            "read-only" => Err(FsError::sandbox_denied(format!(
                 "cannot write \"{}\": file access denied under read-only mode",
                 target.display_path
             ))),
@@ -63,7 +64,7 @@ impl SandboxedFs {
                 if allow_path(workspace_root, &target.target_key) {
                     Ok(())
                 } else {
-                    Err(FsError::Denied(format!(
+                    Err(FsError::sandbox_denied(format!(
                         "cannot write \"{}\": file access denied under workspace-write mode",
                         target.display_path
                     )))
@@ -134,10 +135,19 @@ impl FsProvider for SandboxedFs {
 
 /// Provide `ctx.fs` as the sandboxed local backend, replacing a prior mount.
 pub fn install(ctx: &Context, config: Config) -> Result<()> {
-    let runtime = Arc::new(FsRuntime::new(Arc::new(SandboxedFs::new(
-        config.mode,
-        config.workspace_root,
-    ))));
+    let mode = SandboxMode::parse(&config.mode).ok_or_else(|| {
+        dsh_cordis::CordisError::Validation(format!(
+            "fs-sandbox: unknown sandbox mode `{}`",
+            config.mode
+        ))
+    })?;
+    let runtime = Arc::new(
+        FsRuntime::new(Arc::new(SandboxedFs::new(
+            config.mode,
+            config.workspace_root,
+        )))
+        .with_sandbox_mode(mode),
+    );
     ctx.provide(runtime)
 }
 

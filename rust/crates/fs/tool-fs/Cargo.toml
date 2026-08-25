@@ -8,11 +8,16 @@ description = "Model-facing filesystem tools."
 
 [dependencies]
 async-trait.workspace = true
+dsh-agent.workspace = true
 dsh-cordis.workspace = true
 dsh-fs.workspace = true
+dsh-sandbox.workspace = true
 dsh-sandbox-policy.workspace = true
+dsh-session.workspace = true
 dsh-tools.workspace = true
+dsh-user-approval.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+dsh-llm.workspace = true
 tokio.workspace = true

@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use dsh_cordis::{Context, Service};
+use dsh_sandbox::SandboxMode;
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -42,6 +43,8 @@ pub enum FsErrorCode {
     StaleVersion,
     /// Target exists but is not a regular file.
     NotRegularFile,
+    /// The file-effect fence refused this mutation.
+    SandboxDenied,
 }
 
 impl FsErrorCode {
@@ -52,6 +55,7 @@ impl FsErrorCode {
             Self::NotObserved => "FS_NOT_OBSERVED",
             Self::StaleVersion => "FS_STALE_VERSION",
             Self::NotRegularFile => "FS_NOT_REGULAR_FILE",
+            Self::SandboxDenied => "FS_SANDBOX_DENIED",
         }
     }
 }
@@ -85,6 +89,14 @@ impl FsError {
     pub fn not_regular(message: impl Into<String>) -> Self {
         Self::Coded {
             code: FsErrorCode::NotRegularFile,
+            message: message.into(),
+        }
+    }
+
+    /// `FS_SANDBOX_DENIED`.
+    pub fn sandbox_denied(message: impl Into<String>) -> Self {
+        Self::Coded {
+            code: FsErrorCode::SandboxDenied,
             message: message.into(),
         }
     }
@@ -322,6 +334,7 @@ pub fn error_from_event(value: &Value) -> Option<FsError> {
         "FS_NOT_OBSERVED" => FsErrorCode::NotObserved,
         "FS_STALE_VERSION" => FsErrorCode::StaleVersion,
         "FS_NOT_REGULAR_FILE" => FsErrorCode::NotRegularFile,
+        "FS_SANDBOX_DENIED" => FsErrorCode::SandboxDenied,
         _ => return None,
     };
     Some(FsError::Coded { code, message })
@@ -391,12 +404,27 @@ pub trait FsProvider: Send + Sync {
 /// `ctx.fs`.
 pub struct FsRuntime {
     backend: std::sync::Arc<dyn FsProvider>,
+    sandbox_mode: Option<SandboxMode>,
 }
 
 impl FsRuntime {
     /// Wrap a backend.
     pub fn new(backend: std::sync::Arc<dyn FsProvider>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            sandbox_mode: None,
+        }
+    }
+
+    /// Record the backend's standing sandbox mode (the capability fact).
+    pub fn with_sandbox_mode(mut self, mode: SandboxMode) -> Self {
+        self.sandbox_mode = Some(mode);
+        self
+    }
+
+    /// Standing sandbox mode when the backend confines.
+    pub fn sandbox_mode(&self) -> Option<SandboxMode> {
+        self.sandbox_mode
     }
 
     /// `ctx.fs` as of this call, or `fallback` when the service is absent.

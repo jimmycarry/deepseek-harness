@@ -3,9 +3,11 @@
 use async_trait::async_trait;
 use dsh_cordis::Context;
 use dsh_fs::{
-    error_from_event, fs_event_payload, FsError, FsKind, FsObservation, FsObservationActor,
+    error_from_event, fs_event_payload, FsError, FsErrorCode, FsKind, FsObservation, FsObservationActor,
     FsRuntime, FsWriteIntent, FsWritePolicy, FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
 };
+use dsh_sandbox::{sandbox_denial_marker, SandboxMode};
+use dsh_sandbox_policy::SandboxPolicyService;
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome, ToolRuntime};
 use serde_json::Value;
 use std::path::Path;
@@ -231,6 +233,15 @@ impl StrReplaceEditorTool {
         }
     }
 
+    fn map_mutation_error(error: FsError, policy: Option<&FsWritePolicy>) -> String {
+        if error.code() == Some(FsErrorCode::SandboxDenied) {
+            if let Some(mode) = policy.and_then(|policy| SandboxMode::parse(&policy.mode)) {
+                return sandbox_denial_marker(mode);
+            }
+        }
+        error.remediate().to_string()
+    }
+
     fn fs(&self) -> Arc<FsRuntime> {
         FsRuntime::from_context(&self.ctx, &self.fallback)
     }
@@ -398,7 +409,7 @@ impl StrReplaceEditorTool {
         let outcome = fs
             .write_intended_with_policy(&target, &content, intent, policy.as_ref())
             .await
-            .map_err(|error| error.remediate().to_string())?;
+            .map_err(|error| Self::map_mutation_error(error, policy.as_ref()))?;
         self.observe(
             &target,
             FsObservation::Present {
@@ -450,7 +461,7 @@ impl StrReplaceEditorTool {
                 let outcome = fs
                     .write_intended_with_policy(&target, &after, intent, policy.as_ref())
                     .await
-                    .map_err(|error| error.remediate().to_string())?;
+                    .map_err(|error| Self::map_mutation_error(error, policy.as_ref()))?;
                 self.observe(
                     &target,
                     FsObservation::Present {
@@ -516,7 +527,7 @@ impl StrReplaceEditorTool {
         let outcome = fs
             .write_intended_with_policy(&target, &after.join("\n"), intent, policy.as_ref())
             .await
-            .map_err(|error| error.remediate().to_string())?;
+            .map_err(|error| Self::map_mutation_error(error, policy.as_ref()))?;
         self.observe(
             &target,
             FsObservation::Present {
@@ -639,6 +650,12 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<()> {
     let fs = ctx.service::<FsRuntime>().map_err(|_| {
         dsh_cordis::CordisError::Validation("tool-str-replace-editor requires ctx.fs".into())
     })?;
+    if fs.sandbox_mode().is_some() && ctx.get::<SandboxPolicyService>().is_none() {
+        return Err(dsh_cordis::CordisError::Validation(
+            "tool-str-replace-editor: the mounted filesystem confines but ctx.sandboxPolicy is missing"
+                .into(),
+        ));
+    }
     let tools = ctx.service::<ToolRuntime>().map_err(|_| {
         dsh_cordis::CordisError::Validation("tool-str-replace-editor requires ctx.tools".into())
     })?;
@@ -752,5 +769,19 @@ mod tests {
         install(&ctx, Config::resolve(None).unwrap()).unwrap();
         let tools = ctx.service::<ToolRuntime>().unwrap();
         assert!(tools.get("str_replace_editor").is_some());
+    }
+
+    #[test]
+    fn sandbox_denial_is_the_marker_without_a_hint() {
+        let policy = FsWritePolicy {
+            mode: "read-only".into(),
+            workspace_root: "/tmp".into(),
+        };
+        let text = StrReplaceEditorTool::map_mutation_error(
+            FsError::sandbox_denied("denied"),
+            Some(&policy),
+        );
+        assert_eq!(text, "[sandbox: file access denied under read-only mode]");
+        assert!(!text.contains("escalation available"));
     }
 }

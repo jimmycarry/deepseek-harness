@@ -625,6 +625,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
  "dsh-cordis",
+ "dsh-sandbox",
  "serde_json",
  "thiserror",
 ]
@@ -863,6 +864,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1256,13 +1258,19 @@ name = "dsh-tool-bash"
 version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
+ "dsh-agent",
  "dsh-cordis",
  "dsh-jobs",
+ "dsh-llm",
+ "dsh-sandbox",
  "dsh-sandbox-policy",
+ "dsh-session",
  "dsh-shell",
  "dsh-shell-env",
  "dsh-tools",
+ "dsh-user-approval",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1270,10 +1278,15 @@ name = "dsh-tool-fs"
 version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
+ "dsh-agent",
  "dsh-cordis",
  "dsh-fs",
+ "dsh-llm",
+ "dsh-sandbox",
  "dsh-sandbox-policy",
+ "dsh-session",
  "dsh-tools",
+ "dsh-user-approval",
  "serde_json",
  "tokio",
 ]
@@ -1387,6 +1400,7 @@ dependencies = [
  "dsh-fs",
  "dsh-fs-local",
  "dsh-llm",
+ "dsh-sandbox",
  "dsh-sandbox-local",
  "dsh-sandbox-policy",
  "dsh-tools",

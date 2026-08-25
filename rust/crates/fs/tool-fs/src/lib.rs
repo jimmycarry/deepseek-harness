@@ -1,21 +1,16 @@
-//! Model-facing `read`, `write`, and `edit` tools. Depends on the FS Service Definition only.
+//! Model-facing `read`, `write`, and `edit` tools.
+
+mod sandbox;
 
 use async_trait::async_trait;
 use dsh_cordis::Context;
 use dsh_fs::{
     error_from_event, fs_event_payload, FsObservation, FsObservationActor, FsRuntime, FsWriteIntent,
-    FsWritePolicy, FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
+    FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
 };
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome};
 use serde_json::{json, Value};
 use std::sync::Arc;
-
-fn write_policy(ctx: &Context, agent_id: Option<&str>) -> Option<FsWritePolicy> {
-    dsh_sandbox_policy::resolve_from_context(ctx, agent_id).map(|policy| FsWritePolicy {
-        mode: policy.mode.as_str().to_string(),
-        workspace_root: policy.workspace_root,
-    })
-}
 
 /// Default and maximum lines returned by one `read` call.
 pub const READ_LIMIT: usize = 2000;
@@ -131,15 +126,28 @@ impl Tool for ReadTool {
 pub struct WriteTool {
     fallback: Arc<FsRuntime>,
     ctx: Context,
+    sandbox: sandbox::FsSandboxController,
 }
 
 impl WriteTool {
     /// Bind to `ctx.fs` and the plugin context used for `fs/*` events.
+    ///
+    /// # Panics
+    /// A confining `ctx.fs` is already mounted and `ctx.sandboxPolicy` is missing.
     pub fn new(fs: Arc<FsRuntime>, ctx: Context) -> Self {
-        Self {
+        Self::try_new(fs, ctx).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Bind to `ctx.fs`, failing loud when a confining backend has no policy resolver.
+    ///
+    /// # Errors
+    /// `ctx.fs` confines and `ctx.sandboxPolicy` is missing.
+    pub fn try_new(fs: Arc<FsRuntime>, ctx: Context) -> Result<Self, String> {
+        Ok(Self {
+            sandbox: sandbox::FsSandboxController::new(ctx.clone(), Arc::clone(&fs))?,
             fallback: fs,
             ctx,
-        }
+        })
     }
 
     fn fs(&self) -> Arc<FsRuntime> {
@@ -161,12 +169,21 @@ impl Tool for WriteTool {
     }
 
     fn parameters(&self) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "file_path".into(),
+            json!({ "type": "string", "description": "Path to write, resolved by the filesystem backend." }),
+        );
+        properties.insert(
+            "content".into(),
+            json!({ "type": "string", "description": "Full UTF-8 text content to write." }),
+        );
+        if self.sandbox.advertises_escalation() {
+            properties.extend(self.sandbox.schema_fields());
+        }
         json!({
             "type": "object",
-            "properties": {
-                "file_path": { "type": "string", "description": "Path to write, resolved by the filesystem backend." },
-                "content": { "type": "string", "description": "Full UTF-8 text content to write." }
-            },
+            "properties": properties,
             "required": ["file_path", "content"]
         })
     }
@@ -186,6 +203,15 @@ impl Tool for WriteTool {
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
         let content = call.args.get("content").and_then(Value::as_str).unwrap_or("");
+        let policy = match self
+            .sandbox
+            .resolve_policy("write", &call.args, call.agent_id.as_deref())
+            .await
+        {
+            Ok(policy) => policy,
+            Err(message) => return Ok(ToolOutcome::error(message)),
+        };
+        let fence = policy.as_ref().map(sandbox::write_policy_from);
         let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
         let fs = self.fs();
         let target = match fs.resolve(&path).await {
@@ -208,12 +234,7 @@ impl Tool for WriteTool {
                 }
             });
         match fs
-            .write_intended_with_policy(
-                &target,
-                content,
-                intent,
-                write_policy(&self.ctx, call.agent_id.as_deref()).as_ref(),
-            )
+            .write_intended_with_policy(&target, content, intent, fence.as_ref())
             .await
         {
             Ok(outcome) => {
@@ -232,7 +253,9 @@ impl Tool for WriteTool {
                     outcome.operation,
                 )))
             }
-            Err(error) => Ok(ToolOutcome::error(error.remediate().to_string())),
+            Err(error) => Ok(ToolOutcome::error(
+                self.sandbox.map_error(error, policy.as_ref()).to_string(),
+            )),
         }
     }
 }
@@ -241,15 +264,28 @@ impl Tool for WriteTool {
 pub struct EditTool {
     fallback: Arc<FsRuntime>,
     ctx: Context,
+    sandbox: sandbox::FsSandboxController,
 }
 
 impl EditTool {
     /// Bind to `ctx.fs` and the plugin context used for `fs/*` events.
+    ///
+    /// # Panics
+    /// A confining `ctx.fs` is already mounted and `ctx.sandboxPolicy` is missing.
     pub fn new(fs: Arc<FsRuntime>, ctx: Context) -> Self {
-        Self {
+        Self::try_new(fs, ctx).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Bind to `ctx.fs`, failing loud when a confining backend has no policy resolver.
+    ///
+    /// # Errors
+    /// `ctx.fs` confines and `ctx.sandboxPolicy` is missing.
+    pub fn try_new(fs: Arc<FsRuntime>, ctx: Context) -> Result<Self, String> {
+        Ok(Self {
+            sandbox: sandbox::FsSandboxController::new(ctx.clone(), Arc::clone(&fs))?,
             fallback: fs,
             ctx,
-        }
+        })
     }
 
     fn fs(&self) -> Arc<FsRuntime> {
@@ -268,14 +304,29 @@ impl Tool for EditTool {
     }
 
     fn parameters(&self) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "file_path".into(),
+            json!({ "type": "string", "description": "Path to edit, resolved by the filesystem backend." }),
+        );
+        properties.insert(
+            "old_string".into(),
+            json!({ "type": "string", "description": "Literal text to replace. Must match exactly." }),
+        );
+        properties.insert(
+            "new_string".into(),
+            json!({ "type": "string", "description": "Literal replacement text. Use an empty string to delete the match." }),
+        );
+        properties.insert(
+            "replace_all".into(),
+            json!({ "type": "boolean", "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once." }),
+        );
+        if self.sandbox.advertises_escalation() {
+            properties.extend(self.sandbox.schema_fields());
+        }
         json!({
             "type": "object",
-            "properties": {
-                "file_path": { "type": "string", "description": "Path to edit, resolved by the filesystem backend." },
-                "old_string": { "type": "string", "description": "Literal text to replace. Must match exactly." },
-                "new_string": { "type": "string", "description": "Literal replacement text. Use an empty string to delete the match." },
-                "replace_all": { "type": "boolean", "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once." }
-            },
+            "properties": properties,
             "required": ["file_path", "old_string", "new_string"]
         })
     }
@@ -294,6 +345,15 @@ impl Tool for EditTool {
             Ok(input) => input,
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
+        let policy = match self
+            .sandbox
+            .resolve_policy("edit", &call.args, call.agent_id.as_deref())
+            .await
+        {
+            Ok(policy) => policy,
+            Err(message) => return Ok(ToolOutcome::error(message)),
+        };
+        let fence = policy.as_ref().map(sandbox::write_policy_from);
         let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
         let fs = self.fs();
         let target = match fs.resolve(&input.file_path).await {
@@ -328,12 +388,7 @@ impl Tool for EditTool {
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
         match fs
-            .write_intended_with_policy(
-                &target,
-                &after,
-                intent,
-                write_policy(&self.ctx, call.agent_id.as_deref()).as_ref(),
-            )
+            .write_intended_with_policy(&target, &after, intent, fence.as_ref())
             .await
         {
             Ok(outcome) => {
@@ -352,7 +407,9 @@ impl Tool for EditTool {
                     input.replace_all,
                 )))
             }
-            Err(error) => Ok(ToolOutcome::error(error.remediate().to_string())),
+            Err(error) => Ok(ToolOutcome::error(
+                self.sandbox.map_error(error, policy.as_ref()).to_string(),
+            )),
         }
     }
 }
@@ -619,6 +676,308 @@ mod tests {
         );
     }
 
+    fn text(outcome: &ToolOutcome) -> String {
+        match &outcome.content[0] {
+            dsh_llm::ContentBlock::Text { text } => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn confining_without_policy_fails_loud() {
+        let ctx = Context::new();
+        let fs = Arc::new(
+            FsRuntime::new(Arc::new(DummyFs)).with_sandbox_mode(dsh_sandbox::SandboxMode::ReadOnly),
+        );
+        ctx.provide(Arc::clone(&fs)).unwrap();
+        let err = match WriteTool::try_new(fs, ctx) {
+            Ok(_) => panic!("expected fail-loud without sandboxPolicy"),
+            Err(err) => err,
+        };
+        assert!(err.contains(
+            "tool-fs: the mounted filesystem confines but ctx.sandboxPolicy is missing"
+        ));
+    }
+
+    #[test]
+    fn advertises_no_escalation_fields_under_a_non_confining_backend() {
+        let ctx = Context::new();
+        let tool = WriteTool::new(dummy_fs(), ctx);
+        let parameters = tool.parameters();
+        let props = parameters["properties"].as_object().unwrap();
+        assert!(props.get("sandbox_permissions").is_none());
+        assert!(props.get("justification").is_none());
+    }
+
+    #[test]
+    fn advertises_closed_targets_under_a_confining_backend() {
+        let ctx = Context::new();
+        dsh_sandbox_policy::install(
+            &ctx,
+            Some(&json!({ "mode": "workspace-write", "workspaceRoot": "/tmp" })),
+        )
+        .unwrap();
+        let fs = Arc::new(
+            FsRuntime::new(Arc::new(DummyFs))
+                .with_sandbox_mode(dsh_sandbox::SandboxMode::WorkspaceWrite),
+        );
+        ctx.provide(Arc::clone(&fs)).unwrap();
+        let write = WriteTool::try_new(Arc::clone(&fs), ctx.clone()).unwrap();
+        let edit = EditTool::try_new(fs, ctx).unwrap();
+        for tool in [
+            write.parameters()["properties"].clone(),
+            edit.parameters()["properties"].clone(),
+        ] {
+            let enum_values = tool["sandbox_permissions"]["enum"].as_array().unwrap();
+            assert_eq!(
+                enum_values,
+                &vec![json!("workspace-write"), json!("danger-full-access")]
+            );
+            assert!(tool.get("justification").is_some());
+        }
+    }
+
+    #[test]
+    fn live_fs_after_install_advertises_escalation() {
+        let ctx = Context::new();
+        dsh_sandbox_policy::install(
+            &ctx,
+            Some(&json!({ "mode": "read-only", "workspaceRoot": "/tmp" })),
+        )
+        .unwrap();
+        let tool = WriteTool::new(dummy_fs(), ctx.clone());
+        assert!(tool.parameters()["properties"]
+            .as_object()
+            .unwrap()
+            .get("sandbox_permissions")
+            .is_none());
+        ctx.provide(Arc::new(
+            FsRuntime::new(Arc::new(DummyFs)).with_sandbox_mode(dsh_sandbox::SandboxMode::ReadOnly),
+        ))
+        .unwrap();
+        let parameters = tool.parameters();
+        let enum_values = parameters["properties"]["sandbox_permissions"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            enum_values,
+            &vec![json!("workspace-write"), json!("danger-full-access")]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_write_maps_to_marker_plus_hint() {
+        let ctx = Context::new();
+        dsh_sandbox_policy::install(
+            &ctx,
+            Some(&json!({ "mode": "workspace-write", "workspaceRoot": "/tmp" })),
+        )
+        .unwrap();
+        let backend = Arc::new(RecordingFs {
+            stamped: std::sync::Mutex::new(Vec::new()),
+            deny: std::sync::Mutex::new(true),
+        });
+        let fs = Arc::new(
+            FsRuntime::new(Arc::clone(&backend) as Arc<dyn dsh_fs::FsProvider>)
+                .with_sandbox_mode(dsh_sandbox::SandboxMode::WorkspaceWrite),
+        );
+        ctx.provide(Arc::clone(&fs)).unwrap();
+        let tool = WriteTool::try_new(fs, ctx).unwrap();
+        let outcome = tool
+            .execute_call(&ToolCall {
+                name: "write".into(),
+                args: json!({ "file_path": "a.txt", "content": "x" }),
+                agent_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.is_error);
+        let body = text(&outcome);
+        assert!(body.contains("[sandbox: file access denied under workspace-write mode]"));
+        assert!(body.contains("retry this exact operation once with sandbox_permissions"));
+    }
+
+    #[tokio::test]
+    async fn pairing_and_unadvertised_fields_fail_closed() {
+        let ctx = Context::new();
+        dsh_sandbox_policy::install(
+            &ctx,
+            Some(&json!({ "mode": "workspace-write", "workspaceRoot": "/tmp" })),
+        )
+        .unwrap();
+        let fs = Arc::new(
+            FsRuntime::new(Arc::new(DummyFs))
+                .with_sandbox_mode(dsh_sandbox::SandboxMode::WorkspaceWrite),
+        );
+        ctx.provide(Arc::clone(&fs)).unwrap();
+        let tool = WriteTool::try_new(fs, ctx.clone()).unwrap();
+        let missing = tool
+            .execute_call(&ToolCall {
+                name: "write".into(),
+                args: json!({
+                    "file_path": "a.txt",
+                    "content": "x",
+                    "sandbox_permissions": "workspace-write"
+                }),
+                agent_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(text(&missing).contains("sandbox_permissions requires a justification"));
+
+        let plain = WriteTool::new(dummy_fs(), Context::new());
+        let unadvertised = plain
+            .execute_call(&ToolCall {
+                name: "write".into(),
+                args: json!({
+                    "file_path": "a.txt",
+                    "content": "x",
+                    "sandbox_permissions": "workspace-write",
+                    "justification": "why"
+                }),
+                agent_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(text(&unadvertised).contains("not available in this composition"));
+    }
+
+    #[tokio::test]
+    async fn escalation_without_approval_or_agent_fails_closed() {
+        let ctx = Context::new();
+        dsh_sandbox_policy::install(
+            &ctx,
+            Some(&json!({ "mode": "workspace-write", "workspaceRoot": "/tmp" })),
+        )
+        .unwrap();
+        let fs = Arc::new(
+            FsRuntime::new(Arc::new(DummyFs))
+                .with_sandbox_mode(dsh_sandbox::SandboxMode::WorkspaceWrite),
+        );
+        ctx.provide(Arc::clone(&fs)).unwrap();
+        let tool = WriteTool::try_new(Arc::clone(&fs), ctx.clone()).unwrap();
+        let args = json!({
+            "file_path": "a.txt",
+            "content": "x",
+            "sandbox_permissions": "danger-full-access",
+            "justification": "why"
+        });
+        let without_service = tool
+            .execute_call(&ToolCall {
+                name: "write".into(),
+                args: args.clone(),
+                agent_id: Some("sess-fs-esc".into()),
+            })
+            .await
+            .unwrap();
+        assert!(text(&without_service).contains("no approval service is composed"));
+
+        dsh_user_approval::install(&ctx, Some(&json!({ "policy": "ask" }))).unwrap();
+        let tool = WriteTool::try_new(fs, ctx).unwrap();
+        let without_agent = tool
+            .execute_call(&ToolCall {
+                name: "write".into(),
+                args,
+                agent_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(text(&without_agent).contains("no agent to route it through"));
+    }
+
+    #[tokio::test]
+    async fn approved_escalation_stamps_the_granted_mode() {
+        use dsh_agent::{
+            Agent, AgentCancelCause, AgentError, AgentFactory, AgentRegistry, AgentStatus, Inbox,
+            InboxTarget,
+        };
+        use dsh_session::{Session, SessionEventData, SessionStore};
+
+        struct StubAgent {
+            session: Arc<Session>,
+            inbox: Arc<Inbox>,
+        }
+        #[async_trait]
+        impl Agent for StubAgent {
+            fn id(&self) -> &dsh_session::SessionId {
+                self.session.id()
+            }
+            fn session(&self) -> Arc<Session> {
+                Arc::clone(&self.session)
+            }
+            fn inbox(&self) -> Arc<Inbox> {
+                Arc::clone(&self.inbox)
+            }
+            fn status(&self) -> AgentStatus {
+                AgentStatus::Idle
+            }
+            fn send(&self, _: dsh_llm::UserMessage, _: InboxTarget, _: bool) {}
+            fn cancel(&self, _: AgentCancelCause) {}
+            async fn when_idle(&self) {}
+            async fn run(&self) -> Result<(), AgentError> {
+                Ok(())
+            }
+        }
+        struct StubFactory;
+        impl AgentFactory for StubFactory {
+            fn create(&self, session: Arc<Session>) -> Arc<dyn Agent> {
+                Arc::new(StubAgent {
+                    inbox: Arc::new(Inbox::for_session(Arc::clone(&session))),
+                    session,
+                })
+            }
+        }
+
+        let ctx = Context::new();
+        dsh_sandbox_policy::install(
+            &ctx,
+            Some(&json!({ "mode": "read-only", "workspaceRoot": "/tmp" })),
+        )
+        .unwrap();
+        dsh_user_approval::install(&ctx, Some(&json!({ "policy": "ask" }))).unwrap();
+        ctx.on_waterfall("approval/request", |_payload, _next| json!("allowed-once"))
+            .unwrap();
+        let backend = Arc::new(RecordingFs {
+            stamped: std::sync::Mutex::new(Vec::new()),
+            deny: std::sync::Mutex::new(false),
+        });
+        let fs = Arc::new(
+            FsRuntime::new(Arc::clone(&backend) as Arc<dyn dsh_fs::FsProvider>)
+                .with_sandbox_mode(dsh_sandbox::SandboxMode::ReadOnly),
+        );
+        ctx.provide(Arc::clone(&fs)).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        ctx.service::<AgentRegistry>()
+            .unwrap()
+            .set_factory(Arc::new(StubFactory));
+        let session = SessionStore::new().create_in(Some("/session-project".into()));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(Arc::clone(&session))
+            .unwrap();
+        let tool = WriteTool::try_new(fs, ctx).unwrap();
+        let outcome = tool
+            .execute_call(&ToolCall {
+                name: "write".into(),
+                args: json!({
+                    "file_path": "a.txt",
+                    "content": "x",
+                    "sandbox_permissions": "workspace-write",
+                    "justification": "the test needs it"
+                }),
+                agent_id: Some(handle.agent.session().id().as_str().to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.is_error, "{}", text(&outcome));
+        let stamped = backend.stamped.lock().expect("stamped").clone();
+        assert_eq!(stamped, vec![Some("workspace-write".to_string())]);
+    }
+
     fn dummy_fs() -> Arc<FsRuntime> {
         Arc::new(FsRuntime::new(Arc::new(DummyFs)))
     }
@@ -658,6 +1017,67 @@ mod tests {
             _intent: Option<FsWriteIntent>,
         ) -> Result<FsWriteOutcome, dsh_fs::FsError> {
             let _ = (target, content);
+            Ok(FsWriteOutcome {
+                operation: "create",
+                version: "1".into(),
+            })
+        }
+    }
+
+    struct RecordingFs {
+        stamped: std::sync::Mutex<Vec<Option<String>>>,
+        deny: std::sync::Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl dsh_fs::FsProvider for RecordingFs {
+        async fn read_text(&self, _path: &str) -> Result<String, dsh_fs::FsError> {
+            Ok(String::new())
+        }
+        async fn write_text(&self, _path: &str, _content: &str) -> Result<(), dsh_fs::FsError> {
+            Ok(())
+        }
+        async fn exists(&self, _path: &str) -> Result<bool, dsh_fs::FsError> {
+            Ok(false)
+        }
+        async fn stat(&self, _path: &str) -> Result<Option<dsh_fs::FsInfo>, dsh_fs::FsError> {
+            Ok(None)
+        }
+        async fn list_dir(&self, _path: &str) -> Result<Vec<dsh_fs::DirEntry>, dsh_fs::FsError> {
+            Ok(vec![])
+        }
+        async fn resolve(&self, path: &str) -> Result<dsh_fs::FsTarget, dsh_fs::FsError> {
+            Ok(dsh_fs::FsTarget::new(path, path))
+        }
+        async fn version_of(
+            &self,
+            _target: &dsh_fs::FsTarget,
+        ) -> Result<Option<String>, dsh_fs::FsError> {
+            Ok(None)
+        }
+        async fn write_intended(
+            &self,
+            target: &dsh_fs::FsTarget,
+            content: &str,
+            intent: Option<FsWriteIntent>,
+        ) -> Result<FsWriteOutcome, dsh_fs::FsError> {
+            self.write_intended_with_policy(target, content, intent, None)
+                .await
+        }
+        async fn write_intended_with_policy(
+            &self,
+            _target: &dsh_fs::FsTarget,
+            _content: &str,
+            _intent: Option<FsWriteIntent>,
+            policy: Option<&dsh_fs::FsWritePolicy>,
+        ) -> Result<FsWriteOutcome, dsh_fs::FsError> {
+            self.stamped
+                .lock()
+                .expect("stamped")
+                .push(policy.map(|policy| policy.mode.clone()));
+            if *self.deny.lock().expect("deny") {
+                return Err(dsh_fs::FsError::sandbox_denied("denied"));
+            }
             Ok(FsWriteOutcome {
                 operation: "create",
                 version: "1".into(),
