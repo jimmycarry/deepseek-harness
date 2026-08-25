@@ -10,6 +10,7 @@ description = "Message and stream vocabulary plus the LLM adapter seam (ctx.llm)
 async-trait.workspace = true
 dsh-brand.workspace = true
 dsh-cordis.workspace = true
+dsh-timeout.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

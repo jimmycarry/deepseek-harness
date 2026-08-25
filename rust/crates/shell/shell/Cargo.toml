@@ -9,4 +9,5 @@ description = "Shell executor seam (ctx.shell)."
 [dependencies]
 async-trait.workspace = true
 dsh-cordis.workspace = true
+dsh-sandbox.workspace = true
 thiserror.workspace = true

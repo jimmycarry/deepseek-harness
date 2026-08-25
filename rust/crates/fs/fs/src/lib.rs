@@ -1,7 +1,7 @@
 //! Filesystem seam (`ctx.fs`).
 
 use async_trait::async_trait;
-use dsh_cordis::Service;
+use dsh_cordis::{Context, Service};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -339,6 +339,15 @@ pub fn error_to_event(error: &FsError) -> Value {
     }
 }
 
+/// Per-call file-effect policy forwarded from `ctx.sandboxPolicy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsWritePolicy {
+    /// `read-only`, `workspace-write`, or `danger-full-access`.
+    pub mode: String,
+    /// Absolute workspace root `workspace-write` may write under.
+    pub workspace_root: String,
+}
+
 /// Provider interface.
 #[async_trait]
 pub trait FsProvider: Send + Sync {
@@ -363,6 +372,20 @@ pub trait FsProvider: Send + Sync {
         content: &str,
         intent: Option<FsWriteIntent>,
     ) -> Result<FsWriteOutcome, FsError>;
+
+    /// Atomic write under an explicit per-call file-effect policy.
+    ///
+    /// The default ignores `policy` and delegates to [`Self::write_intended`].
+    async fn write_intended_with_policy(
+        &self,
+        target: &FsTarget,
+        content: &str,
+        intent: Option<FsWriteIntent>,
+        policy: Option<&FsWritePolicy>,
+    ) -> Result<FsWriteOutcome, FsError> {
+        let _ = policy;
+        self.write_intended(target, content, intent).await
+    }
 }
 
 /// `ctx.fs`.
@@ -374,6 +397,16 @@ impl FsRuntime {
     /// Wrap a backend.
     pub fn new(backend: std::sync::Arc<dyn FsProvider>) -> Self {
         Self { backend }
+    }
+
+    /// `ctx.fs` as of this call, or `fallback` when the service is absent.
+    ///
+    /// TypeScript tools read `ctx.fs` during execute. Headless dump order
+    /// mounts `fs-sandbox` after `tool-fs`, so execute must look up the live
+    /// service to apply the sandbox wrapper.
+    pub fn from_context(ctx: &Context, fallback: &std::sync::Arc<Self>) -> std::sync::Arc<Self> {
+        ctx.get::<Self>()
+            .unwrap_or_else(|| std::sync::Arc::clone(fallback))
     }
 
     /// Read text.
@@ -419,6 +452,19 @@ impl FsRuntime {
         intent: Option<FsWriteIntent>,
     ) -> Result<FsWriteOutcome, FsError> {
         self.backend.write_intended(target, content, intent).await
+    }
+
+    /// Guarded write under an explicit per-call file-effect policy.
+    pub async fn write_intended_with_policy(
+        &self,
+        target: &FsTarget,
+        content: &str,
+        intent: Option<FsWriteIntent>,
+        policy: Option<&FsWritePolicy>,
+    ) -> Result<FsWriteOutcome, FsError> {
+        self.backend
+            .write_intended_with_policy(target, content, intent, policy)
+            .await
     }
 }
 

@@ -2,7 +2,9 @@
 //! and key payloads to the TypeScript headless-profile fixture vocabulary.
 
 use dsh_agent::AgentRegistry;
-use dsh_app_boot::{compose_profile, register_profile_plugins, shipped_bundles};
+use dsh_app_boot::{
+    compose_profile, register_profile_plugins, shipped_bundles, PermissionPresetService,
+};
 use dsh_bundle_headless::HeadlessStartup;
 use dsh_cordis::Context;
 use dsh_cordis_loader::{Entry, EntryPatch, Loader};
@@ -260,6 +262,115 @@ async fn text_turn_profile_types_and_payloads() {
             .and_then(|event| event["data"]["chunk"]["reason"]["kind"].as_str()),
         Some("stop")
     );
+}
+
+#[tokio::test]
+async fn provider_rate_limit_retries_then_answers() {
+    let events = run_profile(
+        "ping the product path",
+        replay_overlay(serde_json::json!({
+            "turns": [
+                {
+                    "error": {
+                        "message": "snapshot transient failure",
+                        "code": "RATE_LIMIT",
+                        "status": 429
+                    }
+                },
+                { "text": "RETRY_OK" }
+            ],
+            "providers": [{
+                "id": "deepseek-official",
+                "retryPolicy": {
+                    "mode": "normal",
+                    "maxRetries": 1,
+                    "retryableCodes": ["RATE_LIMIT"],
+                    "backoff": {
+                        "initialDelayMs": 1,
+                        "maxDelayMs": 1,
+                        "jitterRatio": 0
+                    }
+                }
+            }]
+        })),
+    )
+    .await;
+    let types = types_of(&events);
+    assert!(types.contains(&"llm/retry".to_string()), "{types:?}");
+    assert!(
+        types.contains(&"llm/retry-started".to_string()),
+        "{types:?}"
+    );
+    let retry = events
+        .iter()
+        .find(|event| event["type"] == "llm/retry")
+        .expect("llm/retry");
+    assert_eq!(retry["data"]["provider"], "deepseek-official");
+    assert_eq!(retry["data"]["mode"], "normal");
+    assert_eq!(
+        retry["data"]["policyKey"],
+        "[\"normal\",1,[\"RATE_LIMIT\"],1,1,0]"
+    );
+    assert_eq!(retry["data"]["retry"], 1);
+    assert_eq!(retry["data"]["maxRetries"], 1);
+    assert_eq!(retry["data"]["delayMs"], 1);
+    assert_eq!(retry["data"]["failure"]["code"], "RATE_LIMIT");
+    assert_eq!(
+        retry["data"]["failure"]["message"],
+        "snapshot transient failure"
+    );
+    assert_eq!(retry["data"]["failure"]["status"], 429);
+    let retry_index = types.iter().position(|name| name == "llm/retry").unwrap();
+    let started_index = types
+        .iter()
+        .position(|name| name == "llm/retry-started")
+        .unwrap();
+    assert!(retry_index < started_index, "{types:?}");
+    let message = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "assistant/message")
+        .expect("assistant message");
+    assert_eq!(
+        message["data"]["message"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or(""),
+        "RETRY_OK"
+    );
+}
+
+#[test]
+fn replay_negative_max_retries_fails_at_mount() {
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-retry-neg-{}-{}",
+        std::process::id(),
+        uuid_stamp()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("DSH_HOME", &dir);
+    std::env::set_var("DSH_PERMISSION_MODE", "danger-full-access");
+    let overlay = replay_overlay(serde_json::json!({
+        "turns": [{ "text": "x" }],
+        "providers": [{
+            "id": "deepseek-official",
+            "retryPolicy": { "mode": "normal", "maxRetries": -1 }
+        }]
+    }));
+    let layers = shipped_bundles("headless").unwrap();
+    let entries = compose_profile(&layers, &[], &[], &overlay).unwrap();
+    let ctx = Context::new();
+    ctx.provide(Arc::new(HeadlessStartup {
+        task: "x".into(),
+        cwd: Some(dir.to_string_lossy().into_owned()),
+    }))
+    .unwrap();
+    let loader = Loader::new();
+    register_profile_plugins(&loader);
+    let error = loader.mount(&ctx, &entries).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("maxRetries"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -1263,6 +1374,86 @@ async fn write_requires_prior_observation_profile() {
         .unwrap();
     assert!(!edited.outcome.is_error, "{:?}", edited.outcome.content);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn permission_read_only_denies_write() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "dsh-perm-ro-{}-{}",
+            std::process::id(),
+            uuid_stamp()
+        ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctx = mount_profile_in(&dir, "unused", vec![]);
+    let session = ctx
+        .service::<SessionStore>()
+        .unwrap()
+        .create_in(Some(dir.to_string_lossy().into_owned()));
+    let handle = ctx
+        .service::<AgentRegistry>()
+        .unwrap()
+        .create(Arc::clone(&session))
+        .unwrap();
+    ctx.service::<PermissionPresetService>()
+        .unwrap()
+        .pin_initial(handle.agent.session().as_ref())
+        .unwrap();
+    let commands = ctx.service::<dsh_commands::CommandRegistry>().unwrap();
+    let current = commands
+        .execute(handle.agent.session().as_ref(), "/permission")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current.success, "{}", current.text);
+    assert_eq!(
+        current.text,
+        "current preset danger-full-access (available: read-only, workspace-write, danger-full-access)"
+    );
+    let switched = commands
+        .execute(handle.agent.session().as_ref(), "/permission read-only")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(switched.success, "{}", switched.text);
+    assert_eq!(switched.text, "preset read-only");
+    let unknown = commands
+        .execute(handle.agent.session().as_ref(), "/permission nope")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!unknown.success);
+    assert_eq!(
+        unknown.text,
+        "unknown preset \"nope\" (available: read-only, workspace-write, danger-full-access)"
+    );
+    let path = dir.join("fresh.txt");
+    let path_str = path.to_string_lossy().into_owned();
+    let tools = ctx.service::<ToolRuntime>().unwrap();
+    let denied = tools
+        .execute_for(
+            &ctx,
+            "write",
+            serde_json::json!({ "file_path": path_str, "content": "secret" }),
+            Some(handle.agent.session().id().as_str()),
+        )
+        .await
+        .unwrap();
+    assert!(denied.outcome.is_error);
+    let denied_text = match &denied.outcome.content[0] {
+        ContentBlock::Text { text } => text.as_str(),
+        _ => "",
+    };
+    assert!(
+        denied_text.contains("file access denied under read-only mode"),
+        "{denied_text}"
+    );
+    assert!(!path.exists(), "read-only write must not create the file");
+    drop(handle);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -302,6 +302,7 @@ dependencies = [
  "dsh-compaction-basic",
  "dsh-cordis",
  "dsh-cordis-loader",
+ "dsh-credentials",
  "dsh-credentials-local",
  "dsh-fs",
  "dsh-fs-local",
@@ -315,10 +316,12 @@ dependencies = [
  "dsh-llm-deepseek",
  "dsh-llm-replay",
  "dsh-llm-retry",
+ "dsh-permission-presets",
  "dsh-plan-mode",
  "dsh-repeat-tool-reminder",
  "dsh-sandbox",
  "dsh-sandbox-local",
+ "dsh-sandbox-policy",
  "dsh-sdk-server",
  "dsh-session",
  "dsh-session-checkpoint-policy",
@@ -359,6 +362,7 @@ dependencies = [
  "dsh-tool-web",
  "dsh-tool-workflow",
  "dsh-tools",
+ "dsh-user-approval",
  "dsh-user-questions",
  "dsh-web",
  "dsh-web-search-deepseek",
@@ -466,6 +470,7 @@ dependencies = [
  "dsh-cordis",
  "dsh-cordis-loader",
  "dsh-llm",
+ "dsh-permission-presets",
  "dsh-session",
  "dsh-session-persistence",
  "dsh-subagent",
@@ -610,6 +615,8 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
  "dsh-credentials",
+ "dsh-home-paths",
+ "serde_json",
 ]
 
 [[package]]
@@ -716,6 +723,7 @@ dependencies = [
  "async-trait",
  "dsh-brand",
  "dsh-cordis",
+ "dsh-timeout",
  "futures",
  "serde",
  "serde_json",
@@ -777,6 +785,25 @@ dependencies = [
  "dsh-cordis",
  "dsh-lsp",
  "serde_json",
+]
+
+[[package]]
+name = "dsh-permission-presets"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-agent",
+ "dsh-commands",
+ "dsh-cordis",
+ "dsh-sandbox",
+ "dsh-sandbox-policy",
+ "dsh-session",
+ "dsh-session-projection",
+ "dsh-shell",
+ "dsh-system-prompt",
+ "dsh-user-approval",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -844,6 +871,19 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
  "dsh-sandbox",
+]
+
+[[package]]
+name = "dsh-sandbox-policy"
+version = "0.1.1-rc.2"
+dependencies = [
+ "dsh-agent",
+ "dsh-cordis",
+ "dsh-sandbox",
+ "dsh-session",
+ "dsh-system-prompt",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1045,6 +1085,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
  "dsh-cordis",
+ "dsh-sandbox",
  "thiserror",
 ]
 
@@ -1162,6 +1203,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
  "dsh-llm",
+ "dsh-session",
 ]
 
 [[package]]
@@ -1216,6 +1258,7 @@ dependencies = [
  "async-trait",
  "dsh-cordis",
  "dsh-jobs",
+ "dsh-sandbox-policy",
  "dsh-shell",
  "dsh-shell-env",
  "dsh-tools",
@@ -1229,8 +1272,10 @@ dependencies = [
  "async-trait",
  "dsh-cordis",
  "dsh-fs",
+ "dsh-sandbox-policy",
  "dsh-tools",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1343,6 +1388,7 @@ dependencies = [
  "dsh-fs-local",
  "dsh-llm",
  "dsh-sandbox-local",
+ "dsh-sandbox-policy",
  "dsh-tools",
  "serde_json",
  "tokio",
@@ -1469,6 +1515,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-user-approval"
+version = "0.1.1-rc.2"
+dependencies = [
+ "dsh-agent",
+ "dsh-cordis",
+ "dsh-llm",
+ "dsh-session",
+ "dsh-system-prompt",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "dsh-user-questions"
 version = "0.1.1-rc.2"
 dependencies = [
@@ -1505,6 +1565,7 @@ version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
  "dsh-cordis",
+ "dsh-credentials",
  "dsh-session",
  "dsh-web",
  "serde_json",

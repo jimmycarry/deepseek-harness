@@ -1,6 +1,7 @@
 //! DeepSeek LLM adapter. Self-skips with-key tests when `DEEPSEEK_API_KEY` is unset.
 
 use async_trait::async_trait;
+use dsh_credentials::{Credential, CredentialsRuntime};
 use dsh_llm::{
     ContentBlock, LlmAdapter, LlmError, LlmFailure, LlmModelContext, LlmResolvedModelInfo,
     LlmRequest, Message, StreamChunk,
@@ -9,6 +10,12 @@ use futures::stream::{self, BoxStream};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// The single provider route this plugin owns.
+pub const PROVIDER: &str = "deepseek-official";
+
+/// Default environment variable that holds the API key.
+pub const DEFAULT_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
 /// Positive context capacity used when a catalog entry has none (TypeScript default).
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 1_000_000;
@@ -124,6 +131,38 @@ pub fn merge_connection_config(plugin: Option<&Value>, settings: Option<&Value>)
     overlay_section(plugin, settings)
 }
 
+/// Exact TypeScript `MISSING_CREDENTIAL` failure for a missing API key.
+pub fn missing_api_key(api_key_env: &str) -> LlmError {
+    LlmError::Failure(LlmFailure {
+        message: format!(
+            "llm-deepseek: no API key for provider route \"{PROVIDER}\"; store {api_key_env} through the credentials service (the web Models page writes it), or export {api_key_env} in the launching environment"
+        ),
+        code: "MISSING_CREDENTIAL".into(),
+        status: None,
+    })
+}
+
+/// Resolve the API key through `ctx.credentials` when mounted, else the launch env.
+///
+/// # Errors
+/// [`MISSING_CREDENTIAL`](missing_api_key) when no usable key exists.
+pub fn resolve_api_key(
+    credentials: Option<&CredentialsRuntime>,
+    api_key_env: &str,
+) -> std::result::Result<String, LlmError> {
+    if let Some(credentials) = credentials {
+        match credentials.resolve(api_key_env) {
+            Credential::Set(value) => Ok(value),
+            Credential::Unset => Err(missing_api_key(api_key_env)),
+        }
+    } else {
+        std::env::var(api_key_env)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| missing_api_key(api_key_env))
+    }
+}
+
 fn catalog_error(message: String) -> LlmError {
     LlmError::Failure(LlmFailure {
         message,
@@ -145,16 +184,7 @@ pub struct DeepSeekAdapter {
 impl DeepSeekAdapter {
     /// Build from the process environment. Missing key fails loud.
     pub fn from_env() -> Result<Self, LlmError> {
-        let api_key = std::env::var("DEEPSEEK_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                LlmError::Failure(LlmFailure {
-                    message: "DEEPSEEK_API_KEY is not set".into(),
-                    code: "MISSING_CREDENTIAL".into(),
-                    status: None,
-                })
-            })?;
+        let api_key = resolve_api_key(None, DEFAULT_API_KEY_ENV)?;
         let base_url = std::env::var("DEEPSEEK_BASE_URL")
             .unwrap_or_else(|_| "https://api.deepseek.com".into());
         Ok(Self {
@@ -384,7 +414,19 @@ mod tests {
     fn from_env_fails_loud_without_key() {
         let previous = std::env::var("DEEPSEEK_API_KEY").ok();
         std::env::remove_var("DEEPSEEK_API_KEY");
-        assert!(DeepSeekAdapter::from_env().is_err());
+        let Err(error) = DeepSeekAdapter::from_env() else {
+            panic!("from_env must fail when DEEPSEEK_API_KEY is unset");
+        };
+        let LlmError::Failure(failure) = error;
+        assert_eq!(failure.code, "MISSING_CREDENTIAL");
+        assert!(
+            failure
+                .message
+                .contains("no API key for provider route \"deepseek-official\""),
+            "{}",
+            failure.message
+        );
+        assert!(failure.message.contains("DEEPSEEK_API_KEY"), "{}", failure.message);
         if let Some(previous) = previous {
             std::env::set_var("DEEPSEEK_API_KEY", previous);
         }

@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use dsh_cordis::Service;
+use dsh_sandbox::{SandboxExecutionPolicy, SandboxMode};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -17,6 +18,8 @@ pub struct ShellSpec {
     pub cwd: Option<String>,
     /// Trusted managed environment overlay. `None` means inherit ambient `DSH_*`.
     pub dsh_env: Option<BTreeMap<String, String>>,
+    /// Per-call file-effect policy; sandboxing executors default it.
+    pub sandbox_policy: Option<SandboxExecutionPolicy>,
 }
 
 /// Shell request before resolve.
@@ -28,6 +31,8 @@ pub struct ShellRequest {
     pub cwd: Option<String>,
     /// Trusted managed environment overlay.
     pub dsh_env: Option<BTreeMap<String, String>>,
+    /// Per-call file-effect policy; sandboxing executors default it.
+    pub sandbox_policy: Option<SandboxExecutionPolicy>,
 }
 
 /// Explicit resolve.
@@ -36,6 +41,7 @@ pub fn resolve(request: ShellRequest) -> ShellSpec {
         command: request.command,
         cwd: request.cwd,
         dsh_env: request.dsh_env,
+        sandbox_policy: request.sandbox_policy,
     }
 }
 
@@ -60,12 +66,27 @@ pub trait ShellExecutor: Send + Sync {
 /// `ctx.shell`.
 pub struct ShellRuntime {
     backend: std::sync::Arc<dyn ShellExecutor>,
+    sandbox_mode: Option<SandboxMode>,
 }
 
 impl ShellRuntime {
     /// Wrap a backend.
     pub fn new(backend: std::sync::Arc<dyn ShellExecutor>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            sandbox_mode: None,
+        }
+    }
+
+    /// Record the executor's standing sandbox mode.
+    pub fn with_sandbox_mode(mut self, mode: SandboxMode) -> Self {
+        self.sandbox_mode = Some(mode);
+        self
+    }
+
+    /// Standing sandbox mode when the executor confines.
+    pub fn sandbox_mode(&self) -> Option<SandboxMode> {
+        self.sandbox_mode.clone()
     }
 
     /// Run a resolved spec.

@@ -13,6 +13,7 @@ dsh-commands.workspace = true
 dsh-cordis.workspace = true
 dsh-cordis-loader.workspace = true
 dsh-llm.workspace = true
+dsh-permission-presets.workspace = true
 dsh-session.workspace = true
 dsh-session-persistence.workspace = true
 dsh-subagent.workspace = true

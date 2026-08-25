@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dsh_cordis::Context;
 use dsh_fs::{
     error_from_event, fs_event_payload, FsError, FsKind, FsObservation, FsObservationActor,
-    FsRuntime, FsWriteIntent, FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
+    FsRuntime, FsWriteIntent, FsWritePolicy, FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
 };
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome, ToolRuntime};
 use serde_json::Value;
@@ -216,7 +216,7 @@ fn format_file_view(
 
 /// `str_replace_editor` tool.
 pub struct StrReplaceEditorTool {
-    fs: Arc<FsRuntime>,
+    fallback: Arc<FsRuntime>,
     config: Config,
     ctx: Context,
 }
@@ -224,7 +224,15 @@ pub struct StrReplaceEditorTool {
 impl StrReplaceEditorTool {
     /// Bind to `ctx.fs` and the plugin context used for `fs/*` events.
     pub fn new(fs: Arc<FsRuntime>, config: Config, ctx: Context) -> Self {
-        Self { fs, config, ctx }
+        Self {
+            fallback: fs,
+            config,
+            ctx,
+        }
+    }
+
+    fn fs(&self) -> Arc<FsRuntime> {
+        FsRuntime::from_context(&self.ctx, &self.fallback)
     }
 
     fn observe(&self, target: &dsh_fs::FsTarget, observation: FsObservation, actor: &FsObservationActor) {
@@ -232,6 +240,13 @@ impl StrReplaceEditorTool {
             FS_OBSERVED,
             fs_event_payload(target, actor, Some(&observation)),
         );
+    }
+
+    fn write_policy(&self, agent_id: Option<&str>) -> Option<FsWritePolicy> {
+        dsh_sandbox_policy::resolve_from_context(&self.ctx, agent_id).map(|policy| FsWritePolicy {
+            mode: policy.mode.as_str().to_string(),
+            workspace_root: policy.workspace_root,
+        })
     }
 
     fn write_intent(&self, target: &dsh_fs::FsTarget, actor: &FsObservationActor) -> Option<FsWriteIntent> {
@@ -292,7 +307,8 @@ impl StrReplaceEditorTool {
             Ok(rows)
         }
         let mut rows = vec![format!("d\t{path}")];
-        rows.extend(visit(&self.fs, path, 1).await?);
+        let fs = self.fs();
+        rows.extend(visit(&fs, path, 1).await?);
         rows.sort_by(|left, right| {
             let left_path = left.split_once('\t').map(|(_, path)| path).unwrap_or(left);
             let right_path = right
@@ -317,9 +333,9 @@ impl StrReplaceEditorTool {
         actor: &FsObservationActor,
     ) -> Result<String, String> {
         require_absolute(path)?;
-        let target = self.fs.resolve(path).await.map_err(map_fs)?;
-        let info = self
-            .fs
+        let fs = self.fs();
+        let target = fs.resolve(path).await.map_err(map_fs)?;
+        let info = fs
             .stat(&target.target_key)
             .await
             .map_err(map_fs)?;
@@ -340,12 +356,8 @@ impl StrReplaceEditorTool {
                 self.list_directory(&target.target_key).await
             }
             FsKind::File => {
-                let content = self
-                    .fs
-                    .read_text(&target.target_key)
-                    .await
-                    .map_err(map_fs)?;
-                if let Ok(Some(version)) = self.fs.version_of(&target).await {
+                let content = fs.read_text(&target.target_key).await.map_err(map_fs)?;
+                if let Ok(Some(version)) = fs.version_of(&target).await {
                     self.observe(&target, FsObservation::Present { version }, actor);
                 }
                 format_file_view(
@@ -369,9 +381,9 @@ impl StrReplaceEditorTool {
     ) -> Result<String, String> {
         require_absolute(path)?;
         let content = required_for_command(file_text, "file_text", "create", true)?;
-        let target = self.fs.resolve(path).await.map_err(map_fs)?;
-        if self
-            .fs
+        let fs = self.fs();
+        let target = fs.resolve(path).await.map_err(map_fs)?;
+        if fs
             .stat(&target.target_key)
             .await
             .map_err(map_fs)?
@@ -382,9 +394,9 @@ impl StrReplaceEditorTool {
             ));
         }
         let intent = self.write_intent(&target, actor);
-        let outcome = self
-            .fs
-            .write_intended(&target, &content, intent)
+        let policy = self.write_policy(actor.session_id.as_deref());
+        let outcome = fs
+            .write_intended_with_policy(&target, &content, intent, policy.as_ref())
             .await
             .map_err(|error| error.remediate().to_string())?;
         self.observe(
@@ -407,9 +419,9 @@ impl StrReplaceEditorTool {
         require_absolute(path)?;
         let old_value = required_for_command(old_str, "old_str", "str_replace", false)?;
         let new_value = new_str.unwrap_or("");
-        let target = self.fs.resolve(path).await.map_err(map_fs)?;
-        let info = self
-            .fs
+        let fs = self.fs();
+        let target = fs.resolve(path).await.map_err(map_fs)?;
+        let info = fs
             .stat(&target.target_key)
             .await
             .map_err(map_fs)?
@@ -425,11 +437,7 @@ impl StrReplaceEditorTool {
             return Err(format!("cannot edit \"{path}\": not a regular file"));
         }
         let expected = self.edit_intent(&target, actor)?;
-        let before = self
-            .fs
-            .read_text(&target.target_key)
-            .await
-            .map_err(map_fs)?;
+        let before = fs.read_text(&target.target_key).await.map_err(map_fs)?;
         let offsets = match_offsets(&before, &old_value);
         match offsets.as_slice() {
             [] => Err(format!(
@@ -438,9 +446,9 @@ impl StrReplaceEditorTool {
             [_] => {
                 let after = before.replacen(&old_value, new_value, 1);
                 let intent = expected.map(|version| FsWriteIntent::ReplaceIfVersion { version });
-                let outcome = self
-                    .fs
-                    .write_intended(&target, &after, intent)
+                let policy = self.write_policy(actor.session_id.as_deref());
+                let outcome = fs
+                    .write_intended_with_policy(&target, &after, intent, policy.as_ref())
                     .await
                     .map_err(|error| error.remediate().to_string())?;
                 self.observe(
@@ -477,9 +485,9 @@ impl StrReplaceEditorTool {
         let insert_line = insert_line
             .ok_or_else(|| "Parameter `insert_line` is required for command: insert".to_string())?;
         let value = required_for_command(new_str, "new_str", "insert", true)?;
-        let target = self.fs.resolve(path).await.map_err(map_fs)?;
-        let info = self
-            .fs
+        let fs = self.fs();
+        let target = fs.resolve(path).await.map_err(map_fs)?;
+        let info = fs
             .stat(&target.target_key)
             .await
             .map_err(map_fs)?
@@ -490,11 +498,7 @@ impl StrReplaceEditorTool {
             return Err(format!("cannot insert into \"{path}\": not a regular file"));
         }
         let expected = self.edit_intent(&target, actor)?;
-        let before = self
-            .fs
-            .read_text(&target.target_key)
-            .await
-            .map_err(map_fs)?;
+        let before = fs.read_text(&target.target_key).await.map_err(map_fs)?;
         let lines: Vec<&str> = before.split('\n').collect();
         if insert_line < 0 || insert_line as usize > lines.len() {
             return Err(format!(
@@ -508,9 +512,9 @@ impl StrReplaceEditorTool {
         after.extend(value.split('\n'));
         after.extend(&lines[at..]);
         let intent = expected.map(|version| FsWriteIntent::ReplaceIfVersion { version });
-        let outcome = self
-            .fs
-            .write_intended(&target, &after.join("\n"), intent)
+        let policy = self.write_policy(actor.session_id.as_deref());
+        let outcome = fs
+            .write_intended_with_policy(&target, &after.join("\n"), intent, policy.as_ref())
             .await
             .map_err(|error| error.remediate().to_string())?;
         self.observe(

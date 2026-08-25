@@ -22,6 +22,7 @@ members = [
   "crates/subprocess/subprocess-local",
   "crates/sandbox/sandbox",
   "crates/sandbox/sandbox-local",
+  "crates/sandbox/sandbox-policy",
   "crates/shell/shell",
   "crates/shell/shell-env",
   "crates/shell/bash-local",
@@ -95,6 +96,8 @@ members = [
   "crates/interaction/commands",
   "crates/feedback/command-feedback",
   "crates/interaction/user-questions",
+  "crates/interaction/user-approval",
+  "crates/interaction/permission-presets",
   "crates/sdk/protocol",
   "crates/sdk/client",
   "crates/sdk/server",
@@ -155,6 +158,7 @@ dsh-subprocess = { path = "crates/subprocess/subprocess" }
 dsh-subprocess-local = { path = "crates/subprocess/subprocess-local" }
 dsh-sandbox = { path = "crates/sandbox/sandbox" }
 dsh-sandbox-local = { path = "crates/sandbox/sandbox-local" }
+dsh-sandbox-policy = { path = "crates/sandbox/sandbox-policy" }
 dsh-shell = { path = "crates/shell/shell" }
 dsh-shell-env = { path = "crates/shell/shell-env" }
 dsh-bash-local = { path = "crates/shell/bash-local" }
@@ -226,6 +230,8 @@ dsh-commands = { path = "crates/interaction/commands" }
 dsh-anonymous-user-id = { path = "crates/identity/anonymous-user-id" }
 dsh-command-feedback = { path = "crates/feedback/command-feedback" }
 dsh-user-questions = { path = "crates/interaction/user-questions" }
+dsh-user-approval = { path = "crates/interaction/user-approval" }
+dsh-permission-presets = { path = "crates/interaction/permission-presets" }
 dsh-sdk-protocol = { path = "crates/sdk/protocol" }
 dsh-sdk-client = { path = "crates/sdk/client" }
 dsh-sdk-server = { path = "crates/sdk/server" }

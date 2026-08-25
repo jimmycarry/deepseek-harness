@@ -4,13 +4,14 @@
 //! mount as no-ops so the headless tree can load; their behavior is filled
 //! in later without changing the composition identity.
 
+use dsh_credentials::CredentialsRuntime;
 use dsh_agent::{AgentDefaultModel, AgentRegistry};
 use dsh_agent_loop::AgentLoop;
 use dsh_bash_local::BashLocal;
 use dsh_commands::CommandRegistry;
 use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_fs::FsRuntime;
-use dsh_llm::{LlmAdapter, LlmError, LlmRequest, LlmRuntime, StreamChunk};
+use dsh_llm::{resolve_retry_policy, LlmAdapter, LlmError, LlmRequest, LlmRuntime, StreamChunk};
 use dsh_llm_replay::ReplayAdapter;
 use dsh_sandbox::SandboxRuntime;
 use dsh_session::SessionStore;
@@ -44,7 +45,7 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
             dsh_session_telemetry_otel::install(ctx, config.as_ref())
         }
         "@deepseek-ai/dsh-credentials-local" => {
-            dsh_credentials_local::install(ctx)?;
+            dsh_credentials_local::install(ctx, config.as_ref())?;
             Ok(())
         }
         "@deepseek-ai/dsh-session-title" => apply_session_title(ctx, config),
@@ -84,7 +85,11 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
             AgentLoop::install(ctx)?;
             Ok(())
         }
-        "@deepseek-ai/dsh-commands" => ctx.provide(Arc::new(CommandRegistry::new())),
+        "@deepseek-ai/dsh-commands" => {
+            ctx.provide(Arc::new(CommandRegistry::new()))?;
+            dsh_permission_presets::bind_command(ctx)?;
+            Ok(())
+        }
         "@deepseek-ai/dsh-command-feedback" => dsh_command_feedback::install(ctx),
         "@deepseek-ai/dsh-fs-sandbox" => apply_fs_sandbox(ctx),
         "@deepseek-ai/dsh-llm-deepseek" => apply_llm_deepseek(ctx, config),
@@ -145,37 +150,6 @@ impl Service for Timer {
 struct CodeRuntime;
 impl Service for CodeRuntime {
     const KEY: &'static str = "codeRuntime";
-}
-
-/// `ctx.sandboxPolicy`.
-pub struct SandboxPolicyService {
-    /// Permission mode (`workspace-write`, `read-only`, `danger-full-access`).
-    pub mode: String,
-    /// Workspace root used in the workspace-write snapshot sentence.
-    pub workspace_root: String,
-}
-
-impl Service for SandboxPolicyService {
-    const KEY: &'static str = "sandboxPolicy";
-}
-
-/// `ctx.approval`.
-pub struct ApprovalService {
-    /// `ask` or `never`.
-    pub policy: String,
-}
-
-impl Service for ApprovalService {
-    const KEY: &'static str = "approval";
-}
-
-/// `ctx.permission`.
-pub struct PermissionService {
-    /// Active preset name.
-    pub preset: String,
-}
-impl Service for PermissionService {
-    const KEY: &'static str = "permission";
 }
 
 struct UnsetAdapter;
@@ -361,73 +335,23 @@ fn apply_sandbox(ctx: &Context, config: Option<Value>) -> Result<()> {
 }
 
 fn apply_sandbox_policy(ctx: &Context, config: Option<Value>) -> Result<()> {
-    let mode = config
-        .as_ref()
-        .and_then(|value| value.get("mode"))
-        .and_then(Value::as_str)
-        .unwrap_or("workspace-write")
-        .to_string();
-    let root = config
-        .as_ref()
-        .and_then(|value| value.get("workspaceRoot"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|_| ".".into())
-        });
+    let resolved = dsh_sandbox_policy::Config::resolve(config.as_ref())
+        .map_err(CordisError::Validation)?;
     if !ctx.has_service(SandboxRuntime::KEY) {
-        dsh_sandbox_local::install(ctx, root.clone())?;
+        dsh_sandbox_local::install(ctx, resolved.workspace_root.clone())?;
     }
-    ctx.provide(Arc::new(SandboxPolicyService {
-        mode,
-        workspace_root: root,
-    }))
+    dsh_sandbox_policy::install(ctx, config.as_ref())?;
+    Ok(())
 }
 
 fn apply_approval(ctx: &Context, config: Option<Value>) -> Result<()> {
-    let policy = config
-        .as_ref()
-        .and_then(|value| value.get("policy"))
-        .and_then(Value::as_str)
-        .unwrap_or("ask")
-        .to_string();
-    ctx.provide(Arc::new(ApprovalService { policy }))
+    dsh_user_approval::install(ctx, config.as_ref())?;
+    Ok(())
 }
 
-fn sandbox_policy_text(mode: &str, workspace_root: &str) -> String {
-    match mode {
-        "read-only" => {
-            "Current DSH file policy: read-only. Any available operation enforced by the DSH file sandbox cannot modify files in the standing mode. Do not refuse a required modification from this policy alone: try an available tool normally and follow any denial and escalation guidance it returns."
-                .into()
-        }
-        "danger-full-access" => {
-            "Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations."
-                .into()
-        }
-        _ => format!(
-            "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: {}. Some platform temporary areas may also be writable.",
-            serde_json::to_string(workspace_root).unwrap_or_else(|_| format!("\"{workspace_root}\""))
-        ),
-    }
-}
-
-fn approval_policy_text(policy: &str) -> String {
-    if policy == "never" {
-        "Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`)."
-            .into()
-    } else {
-        String::new()
-    }
-}
-
-fn apply_permission(ctx: &Context, _config: Option<Value>) -> Result<()> {
-    let preset = ctx
-        .get::<SandboxPolicyService>()
-        .map(|policy| policy.mode.clone())
-        .unwrap_or_else(|| "workspace-write".into());
-    ctx.provide(Arc::new(PermissionService { preset }))
+fn apply_permission(ctx: &Context, config: Option<Value>) -> Result<()> {
+    dsh_permission_presets::install(ctx, config.as_ref())?;
+    Ok(())
 }
 
 fn apply_bash_sandbox(ctx: &Context) -> Result<()> {
@@ -439,8 +363,13 @@ fn apply_bash_sandbox(ctx: &Context) -> Result<()> {
         return Ok(());
     }
     let (mode, workspace_root) = ctx
-        .get::<SandboxPolicyService>()
-        .map(|policy| (policy.mode.clone(), policy.workspace_root.clone()))
+        .get::<dsh_sandbox_policy::SandboxPolicyService>()
+        .map(|policy| {
+            (
+                policy.default_mode().as_str().to_string(),
+                policy.workspace_root().to_string(),
+            )
+        })
         .unwrap_or_else(|| {
             (
                 "workspace-write".into(),
@@ -490,7 +419,8 @@ fn apply_tool_bash(ctx: &Context, config: Option<Value>) -> Result<()> {
         shell,
         jobs,
         resolved.enable_run_in_background,
-    );
+    )
+    .with_context(ctx.clone());
     if let Some(shell_env) = ctx.get::<dsh_shell_env::ShellEnvRegistry>() {
         tool = tool.with_shell_env(shell_env);
     }
@@ -518,8 +448,13 @@ fn apply_tool_fs(ctx: &Context) -> Result<()> {
 
 fn apply_fs_sandbox(ctx: &Context) -> Result<()> {
     let (mode, workspace_root) = ctx
-        .get::<SandboxPolicyService>()
-        .map(|policy| (policy.mode.clone(), policy.workspace_root.clone()))
+        .get::<dsh_sandbox_policy::SandboxPolicyService>()
+        .map(|policy| {
+            (
+                policy.default_mode().as_str().to_string(),
+                policy.workspace_root().to_string(),
+            )
+        })
         .unwrap_or_else(|| {
             (
                 "workspace-write".into(),
@@ -576,20 +511,8 @@ fn apply_system_prompt(ctx: &Context, config: Option<Value>) -> Result<()> {
     {
         prompt.set_persona(persona);
     }
-    if let Some(policy) = ctx.get::<SandboxPolicyService>() {
-        prompt.register_context(dsh_system_prompt::PromptContext {
-            name: "sandbox:policy".into(),
-            text: sandbox_policy_text(&policy.mode, &policy.workspace_root),
-            order: 10,
-        });
-    }
-    if let Some(approval) = ctx.get::<ApprovalService>() {
-        prompt.register_context(dsh_system_prompt::PromptContext {
-            name: "approval:policy".into(),
-            text: approval_policy_text(&approval.policy),
-            order: 20,
-        });
-    }
+    dsh_sandbox_policy::bind_prompt(ctx)?;
+    dsh_user_approval::bind_prompt(ctx)?;
     Ok(())
 }
 
@@ -813,20 +736,32 @@ fn apply_llm_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
         settings.register("llm-deepseek")?;
     }
     let catalog = dsh_llm_deepseek::resolve_catalog(config.as_ref()).map_err(CordisError::Validation)?;
+    let retry_policy = resolve_retry_policy(
+        config.as_ref().and_then(|value| value.get("retryPolicy")),
+        "llm-deepseek.retryPolicy",
+    )
+    .map_err(CordisError::Validation)?;
     ctx.provide(Arc::new(LlmRuntime::new(Arc::new(LiveDeepSeekAdapter {
         settings: ctx.get::<SettingsRuntime>(),
+        credentials: ctx.get::<CredentialsRuntime>(),
         plugin_config: config,
         last_good: Mutex::new(Some(catalog)),
+        retry_policy,
     }))))
 }
 
 struct LiveDeepSeekAdapter {
     settings: Option<Arc<SettingsRuntime>>,
+    credentials: Option<Arc<CredentialsRuntime>>,
     plugin_config: Option<Value>,
     last_good: Mutex<Option<(u32, Vec<dsh_llm_deepseek::CatalogModel>)>>,
+    retry_policy: dsh_llm::RetryPolicy,
 }
 
-fn resolve_deepseek(settings: Option<&SettingsRuntime>, plugin: Option<&Value>) -> (String, String, String) {
+fn resolve_deepseek(
+    settings: Option<&SettingsRuntime>,
+    plugin: Option<&Value>,
+) -> (String, String, String) {
     let section = dsh_llm_deepseek::merge_connection_config(
         plugin,
         settings.and_then(|settings| settings.section("llm-deepseek")).as_ref(),
@@ -834,8 +769,8 @@ fn resolve_deepseek(settings: Option<&SettingsRuntime>, plugin: Option<&Value>) 
     let api_key_env = section
         .get("apiKeyEnv")
         .and_then(Value::as_str)
-        .unwrap_or("DEEPSEEK_API_KEY");
-    let api_key = std::env::var(api_key_env).unwrap_or_default();
+        .unwrap_or(dsh_llm_deepseek::DEFAULT_API_KEY_ENV)
+        .to_string();
     let base_url = section
         .get("baseURL")
         .and_then(Value::as_str)
@@ -847,7 +782,7 @@ fn resolve_deepseek(settings: Option<&SettingsRuntime>, plugin: Option<&Value>) 
         .and_then(Value::as_str)
         .unwrap_or("deepseek-chat")
         .to_string();
-    (api_key, base_url, model)
+    (api_key_env, base_url, model)
 }
 
 fn catalog_for(adapter: &LiveDeepSeekAdapter) -> Result<(u32, Vec<dsh_llm_deepseek::CatalogModel>), LlmError> {
@@ -884,8 +819,9 @@ impl LlmAdapter for LiveDeepSeekAdapter {
         &self,
         request: LlmRequest,
     ) -> std::result::Result<BoxStream<'static, StreamChunk>, LlmError> {
-        let (api_key, base_url, model) =
+        let (api_key_env, base_url, model) =
             resolve_deepseek(self.settings.as_deref(), self.plugin_config.as_ref());
+        let api_key = dsh_llm_deepseek::resolve_api_key(self.credentials.as_deref(), &api_key_env)?;
         dsh_llm_deepseek::DeepSeekAdapter {
             api_key,
             base_url,
@@ -893,6 +829,14 @@ impl LlmAdapter for LiveDeepSeekAdapter {
         }
         .stream(request)
         .await
+    }
+
+    fn provider_retry_policy(&self, provider: &str) -> dsh_llm::RetryPolicy {
+        if provider == dsh_llm_deepseek::PROVIDER {
+            self.retry_policy.clone()
+        } else {
+            dsh_llm::RetryPolicy::default()
+        }
     }
 
     async fn resolve_model(
@@ -947,7 +891,22 @@ fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
         .map_err(|error| {
             CordisError::Validation(format!("llm-replay: invalid providers catalog: {error}"))
         })?;
-        adapter = adapter.with_providers(parsed);
+        let array = providers.as_array().ok_or_else(|| {
+            CordisError::Validation("llm-replay: providers must be an array".into())
+        })?;
+        let mut policies = std::collections::HashMap::new();
+        for (index, provider) in parsed.iter().enumerate() {
+            let raw = array.get(index).and_then(|item| item.get("retryPolicy"));
+            let policy = resolve_retry_policy(
+                raw,
+                &format!("llm-replay: providers[{index}].retryPolicy"),
+            )
+            .map_err(CordisError::Validation)?;
+            policies.insert(provider.id.clone(), policy);
+        }
+        adapter = adapter
+            .with_providers(parsed)
+            .with_retry_policies(policies);
     }
     ctx.provide(Arc::new(LlmRuntime::new(Arc::new(adapter))))
 }

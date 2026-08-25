@@ -6,7 +6,10 @@ use serde::Deserialize;
 mod plugins;
 mod registry;
 
-pub use plugins::{ApprovalService, PermissionService, SandboxPolicyService};
+pub use dsh_permission_presets::PermissionPresetService;
+pub use dsh_permission_presets::PermissionPresetService as PermissionService;
+pub use dsh_sandbox_policy::SandboxPolicyService;
+pub use dsh_user_approval::ApprovalService;
 pub use registry::{register_profile_plugins, shipped_plugin_names};
 
 /// A named composition stored in the Harness home.

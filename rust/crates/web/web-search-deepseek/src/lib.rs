@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use dsh_cordis::{Context, Result};
+use dsh_credentials::{Credential, CredentialsRuntime};
 use dsh_session::{SessionEventData, SessionStore};
 use dsh_web::{
     WebError, WebRuntime, WebSearchProvider, WebSearchRequest, WebSearchResult, WebSearchSource,
@@ -81,20 +82,52 @@ impl Config {
 pub struct DeepSeekSearch {
     config: Config,
     sessions: Option<Arc<SessionStore>>,
+    credentials: Option<Arc<CredentialsRuntime>>,
 }
 
 impl DeepSeekSearch {
     /// Bind config and an optional session store for request logging.
     pub fn new(config: Config, sessions: Option<Arc<SessionStore>>) -> Self {
-        Self { config, sessions }
+        Self {
+            config,
+            sessions,
+            credentials: None,
+        }
     }
+
+    /// Bind the credentials seam used to resolve `apiKeyEnv`.
+    pub fn with_credentials(mut self, credentials: Arc<CredentialsRuntime>) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    fn resolve_key(&self) -> std::result::Result<String, WebError> {
+        let name = &self.config.api_key_env;
+        if let Some(credentials) = &self.credentials {
+            return match credentials.resolve(name) {
+                Credential::Set(value) => Ok(value),
+                Credential::Unset => Err(missing_search_key(name)),
+            };
+        }
+        std::env::var(name).map_err(|_| missing_search_key(name))
+    }
+}
+
+fn missing_search_key(name: &str) -> WebError {
+    WebError::Provider(format!(
+        "DeepSeek search has no API key for \"{name}\"; store it through the credentials service (the web Models page writes it), export it in the launching environment, or set a literal \"apiKey\" in the web-search-deepseek config"
+    ))
 }
 
 /// Register on `ctx.web`.
 pub fn install(ctx: &Context, config: Config) -> Result<()> {
     let web = ctx.service::<WebRuntime>()?;
     let sessions = ctx.get::<SessionStore>();
-    web.register_search_provider(Arc::new(DeepSeekSearch::new(config, sessions)))
+    let mut provider = DeepSeekSearch::new(config, sessions);
+    if let Some(credentials) = ctx.get::<CredentialsRuntime>() {
+        provider = provider.with_credentials(credentials);
+    }
+    web.register_search_provider(Arc::new(provider))
         .map_err(|error| dsh_cordis::CordisError::Validation(error.to_string()))?;
     Ok(())
 }
@@ -106,7 +139,7 @@ impl WebSearchProvider for DeepSeekSearch {
     }
 
     fn available(&self) -> bool {
-        self.config.replay.is_some() || std::env::var(&self.config.api_key_env).is_ok()
+        self.config.replay.is_some() || self.resolve_key().is_ok()
     }
 
     async fn search(
@@ -116,12 +149,7 @@ impl WebSearchProvider for DeepSeekSearch {
         if let Some(replay) = &self.config.replay {
             return Ok(replay.clone());
         }
-        let api_key = std::env::var(&self.config.api_key_env).map_err(|_| {
-            WebError::Provider(format!(
-                "DeepSeek search has no API key for \"{}\"; store it through the credentials service (the web Models page writes it), export it in the launching environment, or set a literal \"apiKey\" in the web-search-deepseek config",
-                self.config.api_key_env
-            ))
-        })?;
+        let api_key = self.resolve_key()?;
         let endpoint = format!("{}/messages", self.config.base_url.trim_end_matches('/'));
         let body = json!({
             "model": self.config.model,

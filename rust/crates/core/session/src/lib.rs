@@ -291,6 +291,29 @@ pub enum SessionEventData {
         /// Policy name (`ask` or `never`).
         policy: String,
     },
+    /// An approval question was put to the answerer chain — log-only audit.
+    #[serde(rename = "approval/asked")]
+    ApprovalAsked {
+        /// Pairs this ask with the matching [`Self::ApprovalDecided`].
+        id: String,
+        /// Tool the question is about.
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        /// Exact tool call when the asker had one.
+        #[serde(rename = "callId", skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        /// Asker's human-readable explanation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Outcome of a prior [`Self::ApprovalAsked`] with the same `id`.
+    #[serde(rename = "approval/decided")]
+    ApprovalDecided {
+        /// Matching ask id.
+        id: String,
+        /// Closed outcome (`allowed-once`, `rejected`, `cancelled`, `unavailable`).
+        outcome: String,
+    },
     /// One normalized mutation of an agent's pending-message lists.
     #[serde(rename = "agent/inbox/spliced")]
     AgentInboxSpliced {
@@ -586,6 +609,8 @@ pub fn event_type_name(data: &SessionEventData) -> &str {
         SessionEventData::PermissionPreset { .. } => "permission/preset",
         SessionEventData::SandboxMode { .. } => "sandbox/mode",
         SessionEventData::ApprovalPolicy { .. } => "approval/policy",
+        SessionEventData::ApprovalAsked { .. } => "approval/asked",
+        SessionEventData::ApprovalDecided { .. } => "approval/decided",
         SessionEventData::AgentInboxSpliced { .. } => "agent/inbox/spliced",
         SessionEventData::RequestHeader { .. } => "request/header",
         SessionEventData::RequestContext { .. } => "request/context",

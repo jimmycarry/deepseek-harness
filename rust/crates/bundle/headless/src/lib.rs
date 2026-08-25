@@ -6,6 +6,7 @@ use dsh_commands::CommandRegistry;
 use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_cordis_loader::{parse_patch_list, EntryPatch};
 use dsh_llm::UserMessage;
+use dsh_permission_presets::PermissionPresetService;
 use dsh_session::{append_session_knobs, Session, SessionStore};
 use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
@@ -94,14 +95,21 @@ pub async fn run_session(ctx: &Context) -> std::result::Result<Arc<Session>, Str
         .map_err(|error| error.to_string())?
         .create(session)
         .map_err(|error| error.to_string())?;
-    let mode = std::env::var("DSH_PERMISSION_MODE").unwrap_or_else(|_| "workspace-write".into());
-    let policy = if mode == "danger-full-access" {
-        "never"
+    if let Some(presets) = ctx.get::<PermissionPresetService>() {
+        presets
+            .pin_initial(handle.agent.session().as_ref())
+            .map_err(|error| error.to_string())?;
     } else {
-        "ask"
-    };
-    append_session_knobs(handle.agent.session().as_ref(), &mode, &mode, policy)
-        .map_err(|error| error.to_string())?;
+        let mode =
+            std::env::var("DSH_PERMISSION_MODE").unwrap_or_else(|_| "workspace-write".into());
+        let policy = if mode == "danger-full-access" {
+            "never"
+        } else {
+            "ask"
+        };
+        append_session_knobs(handle.agent.session().as_ref(), &mode, &mode, policy)
+            .map_err(|error| error.to_string())?;
+    }
     if let Some(commands) = ctx.get::<CommandRegistry>() {
         match commands
             .execute(handle.agent.session().as_ref(), &task)

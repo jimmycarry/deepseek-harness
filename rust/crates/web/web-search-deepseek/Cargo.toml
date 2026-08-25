@@ -9,6 +9,7 @@ description = "DeepSeek official web search provider."
 [dependencies]
 async-trait.workspace = true
 dsh-cordis.workspace = true
+dsh-credentials.workspace = true
 dsh-session.workspace = true
 dsh-web.workspace = true
 serde_json.workspace = true

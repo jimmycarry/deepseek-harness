@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use dsh_llm::{
     text_block, tool_block, ContentBlock, FinishReason, LlmAdapter, LlmError, LlmFailure,
-    LlmModelContext, LlmResolvedModelInfo, LlmRequest, StreamChunk,
+    LlmModelContext, LlmResolvedModelInfo, LlmRequest, RetryPolicy, StreamChunk,
 };
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,9 @@ pub struct ReplayFailure {
     pub message: String,
     /// Stable provider-neutral machine-routing code.
     pub code: String,
+    /// HTTP status returned by the provider, when the script supplies one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
 }
 
 /// Scripted tool call.
@@ -76,6 +79,7 @@ pub struct ReplayAdapter {
     cursor: std::sync::atomic::AtomicUsize,
     auxiliary: std::collections::HashMap<String, String>,
     providers: std::collections::HashMap<String, ReplayProviderConfig>,
+    retry_policies: std::collections::HashMap<String, RetryPolicy>,
 }
 
 impl ReplayAdapter {
@@ -86,6 +90,7 @@ impl ReplayAdapter {
             cursor: std::sync::atomic::AtomicUsize::new(0),
             auxiliary: std::collections::HashMap::new(),
             providers: std::collections::HashMap::new(),
+            retry_policies: std::collections::HashMap::new(),
         }
     }
 
@@ -111,6 +116,15 @@ impl ReplayAdapter {
             .into_iter()
             .map(|provider| (provider.id.clone(), provider))
             .collect();
+        self
+    }
+
+    /// Capture per-provider retry policies resolved at mount.
+    pub fn with_retry_policies(
+        mut self,
+        policies: std::collections::HashMap<String, RetryPolicy>,
+    ) -> Self {
+        self.retry_policies = policies;
         self
     }
 }
@@ -147,7 +161,7 @@ impl LlmAdapter for ReplayAdapter {
             return Err(LlmError::Failure(LlmFailure {
                 message: error.message,
                 code: error.code,
-                status: None,
+                status: error.status,
             }));
         }
         let mut chunks = Vec::new();
@@ -199,6 +213,13 @@ impl LlmAdapter for ReplayAdapter {
             input_modalities: None,
             reasoning: None,
         })
+    }
+
+    fn provider_retry_policy(&self, provider: &str) -> RetryPolicy {
+        self.retry_policies
+            .get(provider)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -264,6 +285,7 @@ mod tests {
                 error: Some(ReplayFailure {
                     message: "context overflow".into(),
                     code: "CONTEXT_WINDOW_EXCEEDED".into(),
+                    status: None,
                 }),
             },
             ReplayTurn {

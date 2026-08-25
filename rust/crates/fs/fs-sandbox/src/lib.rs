@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use dsh_cordis::{Context, Result};
 use dsh_fs::{
     DirEntry, FsError, FsInfo, FsProvider, FsRuntime, FsTarget, FsWriteIntent, FsWriteOutcome,
+    FsWritePolicy,
 };
 use dsh_fs_local::LocalFs;
 use dsh_sandbox_local::allow_path;
@@ -43,14 +44,23 @@ impl SandboxedFs {
     }
 
     fn check_write(&self, target: &FsTarget) -> std::result::Result<(), FsError> {
-        match self.mode.as_str() {
+        self.check_write_with(&self.mode, &self.workspace_root, target)
+    }
+
+    fn check_write_with(
+        &self,
+        mode: &str,
+        workspace_root: &str,
+        target: &FsTarget,
+    ) -> std::result::Result<(), FsError> {
+        match mode {
             "danger-full-access" => Ok(()),
             "read-only" => Err(FsError::Denied(format!(
                 "cannot write \"{}\": file access denied under read-only mode",
                 target.display_path
             ))),
             _ => {
-                if allow_path(&self.workspace_root, &target.target_key) {
+                if allow_path(workspace_root, &target.target_key) {
                     Ok(())
                 } else {
                     Err(FsError::Denied(format!(
@@ -103,6 +113,22 @@ impl FsProvider for SandboxedFs {
     ) -> std::result::Result<FsWriteOutcome, FsError> {
         self.check_write(target)?;
         self.inner.write_intended(target, content, intent).await
+    }
+
+    async fn write_intended_with_policy(
+        &self,
+        target: &FsTarget,
+        content: &str,
+        intent: Option<FsWriteIntent>,
+        policy: Option<&FsWritePolicy>,
+    ) -> std::result::Result<FsWriteOutcome, FsError> {
+        match policy {
+            Some(policy) => {
+                self.check_write_with(&policy.mode, &policy.workspace_root, target)?;
+                self.inner.write_intended(target, content, intent).await
+            }
+            None => self.write_intended(target, content, intent).await,
+        }
     }
 }
 

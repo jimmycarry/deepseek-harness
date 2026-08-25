@@ -983,15 +983,31 @@ impl Default for RetryPolicy {
     }
 }
 
+/// `JSON.stringify` a JS number: a whole value is an integer token (`0`, not `0.0`).
+fn json_js_number(value: f64) -> Value {
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        Value::from(value as i64)
+    } else {
+        serde_json::json!(value)
+    }
+}
+
 impl RetryPolicy {
     /// Stable policy identity written on each `llm/retry` event.
+    ///
+    /// The string matches TypeScript `JSON.stringify` of the same tuple,
+    /// including whole-number `jitterRatio` as a JSON integer.
     pub fn policy_key(&self) -> String {
         if self.mode == "always" {
             serde_json::to_string(&[
                 serde_json::json!(self.mode),
                 serde_json::json!(self.initial_delay_ms),
                 serde_json::json!(self.max_delay_ms),
-                serde_json::json!(self.jitter_ratio),
+                json_js_number(self.jitter_ratio),
             ])
             .unwrap_or_default()
         } else {
@@ -1003,7 +1019,7 @@ impl RetryPolicy {
                 serde_json::json!(codes),
                 serde_json::json!(self.initial_delay_ms),
                 serde_json::json!(self.max_delay_ms),
-                serde_json::json!(self.jitter_ratio),
+                json_js_number(self.jitter_ratio),
             ])
             .unwrap_or_default()
         }
@@ -1018,6 +1034,159 @@ impl RetryPolicy {
             .min(self.max_delay_ms);
         let jitter = 1.0 - self.jitter_ratio + 2.0 * self.jitter_ratio * random.clamp(0.0, 1.0);
         ((exponential as f64) * jitter).min(self.max_delay_ms as f64) as u64
+    }
+}
+
+const RETRY_POLICY_KEYS: &[&str] = &["mode", "maxRetries", "retryableCodes", "backoff"];
+const BACKOFF_KEYS: &[&str] = &["initialDelayMs", "maxDelayMs", "jitterRatio"];
+
+fn unknown_keys(value: &serde_json::Map<String, Value>, allowed: &[&str], path: &str) -> Result<(), String> {
+    for key in value.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("{path}: unknown key \"{key}\""));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_backoff(config: Option<&Value>, path: &str) -> Result<(u64, u64, f64), String> {
+    if let Some(value) = config {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{path} must be a mapping"))?;
+        unknown_keys(object, BACKOFF_KEYS, path)?;
+    }
+    let initial_delay_ms = positive_delay(
+        config.and_then(|value| value.get("initialDelayMs")),
+        default_initial_delay_ms(),
+        &format!("{path}.initialDelayMs"),
+    )?;
+    let max_delay_ms = positive_delay(
+        config.and_then(|value| value.get("maxDelayMs")),
+        default_max_delay_ms(),
+        &format!("{path}.maxDelayMs"),
+    )?;
+    if initial_delay_ms > max_delay_ms {
+        return Err(format!(
+            "{path}.initialDelayMs must be less than or equal to maxDelayMs"
+        ));
+    }
+    let jitter_ratio = match config.and_then(|value| value.get("jitterRatio")) {
+        None => default_jitter_ratio(),
+        Some(value) => {
+            let ratio = value.as_f64().ok_or_else(|| {
+                format!("{path}.jitterRatio must be between 0 and 1")
+            })?;
+            if !(0.0..=1.0).contains(&ratio) {
+                return Err(format!("{path}.jitterRatio must be between 0 and 1"));
+            }
+            ratio
+        }
+    };
+    Ok((initial_delay_ms, max_delay_ms, jitter_ratio))
+}
+
+fn positive_delay(value: Option<&Value>, default: u64, path: &str) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let number = value.as_f64().ok_or_else(|| {
+        format!(
+            "{path} must be a positive finite number no greater than {}",
+            dsh_timeout::MAX_TIMER_DELAY_MS
+        )
+    })?;
+    if !number.is_finite() || number <= 0.0 || number > dsh_timeout::MAX_TIMER_DELAY_MS as f64 {
+        return Err(format!(
+            "{path} must be a positive finite number no greater than {}",
+            dsh_timeout::MAX_TIMER_DELAY_MS
+        ));
+    }
+    Ok(number as u64)
+}
+
+/// Validate, default, and flatten one provider-owned retry policy.
+///
+/// Omission selects `normal` defaults. YAML `backoff` is flattened onto the
+/// resolved policy. Invalid values fail at the named `path`.
+///
+/// # Errors
+/// Unknown keys, a mode other than `normal`/`always`, empty or duplicate
+/// retryable codes, a negative `maxRetries`, or an out-of-range backoff field.
+pub fn resolve_retry_policy(config: Option<&Value>, path: &str) -> Result<RetryPolicy, String> {
+    let Some(config) = config.filter(|value| !value.is_null()) else {
+        return Ok(RetryPolicy::default());
+    };
+    let object = config
+        .as_object()
+        .ok_or_else(|| format!("{path} must be a mapping"))?;
+    unknown_keys(object, RETRY_POLICY_KEYS, path)?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("normal");
+    let (initial_delay_ms, max_delay_ms, jitter_ratio) =
+        resolve_backoff(object.get("backoff"), &format!("{path}.backoff"))?;
+    match mode {
+        "always" => Ok(RetryPolicy {
+            mode: "always".into(),
+            max_retries: default_max_retries(),
+            retryable_codes: default_retryable_codes(),
+            initial_delay_ms,
+            max_delay_ms,
+            jitter_ratio,
+        }),
+        "normal" => {
+            let max_retries = match object.get("maxRetries") {
+                None => default_max_retries(),
+                Some(value) => {
+                    let number = value.as_i64().ok_or_else(|| {
+                        format!("{path}.maxRetries must be a non-negative safe integer")
+                    })?;
+                    if number < 0 || number > i64::from(u32::MAX) {
+                        return Err(format!(
+                            "{path}.maxRetries must be a non-negative safe integer"
+                        ));
+                    }
+                    number as u32
+                }
+            };
+            let retryable_codes = match object.get("retryableCodes") {
+                None => default_retryable_codes(),
+                Some(value) => {
+                    let items = value.as_array().ok_or_else(|| {
+                        format!("{path}.retryableCodes must contain only non-empty strings")
+                    })?;
+                    if items.is_empty() {
+                        return Err(format!("{path}.retryableCodes must not be empty"));
+                    }
+                    let mut codes = Vec::with_capacity(items.len());
+                    for item in items {
+                        let code = item.as_str().unwrap_or("");
+                        if code.is_empty() {
+                            return Err(format!(
+                                "{path}.retryableCodes must contain only non-empty strings"
+                            ));
+                        }
+                        codes.push(code.to_string());
+                    }
+                    if codes.len() != codes.iter().collect::<std::collections::BTreeSet<_>>().len()
+                    {
+                        return Err(format!("{path}.retryableCodes must not contain duplicates"));
+                    }
+                    codes
+                }
+            };
+            Ok(RetryPolicy {
+                mode: "normal".into(),
+                max_retries,
+                retryable_codes,
+                initial_delay_ms,
+                max_delay_ms,
+                jitter_ratio,
+            })
+        }
+        _ => Err(format!("{path}.mode must be \"normal\" or \"always\"")),
     }
 }
 
@@ -1089,6 +1258,11 @@ impl LlmRuntime {
         let resolved = self.adapter.resolve_model(provider, model).await?;
         normalize_model_info(provider, model, resolved)
     }
+
+    /// Provider-owned retry policy captured on the registered adapter route.
+    pub fn provider_retry_policy(&self, provider: &str) -> RetryPolicy {
+        self.adapter.provider_retry_policy(provider)
+    }
 }
 
 impl Service for LlmRuntime {
@@ -1111,6 +1285,11 @@ pub trait LlmAdapter: Send + Sync {
         model: &str,
     ) -> Result<LlmResolvedModelInfo, LlmError> {
         Ok(LlmResolvedModelInfo::identity(provider, model))
+    }
+
+    /// Retry policy for `provider`. Omission is [`RetryPolicy::default`].
+    fn provider_retry_policy(&self, _provider: &str) -> RetryPolicy {
+        RetryPolicy::default()
     }
 }
 
@@ -1331,6 +1510,69 @@ mod tests {
     #[test]
     fn empty_assistant_text_is_empty() {
         assert_eq!(AssistantMessage::model(vec![], "p", "m").text(), "");
+    }
+
+    #[test]
+    fn omitted_retry_policy_is_normal_defaults() {
+        let policy = resolve_retry_policy(None, "provider.retryPolicy").unwrap();
+        assert_eq!(policy.mode, "normal");
+        assert_eq!(policy.max_retries, 5);
+        assert_eq!(policy.initial_delay_ms, 500);
+        assert_eq!(policy.max_delay_ms, 10_000);
+        assert_eq!(policy.jitter_ratio, 0.1);
+    }
+
+    #[test]
+    fn nested_backoff_flattens_on_always_mode() {
+        let policy = resolve_retry_policy(
+            Some(&serde_json::json!({
+                "mode": "always",
+                "backoff": { "initialDelayMs": 25, "maxDelayMs": 100, "jitterRatio": 0.2 }
+            })),
+            "provider.retryPolicy",
+        )
+        .unwrap();
+        assert_eq!(policy.mode, "always");
+        assert_eq!(policy.initial_delay_ms, 25);
+        assert_eq!(policy.max_delay_ms, 100);
+        assert_eq!(policy.jitter_ratio, 0.2);
+    }
+
+    #[test]
+    fn negative_max_retries_fails_loud() {
+        let error = resolve_retry_policy(
+            Some(&serde_json::json!({ "mode": "normal", "maxRetries": -1 })),
+            "llm-deepseek: retryPolicy",
+        )
+        .unwrap_err();
+        assert!(error.contains("maxRetries"), "{error}");
+    }
+
+    #[test]
+    fn policy_key_stringifies_jitter_like_javascript() {
+        let policy = RetryPolicy {
+            mode: "normal".into(),
+            max_retries: 1,
+            retryable_codes: vec!["RATE_LIMIT".into()],
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_ratio: 0.0,
+        };
+        assert_eq!(policy.policy_key(), r#"["normal",1,["RATE_LIMIT"],1,1,0]"#);
+        let fractional = RetryPolicy {
+            jitter_ratio: 0.1,
+            ..policy.clone()
+        };
+        assert_eq!(
+            fractional.policy_key(),
+            r#"["normal",1,["RATE_LIMIT"],1,1,0.1]"#
+        );
+        let always = RetryPolicy {
+            mode: "always".into(),
+            jitter_ratio: 0.0,
+            ..policy
+        };
+        assert_eq!(always.policy_key(), r#"["always",1,1,0]"#);
     }
 
     #[test]

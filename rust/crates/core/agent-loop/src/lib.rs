@@ -321,7 +321,7 @@ impl LoopAgent {
                         "code": failure.code,
                         "message": failure.message,
                         "failure": failure,
-                        "retryPolicy": dsh_llm::RetryPolicy::default(),
+                        "retryPolicy": llm.provider_retry_policy(&route.0),
                     }),
                     |payload| payload,
                 );
@@ -450,8 +450,9 @@ impl LoopAgent {
 
     fn runtime_context_message(&self) -> Option<UserMessage> {
         let prompt = self.ctx.get::<SystemPrompt>()?;
-        let sections = prompt.context_sections();
-        let text = prompt.render_context_snapshot();
+        let session = Some(self.session.as_ref());
+        let sections = prompt.context_sections(session);
+        let text = prompt.render_context_snapshot(session);
         if text.is_empty() {
             return None;
         }

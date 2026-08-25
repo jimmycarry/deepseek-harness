@@ -2,7 +2,8 @@
 
 use dsh_cordis::Service;
 use dsh_llm::{SnapshotSection, ToolSchema};
-use std::sync::Mutex;
+use dsh_session::Session;
+use std::sync::{Arc, Mutex};
 
 /// One prompt section contributed by a plugin.
 #[derive(Debug, Clone)]
@@ -24,13 +25,53 @@ pub struct PromptAssembly {
     pub tools: Vec<ToolSchema>,
 }
 
+/// Body of one runtime-context contribution.
+#[derive(Clone)]
+pub enum PromptContextText {
+    /// Fixed text, independent of the calling session.
+    Static(String),
+    /// Text computed from the current session, or none for a bare assembly.
+    Dynamic(Arc<dyn Fn(Option<&Session>) -> String + Send + Sync>),
+}
+
+impl std::fmt::Debug for PromptContextText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(text) => formatter.debug_tuple("Static").field(text).finish(),
+            Self::Dynamic(_) => formatter.write_str("Dynamic(..)"),
+        }
+    }
+}
+
+impl PromptContextText {
+    /// Materialize the contribution for `session`.
+    pub fn render(&self, session: Option<&Session>) -> String {
+        match self {
+            Self::Static(text) => text.clone(),
+            Self::Dynamic(render) => render(session),
+        }
+    }
+}
+
+impl From<&str> for PromptContextText {
+    fn from(text: &str) -> Self {
+        Self::Static(text.to_string())
+    }
+}
+
+impl From<String> for PromptContextText {
+    fn from(text: String) -> Self {
+        Self::Static(text)
+    }
+}
+
 /// Dynamic runtime-context contribution materialized as a user-role snapshot.
 #[derive(Debug, Clone)]
 pub struct PromptContext {
     /// Unique name (`sandbox:policy`, `approval:policy`).
     pub name: String,
     /// Model-facing text. Empty text contributes nothing.
-    pub text: String,
+    pub text: PromptContextText,
     /// Sort key; lower first.
     pub order: i32,
 }
@@ -65,22 +106,28 @@ impl SystemPrompt {
     }
 
     /// Named snapshot sections with non-empty text, in order.
-    pub fn context_sections(&self) -> Vec<SnapshotSection> {
+    pub fn context_sections(&self, session: Option<&Session>) -> Vec<SnapshotSection> {
         let mut contexts = self.contexts.lock().expect("contexts").clone();
         contexts.sort_by_key(|context| context.order);
         contexts
             .into_iter()
-            .filter(|context| !context.text.is_empty())
-            .map(|context| SnapshotSection {
-                name: context.name,
-                text: context.text,
+            .filter_map(|context| {
+                let text = context.text.render(session);
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(SnapshotSection {
+                        name: context.name,
+                        text,
+                    })
+                }
             })
             .collect()
     }
 
     /// Full snapshot text, or empty when no context is active.
-    pub fn render_context_snapshot(&self) -> String {
-        join_context_sections(&self.context_sections())
+    pub fn render_context_snapshot(&self, session: Option<&Session>) -> String {
+        join_context_sections(&self.context_sections(session))
     }
 
     /// Register a section. Later registrations with the same id replace.
@@ -159,5 +206,20 @@ mod tests {
         });
         let assembly = prompt.assemble(Vec::new());
         assert_eq!(assembly.system, "You are dsh.\n\nfirst\n\nsecond");
+    }
+
+    #[test]
+    fn dynamic_context_is_empty_without_a_session() {
+        let prompt = SystemPrompt::new();
+        prompt.register_context(PromptContext {
+            name: "sandbox:policy".into(),
+            text: PromptContextText::Dynamic(std::sync::Arc::new(|session| {
+                session
+                    .map(|item| item.id().as_str().to_string())
+                    .unwrap_or_default()
+            })),
+            order: 110,
+        });
+        assert!(prompt.context_sections(None).is_empty());
     }
 }

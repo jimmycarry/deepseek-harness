@@ -4,25 +4,39 @@ use async_trait::async_trait;
 use dsh_cordis::Context;
 use dsh_fs::{
     error_from_event, fs_event_payload, FsObservation, FsObservationActor, FsRuntime, FsWriteIntent,
-    FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
+    FsWritePolicy, FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
 };
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome};
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+fn write_policy(ctx: &Context, agent_id: Option<&str>) -> Option<FsWritePolicy> {
+    dsh_sandbox_policy::resolve_from_context(ctx, agent_id).map(|policy| FsWritePolicy {
+        mode: policy.mode.as_str().to_string(),
+        workspace_root: policy.workspace_root,
+    })
+}
 
 /// Default and maximum lines returned by one `read` call.
 pub const READ_LIMIT: usize = 2000;
 
 /// `read` tool.
 pub struct ReadTool {
-    fs: Arc<FsRuntime>,
+    fallback: Arc<FsRuntime>,
     ctx: Context,
 }
 
 impl ReadTool {
     /// Bind to `ctx.fs` and the plugin context used for `fs/observed`.
     pub fn new(fs: Arc<FsRuntime>, ctx: Context) -> Self {
-        Self { fs, ctx }
+        Self {
+            fallback: fs,
+            ctx,
+        }
+    }
+
+    fn fs(&self) -> Arc<FsRuntime> {
+        FsRuntime::from_context(&self.ctx, &self.fallback)
     }
 }
 
@@ -66,13 +80,14 @@ impl Tool for ReadTool {
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
         let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
-        let target = match self.fs.resolve(&input.file_path).await {
+        let fs = self.fs();
+        let target = match fs.resolve(&input.file_path).await {
             Ok(target) => target,
             Err(error) => return Ok(ToolOutcome::error(error.to_string())),
         };
-        match self.fs.read_text(&target.target_key).await {
+        match fs.read_text(&target.target_key).await {
             Ok(text) => {
-                if let Ok(Some(version)) = self.fs.version_of(&target).await {
+                if let Ok(Some(version)) = fs.version_of(&target).await {
                     self.ctx.emit(
                         FS_OBSERVED,
                         fs_event_payload(
@@ -100,7 +115,7 @@ impl Tool for ReadTool {
                 )))
             }
             Err(error) => {
-                if self.fs.stat(&target.target_key).await.ok().flatten().is_none() {
+                if fs.stat(&target.target_key).await.ok().flatten().is_none() {
                     self.ctx.emit(
                         FS_OBSERVED,
                         fs_event_payload(&target, &actor, Some(&FsObservation::Absent)),
@@ -114,14 +129,21 @@ impl Tool for ReadTool {
 
 /// `write` tool.
 pub struct WriteTool {
-    fs: Arc<FsRuntime>,
+    fallback: Arc<FsRuntime>,
     ctx: Context,
 }
 
 impl WriteTool {
     /// Bind to `ctx.fs` and the plugin context used for `fs/*` events.
     pub fn new(fs: Arc<FsRuntime>, ctx: Context) -> Self {
-        Self { fs, ctx }
+        Self {
+            fallback: fs,
+            ctx,
+        }
+    }
+
+    fn fs(&self) -> Arc<FsRuntime> {
+        FsRuntime::from_context(&self.ctx, &self.fallback)
     }
 }
 
@@ -165,7 +187,8 @@ impl Tool for WriteTool {
         };
         let content = call.args.get("content").and_then(Value::as_str).unwrap_or("");
         let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
-        let target = match self.fs.resolve(&path).await {
+        let fs = self.fs();
+        let target = match fs.resolve(&path).await {
             Ok(target) => target,
             Err(error) => return Ok(ToolOutcome::error(error.to_string())),
         };
@@ -184,7 +207,15 @@ impl Tool for WriteTool {
                     FsWriteIntent::from_value(&value)
                 }
             });
-        match self.fs.write_intended(&target, content, intent).await {
+        match fs
+            .write_intended_with_policy(
+                &target,
+                content,
+                intent,
+                write_policy(&self.ctx, call.agent_id.as_deref()).as_ref(),
+            )
+            .await
+        {
             Ok(outcome) => {
                 self.ctx.emit(
                     FS_OBSERVED,
@@ -208,14 +239,21 @@ impl Tool for WriteTool {
 
 /// `edit` tool.
 pub struct EditTool {
-    fs: Arc<FsRuntime>,
+    fallback: Arc<FsRuntime>,
     ctx: Context,
 }
 
 impl EditTool {
     /// Bind to `ctx.fs` and the plugin context used for `fs/*` events.
     pub fn new(fs: Arc<FsRuntime>, ctx: Context) -> Self {
-        Self { fs, ctx }
+        Self {
+            fallback: fs,
+            ctx,
+        }
+    }
+
+    fn fs(&self) -> Arc<FsRuntime> {
+        FsRuntime::from_context(&self.ctx, &self.fallback)
     }
 }
 
@@ -257,7 +295,8 @@ impl Tool for EditTool {
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
         let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
-        let target = match self.fs.resolve(&input.file_path).await {
+        let fs = self.fs();
+        let target = match fs.resolve(&input.file_path).await {
             Ok(target) => target,
             Err(error) => return Ok(ToolOutcome::error(error.to_string())),
         };
@@ -279,7 +318,7 @@ impl Tool for EditTool {
             }
             Err(error) => return Ok(ToolOutcome::error(error.to_string())),
         };
-        let before = match self.fs.read_text(&target.target_key).await {
+        let before = match fs.read_text(&target.target_key).await {
             Ok(text) => text,
             Err(error) => return Ok(ToolOutcome::error(error.to_string())),
         };
@@ -288,7 +327,15 @@ impl Tool for EditTool {
             Ok(text) => text,
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
-        match self.fs.write_intended(&target, &after, intent).await {
+        match fs
+            .write_intended_with_policy(
+                &target,
+                &after,
+                intent,
+                write_policy(&self.ctx, call.agent_id.as_deref()).as_ref(),
+            )
+            .await
+        {
             Ok(outcome) => {
                 self.ctx.emit(
                     FS_OBSERVED,
@@ -550,6 +597,28 @@ mod tests {
             .contains("was not found"));
     }
 
+    #[tokio::test]
+    async fn execute_uses_fs_service_mounted_after_the_tool() {
+        let ctx = Context::new();
+        let allowing = Arc::new(FsRuntime::new(Arc::new(DummyFs)));
+        let tool = WriteTool::new(allowing, ctx.clone());
+        ctx.provide(Arc::new(FsRuntime::new(Arc::new(DenyingFs))))
+            .unwrap();
+        let outcome = tool
+            .execute_call(&ToolCall {
+                name: "write".into(),
+                args: json!({ "file_path": "fresh.txt", "content": "x" }),
+                agent_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.is_error, "{outcome:?}");
+        assert!(
+            format!("{outcome:?}").contains("later-provider-denied"),
+            "{outcome:?}"
+        );
+    }
+
     fn dummy_fs() -> Arc<FsRuntime> {
         Arc::new(FsRuntime::new(Arc::new(DummyFs)))
     }
@@ -593,6 +662,53 @@ mod tests {
                 operation: "create",
                 version: "1".into(),
             })
+        }
+    }
+
+    struct DenyingFs;
+
+    #[async_trait]
+    impl dsh_fs::FsProvider for DenyingFs {
+        async fn read_text(&self, _path: &str) -> Result<String, dsh_fs::FsError> {
+            Ok(String::new())
+        }
+        async fn write_text(&self, _path: &str, _content: &str) -> Result<(), dsh_fs::FsError> {
+            Err(dsh_fs::FsError::Denied("later-provider-denied".into()))
+        }
+        async fn exists(&self, _path: &str) -> Result<bool, dsh_fs::FsError> {
+            Ok(false)
+        }
+        async fn stat(&self, _path: &str) -> Result<Option<dsh_fs::FsInfo>, dsh_fs::FsError> {
+            Ok(None)
+        }
+        async fn list_dir(&self, _path: &str) -> Result<Vec<dsh_fs::DirEntry>, dsh_fs::FsError> {
+            Ok(vec![])
+        }
+        async fn resolve(&self, path: &str) -> Result<dsh_fs::FsTarget, dsh_fs::FsError> {
+            Ok(dsh_fs::FsTarget::new(path, path))
+        }
+        async fn version_of(
+            &self,
+            _target: &dsh_fs::FsTarget,
+        ) -> Result<Option<String>, dsh_fs::FsError> {
+            Ok(None)
+        }
+        async fn write_intended(
+            &self,
+            _target: &dsh_fs::FsTarget,
+            _content: &str,
+            _intent: Option<FsWriteIntent>,
+        ) -> Result<FsWriteOutcome, dsh_fs::FsError> {
+            Err(dsh_fs::FsError::Denied("later-provider-denied".into()))
+        }
+        async fn write_intended_with_policy(
+            &self,
+            _target: &dsh_fs::FsTarget,
+            _content: &str,
+            _intent: Option<FsWriteIntent>,
+            _policy: Option<&dsh_fs::FsWritePolicy>,
+        ) -> Result<FsWriteOutcome, dsh_fs::FsError> {
+            Err(dsh_fs::FsError::Denied("later-provider-denied".into()))
         }
     }
 }

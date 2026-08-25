@@ -2,7 +2,9 @@
 //! background starts go through `ctx.jobs` when that registry is mounted.
 
 use async_trait::async_trait;
+use dsh_cordis::Context;
 use dsh_jobs::{JobHooks, JobOutcome, JobRegistry, JobStart, JobStatus};
+use dsh_sandbox_policy::resolve_from_context;
 use dsh_shell::{resolve, ShellRequest, ShellRuntime};
 use dsh_shell_env::ShellEnvRegistry;
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome};
@@ -43,6 +45,7 @@ pub struct BashTool {
     jobs: Option<Arc<JobRegistry>>,
     enable_run_in_background: bool,
     shell_env: Option<Arc<ShellEnvRegistry>>,
+    lookup: Option<Context>,
 }
 
 impl BashTool {
@@ -53,6 +56,7 @@ impl BashTool {
             jobs: None,
             enable_run_in_background: true,
             shell_env: None,
+            lookup: None,
         }
     }
 
@@ -67,12 +71,19 @@ impl BashTool {
             jobs,
             enable_run_in_background,
             shell_env: None,
+            lookup: None,
         }
     }
 
     /// Collect trusted `DSH_*` facts for each model bash call.
     pub fn with_shell_env(mut self, shell_env: Arc<ShellEnvRegistry>) -> Self {
         self.shell_env = Some(shell_env);
+        self
+    }
+
+    /// Bind the plugin context used to resolve per-call sandbox policy.
+    pub fn with_context(mut self, ctx: Context) -> Self {
+        self.lookup = Some(ctx);
         self
     }
 }
@@ -154,6 +165,10 @@ impl Tool for BashTool {
                 command: command.into(),
                 cwd: None,
                 dsh_env: collect_dsh_env(self.shell_env.as_deref(), call.agent_id.as_deref())?,
+                sandbox_policy: self
+                    .lookup
+                    .as_ref()
+                    .and_then(|ctx| resolve_from_context(ctx, call.agent_id.as_deref())),
             });
             match self.shell.run(spec).await {
                 Ok(stdout) => Ok(ToolOutcome::text(stdout)),

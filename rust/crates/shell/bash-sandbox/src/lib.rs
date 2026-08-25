@@ -66,14 +66,18 @@ impl BashSandbox {
 #[async_trait]
 impl ShellExecutor for BashSandbox {
     async fn run(&self, spec: ShellSpec) -> Result<String, ShellError> {
-        if self.mode == SandboxMode::DangerFullAccess {
+        let policy = spec
+            .sandbox_policy
+            .clone()
+            .unwrap_or_else(|| self.policy());
+        if policy.mode == SandboxMode::DangerFullAccess {
             return self.local.run(spec).await;
         }
         let confined = self
             .sandbox
             .confine(
                 &["bash".into(), "-c".into(), spec.command.clone()],
-                &self.policy(),
+                &policy,
             )
             .map_err(|error| match error {
                 SandboxError::Unavailable { message, .. } => ShellError::Unavailable(message),
@@ -111,7 +115,8 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<Arc<ShellRun
     })?;
     let executor = BashSandbox::new(subprocess, sandbox, config)
         .map_err(dsh_cordis::CordisError::Validation)?;
-    let runtime = Arc::new(ShellRuntime::new(Arc::new(executor)));
+    let mode = executor.mode.clone();
+    let runtime = Arc::new(ShellRuntime::new(Arc::new(executor)).with_sandbox_mode(mode));
     ctx.provide(Arc::clone(&runtime))?;
     Ok(runtime)
 }
@@ -149,6 +154,7 @@ mod tests {
                 command: "echo hello".into(),
                 cwd: None,
                 dsh_env: None,
+                sandbox_policy: None,
             }))
             .await
             .unwrap();
@@ -164,6 +170,7 @@ mod tests {
                 command: "echo hello".into(),
                 cwd: None,
                 dsh_env: None,
+                sandbox_policy: None,
             }))
             .await;
         match result {
