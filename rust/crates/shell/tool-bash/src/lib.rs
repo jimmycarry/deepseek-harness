@@ -21,7 +21,7 @@ use dsh_user_approval::{ApprovalRequest, ApprovalService};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Deployment-varying background switch.
 #[derive(Debug, Clone)]
@@ -600,6 +600,7 @@ mod tests {
     use super::*;
     use dsh_sandbox::{SandboxEnforcement, SandboxMode};
     use dsh_shell::{ShellError, ShellExecutor, ShellSpec};
+    use std::sync::Mutex;
 
     #[test]
     fn resolve_defaults_background_on() {
