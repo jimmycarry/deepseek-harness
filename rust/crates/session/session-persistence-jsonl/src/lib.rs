@@ -320,9 +320,10 @@ mod tests {
     async fn load_missing_file_is_not_found() {
         let dir = tmp_dir("missing");
         fs::create_dir_all(&dir).await.unwrap();
-        let err = read_jsonl(dir.join("nope.jsonl"), &session_id("nope"))
-            .await
-            .unwrap_err();
+        let err = match read_jsonl(dir.join("nope.jsonl"), &session_id("nope")).await {
+            Err(error) => error,
+            Ok(_) => panic!("missing jsonl must be NotFound"),
+        };
         assert!(matches!(err, PersistenceError::NotFound(id) if id == "nope"));
         let _ = fs::remove_dir_all(&dir).await;
     }

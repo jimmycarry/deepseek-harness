@@ -309,7 +309,10 @@ mod tests {
     async fn load_missing_session_is_not_found() {
         let path = tmp_path("missing");
         let backend = SqliteBackend::open(&path).unwrap();
-        let err = backend.load(&session_id("nope")).await.unwrap_err();
+        let err = match backend.load(&session_id("nope")).await {
+            Err(error) => error,
+            Ok(_) => panic!("missing sqlite session must be NotFound"),
+        };
         assert!(matches!(err, PersistenceError::NotFound(id) if id == "nope"));
         assert_eq!(err.to_string(), "session \"nope\" not found");
         let _ = std::fs::remove_file(&path);
