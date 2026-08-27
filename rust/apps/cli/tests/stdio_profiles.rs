@@ -82,7 +82,7 @@ fn acp_profile_serves_handshake_session_and_prompt() {
 #[test]
 fn jsonrpc_profile_streams_events_around_the_receipt() {
     let mut child = spawn_profile("jsonrpc");
-    let reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     send(
         &mut child,
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -91,6 +91,11 @@ fn jsonrpc_profile_streams_events_around_the_receipt() {
             "model": "deepseek-v4-flash",
         }}),
     );
+    let initialize = read_frame(&mut reader);
+    assert_eq!(
+        initialize["result"]["serverInfo"]["name"],
+        "deepseek-harness-sdk-runtime"
+    );
     send(
         &mut child,
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{
@@ -98,37 +103,37 @@ fn jsonrpc_profile_streams_events_around_the_receipt() {
             "contentBlocks": [{"type":"text","text":"Reply with exactly: SDK snapshot OK"}],
         }}),
     );
-    send(
-        &mut child,
-        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
-    );
-    drop(child.stdin.take());
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        lines.push(serde_json::from_str::<Value>(&line.expect("line")).expect("frame json"));
+    let mut frames = Vec::new();
+    let mut saw_receipt = false;
+    let mut saw_idle = false;
+    loop {
+        let frame = read_frame(&mut reader);
+        if frame.get("id") == Some(&Value::from(2)) {
+            assert!(frame["result"]["messageId"].is_string());
+            saw_receipt = true;
+        }
+        if frame["method"] == "session.status" && frame["params"]["status"] == "idle" {
+            saw_idle = true;
+        }
+        frames.push(frame);
+        if saw_receipt && saw_idle {
+            break;
+        }
+        if frames.len() > 200 {
+            panic!("did not observe receipt and idle: {frames:?}");
+        }
     }
-    let status = child.wait().expect("dsh exit");
-    assert!(status.success());
-    assert_eq!(
-        lines[0]["result"]["serverInfo"]["name"],
-        "deepseek-harness-sdk-runtime"
-    );
-    assert_eq!(lines[1]["method"], "session.event");
-    assert_eq!(lines[1]["params"]["event"]["type"], "agent/inbox/spliced");
-    assert_eq!(lines[2]["params"]["status"], "running");
-    let receipt = lines
+    let splice = frames
         .iter()
-        .find(|frame| frame["id"] == 2)
-        .expect("prompt receipt");
-    assert!(receipt["result"]["messageId"].is_string());
-    let idle = lines
+        .find(|frame| frame["method"] == "session.event")
+        .expect("session.event");
+    assert_eq!(splice["params"]["event"]["type"], "agent/inbox/spliced");
+    let running = frames
         .iter()
-        .filter(|frame| frame["method"] == "session.status")
-        .next_back()
-        .expect("status frames");
-    assert_eq!(idle["params"]["status"], "idle");
-    assert_eq!(lines.last().unwrap()["result"], serde_json::json!({}));
-    let event_types: Vec<&str> = lines
+        .find(|frame| frame["method"] == "session.status" && frame["params"]["status"] == "running")
+        .expect("running");
+    assert_eq!(running["params"]["status"], "running");
+    let event_types: Vec<&str> = frames
         .iter()
         .filter(|frame| frame["method"] == "session.event")
         .map(|frame| frame["params"]["event"]["type"].as_str().unwrap())
@@ -136,4 +141,13 @@ fn jsonrpc_profile_streams_events_around_the_receipt() {
     assert!(event_types.contains(&"turn/start"));
     assert!(event_types.contains(&"assistant/message"));
     assert!(event_types.contains(&"turn/end"));
+    send(
+        &mut child,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+    );
+    let shutdown = read_frame(&mut reader);
+    assert_eq!(shutdown["result"], serde_json::json!({}));
+    drop(child.stdin.take());
+    let status = child.wait().expect("dsh exit");
+    assert!(status.success());
 }

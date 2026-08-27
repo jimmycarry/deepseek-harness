@@ -80,11 +80,22 @@ impl LoopAgent {
     }
 
     fn set_status(&self, status: AgentStatus) {
-        *self.status.lock().expect("status") = status;
-        self.ctx.emit(
-            "agent/status",
-            serde_json::json!({ "status": format!("{status:?}") }),
-        );
+        let previous = {
+            let mut slot = self.status.lock().expect("status");
+            let previous = *slot;
+            *slot = status;
+            previous
+        };
+        if previous.as_wire_str() != status.as_wire_str() {
+            self.ctx.emit(
+                "agent/status",
+                serde_json::json!({
+                    "agentId": self.session.id().as_str(),
+                    "sessionId": self.session.id().as_str(),
+                    "status": status.as_wire_str(),
+                }),
+            );
+        }
         if status == AgentStatus::Idle {
             self.idle.notify_waiters();
         }

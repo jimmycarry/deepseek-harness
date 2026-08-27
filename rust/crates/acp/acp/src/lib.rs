@@ -4,16 +4,17 @@
 //! modules.
 //!
 //! The TypeScript bridge streams `session/update` while the turn runs and
-//! answers `session/prompt` at quiescence. This server also answers at
-//! quiescence, but reads stdin on a dedicated thread so `session/cancel` can
-//! reach an in-flight prompt; every `agent_message_chunk` update still
-//! precedes that prompt's response.
+//! answers `session/prompt` at quiescence. This server matches that split:
+//! store-backed appends publish `session/event`, each committed assistant
+//! text block is written as `agent_message_chunk` on the shared stdout while
+//! the prompt RPC waits for idle, and later frames (including `session/cancel`)
+//! are read on a dedicated stdin thread.
 
 use dsh_agent::{Agent, AgentCancelCause, AgentHandle, AgentRegistry};
 use dsh_agent_loop::run_followup;
 use dsh_cordis::{Context, Service};
 use dsh_llm::{ContentBlock, UserMessage};
-use dsh_sdk_protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use dsh_sdk_protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcStdout};
 use dsh_session::{Session, SessionEventData, SessionHeader, SessionStore, TurnEndReason};
 use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
@@ -74,6 +75,8 @@ impl Drop for InflightGuard<'_> {
 #[derive(Default)]
 pub struct AcpServer {
     sessions: Mutex<HashMap<String, SessionRecord>>,
+    outbound: Mutex<Option<JsonRpcStdout>>,
+    subscribed: AtomicBool,
 }
 
 impl Service for AcpServer {
@@ -94,9 +97,72 @@ impl AcpServer {
         Self::default()
     }
 
-    /// Mount the server as `ctx.acp`.
+    /// Mount the server as `ctx.acp` and subscribe to committed assistant text.
     pub fn install(ctx: &Context) -> dsh_cordis::Result<()> {
-        ctx.provide(Arc::new(Self::new()))
+        let server = Arc::new(Self::new());
+        server.bind_events(ctx);
+        ctx.provide(server)
+    }
+
+    /// Write live `session/update` frames on this stdout.
+    pub fn set_outbound(&self, stdout: JsonRpcStdout) {
+        *self.outbound.lock().expect("acp outbound") = Some(stdout);
+    }
+
+    fn bind_events(self: &Arc<Self>, ctx: &Context) {
+        if self.subscribed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let server = Arc::clone(self);
+        let _ = ctx.on("session/event", move |payload| {
+            server.forward_assistant_chunks(&payload);
+        });
+    }
+
+    fn live(&self) -> bool {
+        self.outbound
+            .lock()
+            .expect("acp outbound")
+            .is_some()
+    }
+
+    fn forward_assistant_chunks(&self, payload: &Value) {
+        let Some(session_id) = payload.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let inflight = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(session_id).map(|record| record.inflight))
+            .unwrap_or(false);
+        if !inflight {
+            return;
+        }
+        let Some(event) = payload.get("event") else {
+            return;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("assistant/message") {
+            return;
+        }
+        let Some(content) = event
+            .pointer("/data/message/content")
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        let Some(outbound) = self.outbound.lock().ok().and_then(|slot| slot.clone()) else {
+            return;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let Some(text) = block.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let _ = outbound.write_json(&agent_message_chunk(session_id, text));
+        }
     }
 
     /// Dispatch one incoming request, returning the `session/update`
@@ -291,6 +357,7 @@ impl AcpServer {
             session_id: session_id.clone(),
         };
         let message = UserMessage::from_parts(content, dsh_llm::MessageSource::User);
+        let live = self.live();
         let watermark = agent.session().events().len();
         if let Err(error) = run_followup(agent.as_ref(), message).await {
             return (Vec::new(), internal_error(id, &error.to_string()));
@@ -306,9 +373,11 @@ impl AcpServer {
         for event in events.iter().skip(watermark) {
             match &event.data {
                 SessionEventData::AssistantMessage { message, .. } => {
-                    for block in &message.content {
-                        if let ContentBlock::Text { text } = block {
-                            notifications.push(agent_message_chunk(&session_id, text));
+                    if !live {
+                        for block in &message.content {
+                            if let ContentBlock::Text { text } = block {
+                                notifications.push(agent_message_chunk(&session_id, text));
+                            }
                         }
                     }
                 }
@@ -369,18 +438,22 @@ fn agent_message_chunk(session_id: &str, text: &str) -> JsonRpcNotification {
 
 /// Serve newline-delimited ACP JSON-RPC until EOF. `session/prompt` runs as a
 /// background task so later frames — including `session/cancel` — can be read
-/// while the turn is in flight. Notifications for a request are written
-/// before its response; `session/cancel` frames (no id) produce no output.
+/// while the turn is in flight. Committed assistant text is written as
+/// `session/update` while that task runs; the prompt response is written after
+/// idle. `session/cancel` frames (no id) produce no output.
 pub async fn serve<R, W>(
     ctx: Context,
     server: Arc<AcpServer>,
     reader: R,
-    mut writer: W,
+    writer: W,
 ) -> Result<(), String>
 where
     R: BufRead + Send + 'static,
-    W: Write,
+    W: Write + Send + 'static,
 {
+    let stdout = JsonRpcStdout::new(writer);
+    server.set_outbound(stdout.clone());
+    server.bind_events(&ctx);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
     std::thread::spawn(move || {
         for line in reader.lines() {
@@ -426,9 +499,9 @@ where
                         } else {
                             let (notifications, response) = server.handle_request(&ctx, request).await;
                             for notification in notifications {
-                                write_frame(&mut writer, &notification)?;
+                                stdout.write_json(&notification)?;
                             }
-                            write_frame(&mut writer, &response)?;
+                            stdout.write_json(&response)?;
                         }
                     }
                 }
@@ -436,9 +509,9 @@ where
             Some(joined) = prompts.join_next(), if !prompts.is_empty() => {
                 let (notifications, response) = joined.map_err(|error| error.to_string())?;
                 for notification in notifications {
-                    write_frame(&mut writer, &notification)?;
+                    stdout.write_json(&notification)?;
                 }
-                write_frame(&mut writer, &response)?;
+                stdout.write_json(&response)?;
             }
         }
     }
@@ -458,11 +531,6 @@ pub async fn serve_stdio(ctx: &Context) -> Result<(), String> {
         std::io::stdout(),
     )
     .await
-}
-
-fn write_frame<W: Write>(writer: &mut W, frame: &impl serde::Serialize) -> Result<(), String> {
-    let line = serde_json::to_string(frame).map_err(|error| error.to_string())?;
-    writeln!(writer, "{line}").map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -845,6 +913,87 @@ mod tests {
             .find(|frame| frame.get("id") == Some(&Value::from(2)))
             .expect("prompt response");
         assert_eq!(prompt["result"]["stopReason"], "cancelled", "{body}");
+    }
+
+    #[tokio::test]
+    async fn serve_writes_chunk_before_the_prompt_response() {
+        let ctx = Context::new();
+        apply_replay(&ctx, "ONE").unwrap();
+        let server = Arc::new(AcpServer::new());
+        server.bind_events(&ctx);
+        ctx.on("session/event", |payload| {
+            if payload
+                .get("event")
+                .and_then(|event| event.get("type"))
+                .and_then(Value::as_str)
+                == Some("assistant/message")
+            {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        })
+        .unwrap();
+        let (_, response) = server
+            .handle_request(
+                &ctx,
+                request(1, "session/new", serde_json::json!({"cwd": "/tmp"})),
+            )
+            .await;
+        let session_id = response.result.unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serve_task = {
+            let ctx = ctx.clone();
+            let server = Arc::clone(&server);
+            let captured = Arc::clone(&captured);
+            tokio::spawn(async move {
+                serve(
+                    ctx,
+                    server,
+                    std::io::BufReader::new(ChannelRead {
+                        rx,
+                        leftover: Vec::new(),
+                    }),
+                    Capture(captured),
+                )
+                .await
+            })
+        };
+        tx.send(Some(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": "go" }],
+                },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let body = String::from_utf8(captured.lock().expect("capture").clone()).unwrap();
+            let has_chunk = body.contains("agent_message_chunk");
+            let has_response = body.lines().any(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .is_some_and(|frame| frame.get("id") == Some(&Value::from(2)))
+            });
+            if has_chunk {
+                assert!(!has_response, "chunk must precede the prompt response: {body}");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for agent_message_chunk: {body}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tx.send(None).unwrap();
+        serve_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

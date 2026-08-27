@@ -2,28 +2,26 @@
 //! `initialize`, `session/prompt`, and `shutdown`, and streams `session.event`
 //! and `session.status` notifications for each driven turn.
 //!
-//! The TypeScript server enqueues a prompt and lets the agent run in the
-//! background, so its receipt response precedes most event notifications. This
-//! server drives the turn to quiescence inside the request, so every
-//! notification for the turn precedes the response; the notification order
-//! itself (inbox splice, `running`, turn events, `idle`) matches TypeScript.
-//! `subagent.started` / `subagent.finished` collected during the driven turn
-//! land after `running` and before `idle`.
+//! `session/prompt` enqueues via `followup` and returns `{ messageId }`
+//! immediately on the live stdio writer. `session.event` / `session.status` /
+//! `subagent.*` are forwarded from the Cordis bus while the agent runs.
+//! Callers that do not attach a writer (HTTP `/rpc`, crate tests) still drive
+//! the turn to quiescence inside the request and return the notification
+//! batch: splice, `running`, turn events, `subagent.*`, then `idle`.
 
 use dsh_agent::{Agent, AgentHandle, AgentRegistry};
-use dsh_agent_loop::run_followup;
 use dsh_cordis::{Context, Service};
 use dsh_llm::{LlmRuntime, UserMessage};
 use dsh_sdk_protocol::{
     methods, InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, ServerInfo, SessionPromptParams, SessionPromptResult, SERVER_NAME,
-    SERVER_VERSION,
+    JsonRpcResponse, JsonRpcStdout, ServerInfo, SessionPromptParams, SessionPromptResult,
+    SERVER_NAME, SERVER_VERSION,
 };
 use dsh_session::{Session, SessionHeader, SessionStore};
 use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +29,7 @@ use std::sync::{Arc, Mutex};
 struct SessionEntry {
     agent: Arc<dyn Agent>,
     handle: Option<AgentHandle>,
+    drive: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Route and lifecycle state configured by `initialize`.
@@ -61,6 +60,7 @@ impl Default for State {
 pub struct HarnessSdkJsonRpcServer {
     state: Mutex<State>,
     pending: Arc<Mutex<Vec<JsonRpcNotification>>>,
+    outbound: Arc<Mutex<Option<JsonRpcStdout>>>,
     subscribed: AtomicBool,
     max_tokens_as_success: Arc<AtomicBool>,
 }
@@ -70,6 +70,7 @@ impl Default for HarnessSdkJsonRpcServer {
         Self {
             state: Mutex::new(State::default()),
             pending: Arc::new(Mutex::new(Vec::new())),
+            outbound: Arc::new(Mutex::new(None)),
             subscribed: AtomicBool::new(false),
             max_tokens_as_success: Arc::new(AtomicBool::new(false)),
         }
@@ -93,12 +94,57 @@ impl HarnessSdkJsonRpcServer {
         ctx.provide(server)
     }
 
-    /// Subscribe once for `subagent.started` / `subagent.finished`.
+    /// Write live notifications and the prompt receipt on this stdout.
+    pub fn set_outbound(&self, stdout: JsonRpcStdout) {
+        *self.outbound.lock().expect("sdk outbound") = Some(stdout);
+    }
+
+    /// Subscribe once for session, status, and subagent notifications.
     fn subscribe(&self, ctx: &Context) {
         if self.subscribed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let outbound = Arc::clone(&self.outbound);
+        let _ = ctx.on("session/event", move |payload| {
+            let Some(stdout) = outbound.lock().ok().and_then(|slot| slot.clone()) else {
+                return;
+            };
+            let Some(session_id) = payload.get("sessionId").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(event) = payload.get("event") else {
+                return;
+            };
+            let _ = stdout.write_json(&JsonRpcNotification::new(
+                methods::SESSION_EVENT,
+                Some(serde_json::json!({
+                    "sessionId": session_id,
+                    "event": event,
+                })),
+            ));
+        });
+        let outbound = Arc::clone(&self.outbound);
+        let _ = ctx.on("agent/status", move |payload| {
+            let Some(stdout) = outbound.lock().ok().and_then(|slot| slot.clone()) else {
+                return;
+            };
+            let Some(status) = payload.get("status").and_then(Value::as_str) else {
+                return;
+            };
+            if status != "running" && status != "idle" {
+                return;
+            }
+            let Some(session_id) = payload
+                .get("sessionId")
+                .or_else(|| payload.get("agentId"))
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            let _ = stdout.write_json(&status_notification(session_id, status));
+        });
         let pending = Arc::clone(&self.pending);
+        let outbound = Arc::clone(&self.outbound);
         let _ = ctx.on("session/created", move |payload| {
             let Some(parent) = payload.get("parentSession").and_then(Value::as_str) else {
                 return;
@@ -106,18 +152,21 @@ impl HarnessSdkJsonRpcServer {
             let Some(child) = payload.get("id").and_then(Value::as_str) else {
                 return;
             };
-            pending
-                .lock()
-                .expect("sdk pending")
-                .push(JsonRpcNotification::new(
-                    methods::SUBAGENT_STARTED,
-                    Some(serde_json::json!({
-                        "parentSessionId": parent,
-                        "childSessionId": child,
-                    })),
-                ));
+            let notification = JsonRpcNotification::new(
+                methods::SUBAGENT_STARTED,
+                Some(serde_json::json!({
+                    "parentSessionId": parent,
+                    "childSessionId": child,
+                })),
+            );
+            if let Some(stdout) = outbound.lock().ok().and_then(|slot| slot.clone()) {
+                let _ = stdout.write_json(&notification);
+                return;
+            }
+            pending.lock().expect("sdk pending").push(notification);
         });
         let pending = Arc::clone(&self.pending);
+        let outbound = Arc::clone(&self.outbound);
         let max_tokens = Arc::clone(&self.max_tokens_as_success);
         let _ = ctx.on("subagent/end", move |payload| {
             if payload.get("local").and_then(Value::as_bool) != Some(true) {
@@ -147,13 +196,12 @@ impl HarnessSdkJsonRpcServer {
             if let Some(message) = payload.get("lastAssistantMessage") {
                 body["lastAssistantMessage"] = message.clone();
             }
-            pending
-                .lock()
-                .expect("sdk pending")
-                .push(JsonRpcNotification::new(
-                    methods::SUBAGENT_FINISHED,
-                    Some(body),
-                ));
+            let notification = JsonRpcNotification::new(methods::SUBAGENT_FINISHED, Some(body));
+            if let Some(stdout) = outbound.lock().ok().and_then(|slot| slot.clone()) {
+                let _ = stdout.write_json(&notification);
+                return;
+            }
+            pending.lock().expect("sdk pending").push(notification);
         });
     }
 
@@ -237,18 +285,18 @@ impl HarnessSdkJsonRpcServer {
             Ok(params) => params,
             Err(error) => return (Vec::new(), JsonRpcResponse::error(id, -32603, error)),
         };
-        let agent = match self.get_or_create_session(ctx, &params.session_id) {
-            Ok(agent) => agent,
+        let (agent, drive) = match self.get_or_create_session(ctx, &params.session_id) {
+            Ok(pair) => pair,
             Err(error) => return (Vec::new(), JsonRpcResponse::error(id, -32603, error)),
         };
         // A registry-level reload disposes the loop's agents while this record
         // survives; a retained agent accepts followup() silently, so validate
         // the record against the live registry before delivery.
-        let live = ctx
+        let live_agent = ctx
             .service::<AgentRegistry>()
             .ok()
             .and_then(|agents| agents.get(agent.id()));
-        if !live.is_some_and(|live| Arc::ptr_eq(&live, &agent)) {
+        if !live_agent.is_some_and(|live| Arc::ptr_eq(&live, &agent)) {
             return (
                 Vec::new(),
                 JsonRpcResponse::error(
@@ -264,11 +312,22 @@ impl HarnessSdkJsonRpcServer {
         let message = UserMessage::from_parts(params.content_blocks, dsh_llm::MessageSource::User);
         let message_id = message.id.clone();
         let watermark = agent.session().events().len();
-        if let Err(error) = run_followup(agent.as_ref(), message).await {
-            return (
-                Vec::new(),
-                JsonRpcResponse::error(id, -32603, error.to_string()),
-            );
+        agent.followup(message);
+        {
+            let _drive = drive.lock().await;
+            if let Err(error) = agent.run().await {
+                return (
+                    Vec::new(),
+                    JsonRpcResponse::error(id, -32603, error.to_string()),
+                );
+            }
+            agent.when_idle().await;
+            if let Err(error) = agent.run_maintenance().await {
+                return (
+                    Vec::new(),
+                    JsonRpcResponse::error(id, -32603, error.to_string()),
+                );
+            }
         }
         if let Some(persistence) = ctx.get::<PersistenceRuntime>() {
             if let Err(error) = persistence.save(agent.session().as_ref()).await {
@@ -300,6 +359,74 @@ impl HarnessSdkJsonRpcServer {
         )
     }
 
+    async fn stdio_prompt(
+        &self,
+        ctx: &Context,
+        request: JsonRpcRequest,
+        stdout: &JsonRpcStdout,
+    ) -> Result<(), String> {
+        self.subscribe(ctx);
+        let id = request.id.clone();
+        let params: SessionPromptParams = match request
+            .params
+            .ok_or_else(|| "session/prompt requires params".to_string())
+            .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
+        {
+            Ok(params) => params,
+            Err(error) => {
+                stdout.write_json(&JsonRpcResponse::error(id, -32603, error))?;
+                return Ok(());
+            }
+        };
+        let (agent, drive) = match self.get_or_create_session(ctx, &params.session_id) {
+            Ok(pair) => pair,
+            Err(error) => {
+                stdout.write_json(&JsonRpcResponse::error(id, -32603, error))?;
+                return Ok(());
+            }
+        };
+        let live_agent = ctx
+            .service::<AgentRegistry>()
+            .ok()
+            .and_then(|agents| agents.get(agent.id()));
+        if !live_agent.is_some_and(|live| Arc::ptr_eq(&live, &agent)) {
+            stdout.write_json(&JsonRpcResponse::error(
+                id,
+                -32603,
+                format!(
+                    "session agent was disposed outside the server: {}",
+                    params.session_id
+                ),
+            ))?;
+            return Ok(());
+        }
+        let message = UserMessage::from_parts(params.content_blocks, dsh_llm::MessageSource::User);
+        let receipt = SessionPromptResult {
+            message_id: message.id.clone(),
+        };
+        agent.followup(message);
+        stdout.write_json(&JsonRpcResponse::result(
+            id,
+            serde_json::to_value(receipt).expect("prompt receipt"),
+        ))?;
+        {
+            let _drive = drive.lock().await;
+            agent.run().await.map_err(|error| error.to_string())?;
+            agent.when_idle().await;
+            agent
+                .run_maintenance()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(persistence) = ctx.get::<PersistenceRuntime>() {
+            persistence
+                .save(agent.session().as_ref())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Dispose server-owned agents. The surrounding context remains running.
     fn shutdown(&self, id: Value) -> JsonRpcResponse {
         let mut state = self.state.lock().expect("sdk state");
@@ -316,13 +443,13 @@ impl HarnessSdkJsonRpcServer {
         &self,
         ctx: &Context,
         session_id: &str,
-    ) -> Result<Arc<dyn Agent>, String> {
+    ) -> Result<(Arc<dyn Agent>, Arc<tokio::sync::Mutex<()>>), String> {
         let mut state = self.state.lock().expect("sdk state");
         if state.shutting_down {
             return Err("SDK server is shutting down".into());
         }
         if let Some(entry) = state.sessions.get(session_id) {
-            return Ok(Arc::clone(&entry.agent));
+            return Ok((Arc::clone(&entry.agent), Arc::clone(&entry.drive)));
         }
         let store = ctx
             .service::<SessionStore>()
@@ -336,14 +463,16 @@ impl HarnessSdkJsonRpcServer {
             .create(session)
             .map_err(|error| error.to_string())?;
         let agent = Arc::clone(&handle.agent);
+        let drive = Arc::new(tokio::sync::Mutex::new(()));
         state.sessions.insert(
             session_id.to_string(),
             SessionEntry {
                 agent: Arc::clone(&agent),
                 handle: Some(handle),
+                drive: Arc::clone(&drive),
             },
         );
-        Ok(agent)
+        Ok((agent, drive))
     }
 }
 
@@ -394,29 +523,80 @@ fn status_notification(session_id: &str, status: &str) -> JsonRpcNotification {
     )
 }
 
-/// Serve newline-delimited JSON-RPC over the given reader/writer until EOF.
-/// Notifications for a request are written before its response.
-pub async fn serve<R: BufRead, W: Write>(
+/// Serve newline-delimited JSON-RPC until EOF. `session/prompt` writes the
+/// `{ messageId }` receipt as soon as `followup` succeeds, then streams
+/// `session.event` / `session.status` / `subagent.*` while the agent runs.
+/// `shutdown` waits for in-flight prompts before disposing server-owned agents.
+pub async fn serve<R>(
     ctx: &Context,
-    server: &HarnessSdkJsonRpcServer,
+    server: Arc<HarnessSdkJsonRpcServer>,
     reader: R,
-    writer: &mut W,
-) -> Result<(), String> {
-    for line in reader.lines() {
-        let line = line.map_err(|error| error.to_string())?;
-        if line.trim().is_empty() {
-            continue;
+    stdout: JsonRpcStdout,
+) -> Result<(), String>
+where
+    R: BufRead + Send + 'static,
+{
+    server.set_outbound(stdout.clone());
+    server.subscribe(ctx);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(Some(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
-        let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line) else {
-            // Frames without an id (notifications) and malformed lines are
-            // dropped; the SDK protocol defines no client-to-server notifications.
-            continue;
-        };
-        let (notifications, response) = server.handle_request(ctx, request).await;
-        for notification in notifications {
-            write_frame(writer, &notification)?;
+        let _ = tx.send(None);
+    });
+    let mut prompts = tokio::task::JoinSet::new();
+    let mut stdin_open = true;
+    while stdin_open || !prompts.is_empty() {
+        tokio::select! {
+            biased;
+            msg = rx.recv(), if stdin_open => {
+                match msg {
+                    None | Some(None) => stdin_open = false,
+                    Some(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line) else {
+                            continue;
+                        };
+                        if request.method == methods::SESSION_PROMPT {
+                            let ctx = ctx.clone();
+                            let server = Arc::clone(&server);
+                            let stdout = stdout.clone();
+                            prompts.spawn(async move {
+                                server.stdio_prompt(&ctx, request, &stdout).await
+                            });
+                        } else if request.method == methods::SHUTDOWN {
+                            while prompts.join_next().await.is_some() {}
+                            let (notifications, response) =
+                                server.handle_request(ctx, request).await;
+                            for notification in notifications {
+                                stdout.write_json(&notification)?;
+                            }
+                            stdout.write_json(&response)?;
+                        } else {
+                            let (notifications, response) =
+                                server.handle_request(ctx, request).await;
+                            for notification in notifications {
+                                stdout.write_json(&notification)?;
+                            }
+                            stdout.write_json(&response)?;
+                        }
+                    }
+                }
+            }
+            Some(joined) = prompts.join_next(), if !prompts.is_empty() => {
+                joined.map_err(|error| error.to_string())??;
+            }
         }
-        write_frame(writer, &response)?;
     }
     Ok(())
 }
@@ -426,14 +606,13 @@ pub async fn serve_stdio(ctx: &Context) -> Result<(), String> {
     let server = ctx
         .service::<HarnessSdkJsonRpcServer>()
         .map_err(|error| error.to_string())?;
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    serve(ctx, server.as_ref(), stdin.lock(), &mut stdout).await
-}
-
-fn write_frame<W: Write>(writer: &mut W, frame: &impl serde::Serialize) -> Result<(), String> {
-    let line = serde_json::to_string(frame).map_err(|error| error.to_string())?;
-    writeln!(writer, "{line}").map_err(|error| error.to_string())
+    serve(
+        ctx,
+        server,
+        std::io::BufReader::new(std::io::stdin()),
+        JsonRpcStdout::new(std::io::stdout()),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -696,5 +875,141 @@ mod tests {
         assert_eq!(finished["parentSessionId"], started["parentSessionId"]);
         assert_eq!(finished["childSessionId"], started["childSessionId"]);
         assert_eq!(finished["lastAssistantMessage"][0]["text"], "child-done");
+    }
+
+    struct ChannelRead {
+        rx: std::sync::mpsc::Receiver<Option<String>>,
+        leftover: Vec<u8>,
+    }
+
+    impl std::io::Read for ChannelRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.leftover.is_empty() {
+                match self.rx.recv() {
+                    Ok(Some(line)) => {
+                        self.leftover.extend_from_slice(line.as_bytes());
+                        self.leftover.push(b'\n');
+                    }
+                    Ok(None) | Err(_) => return Ok(0),
+                }
+            }
+            let n = self.leftover.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.leftover[..n]);
+            self.leftover.drain(..n);
+            Ok(n)
+        }
+    }
+
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SlowAdapter;
+
+    #[async_trait::async_trait]
+    impl dsh_llm::LlmAdapter for SlowAdapter {
+        async fn stream(
+            &self,
+            _: dsh_llm::LlmRequest,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<'static, dsh_llm::StreamChunk>,
+            dsh_llm::LlmError,
+        > {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            Ok(Box::pin(futures::stream::iter(
+                dsh_llm::StreamChunk::text_stream("late"),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_returns_the_receipt_before_the_turn_runs() {
+        use dsh_agent_spine::apply;
+
+        let ctx = Context::new();
+        apply(&ctx, Arc::new(SlowAdapter)).unwrap();
+        let server = Arc::new(HarnessSdkJsonRpcServer::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serve_task = {
+            let ctx = ctx.clone();
+            let server = Arc::clone(&server);
+            let captured = Arc::clone(&captured);
+            tokio::spawn(async move {
+                serve(
+                    &ctx,
+                    server,
+                    std::io::BufReader::new(ChannelRead {
+                        rx,
+                        leftover: Vec::new(),
+                    }),
+                    JsonRpcStdout::new(Capture(captured)),
+                )
+                .await
+            })
+        };
+        tx.send(Some(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "cwd": ".",
+                    "provider": "deepseek-official",
+                    "model": "deepseek-v4-flash",
+                },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        tx.send(Some(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "11111111-1111-1111-1111-111111111111",
+                    "contentBlocks": [{ "type": "text", "text": "go" }],
+                },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let body = String::from_utf8(captured.lock().expect("capture").clone()).unwrap();
+            let frames: Vec<Value> = body
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            let receipt = frames.iter().find(|frame| frame.get("id") == Some(&Value::from(2)));
+            if let Some(receipt) = receipt {
+                assert!(receipt["result"]["messageId"].is_string(), "{body}");
+                let has_assistant = frames.iter().any(|frame| {
+                    frame["method"] == methods::SESSION_EVENT
+                        && frame["params"]["event"]["type"] == "assistant/message"
+                });
+                assert!(
+                    !has_assistant,
+                    "receipt must precede assistant/message: {body}"
+                );
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for prompt receipt: {body}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tx.send(None).unwrap();
+        serve_task.await.unwrap().unwrap();
     }
 }

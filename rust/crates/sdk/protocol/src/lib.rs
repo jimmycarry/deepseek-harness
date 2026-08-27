@@ -8,6 +8,8 @@ use dsh_llm::ContentBlock;
 use dsh_session::SessionEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 /// Wire-stable SDK runtime server name returned by `initialize`.
 pub const SERVER_NAME: &str = "deepseek-harness-sdk-runtime";
@@ -97,6 +99,30 @@ impl JsonRpcNotification {
             method: method.into(),
             params,
         }
+    }
+}
+
+/// One ordered newline-delimited JSON-RPC writer shared by request handlers
+/// and live `session/event` / `agent/status` listeners.
+#[derive(Clone)]
+pub struct JsonRpcStdout {
+    inner: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+impl JsonRpcStdout {
+    /// Wrap any `Write` as a cloneable, mutexed stdout.
+    pub fn new<W: Write + Send + 'static>(writer: W) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Box::new(writer))),
+        }
+    }
+
+    /// Serialize one frame as a flushed newline-delimited JSON object.
+    pub fn write_json(&self, frame: &impl Serialize) -> Result<(), String> {
+        let line = serde_json::to_string(frame).map_err(|error| error.to_string())?;
+        let mut writer = self.inner.lock().map_err(|error| error.to_string())?;
+        writeln!(writer, "{line}").map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())
     }
 }
 

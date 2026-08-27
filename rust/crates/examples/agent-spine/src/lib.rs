@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// Mount the product spine on `ctx`. The loop is always last.
 pub fn apply(ctx: &Context, adapter: Arc<dyn LlmAdapter>) -> Result<()> {
     ctx.provide(Arc::new(LlmRuntime::new(adapter)))?;
-    ctx.provide(Arc::new(SessionStore::new()))?;
+    SessionStore::install(ctx)?;
     let prompt = SystemPrompt::new();
     prompt.set_persona("You are DeepSeek Harness.");
     ctx.provide(Arc::new(prompt))?;

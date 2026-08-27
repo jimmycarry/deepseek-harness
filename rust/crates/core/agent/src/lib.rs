@@ -38,6 +38,16 @@ pub enum AgentStatus {
     Maintenance,
 }
 
+impl AgentStatus {
+    /// TypeScript `AgentStatus` wire value: maintenance publishes as `idle`.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Idle | Self::Maintenance => "idle",
+        }
+    }
+}
+
 /// Why the caller cancelled.
 #[derive(Debug, Clone)]
 pub struct AgentCancelCause {

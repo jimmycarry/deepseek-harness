@@ -918,8 +918,8 @@ dependencies = [
 name = "dsh-sdk-server"
 version = "0.1.1-rc.2"
 dependencies = [
+ "async-trait",
  "dsh-agent",
- "dsh-agent-loop",
  "dsh-agent-spine",
  "dsh-cordis",
  "dsh-llm",
@@ -927,6 +927,7 @@ dependencies = [
  "dsh-sdk-protocol",
  "dsh-session",
  "dsh-session-persistence",
+ "futures",
  "serde",
  "serde_json",
  "tokio",

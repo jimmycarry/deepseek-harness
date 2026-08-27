@@ -1,7 +1,7 @@
 //! Append-only session log. Model-visible means logged.
 
 use dsh_brand::Branded;
-use dsh_cordis::Service;
+use dsh_cordis::{Context, Service};
 use dsh_llm::{
     AssistantMessage, ContentBlock, Message, StreamChunk, TokenUsage, ToolResultMessage,
     UserMessage,
@@ -9,9 +9,13 @@ use dsh_llm::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
+
+/// Firehose invoked after a store-backed append commits.
+pub type SessionEventSink = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
 
 /// Brand token for a session id.
 pub struct SessionIdBrand;
@@ -736,6 +740,9 @@ pub enum SessionError {
     /// Required-on-read event type this build does not know.
     #[error("unknown required-on-read event type `{0}`")]
     UnknownRequiredEvent(String),
+    /// A `session/event` observer appended to the same session.
+    #[error("session append cannot reenter while another append is being published")]
+    ReentrantAppend,
 }
 
 /// Folded surface: current nodes and how many replacements have landed.
@@ -782,6 +789,8 @@ pub struct Session {
     header: SessionHeader,
     events: Mutex<Vec<SessionEvent>>,
     surface: Mutex<SessionSurface>,
+    publisher: Mutex<Option<SessionEventSink>>,
+    appending: AtomicBool,
 }
 
 impl Session {
@@ -799,7 +808,14 @@ impl Session {
             header,
             events: Mutex::new(Vec::new()),
             surface: Mutex::new(SessionSurface::default()),
+            publisher: Mutex::new(None),
+            appending: AtomicBool::new(false),
         }
+    }
+
+    /// Attach the store's `session/event` firehose. Detached sessions stay silent.
+    pub fn set_publisher(&self, sink: SessionEventSink) {
+        *self.publisher.lock().expect("publisher") = Some(sink);
     }
 
     /// Session identity.
@@ -882,20 +898,36 @@ impl Session {
         if !data.is_surface() && source_event_seqs.is_some() {
             return Err(SessionError::UnexpectedSourceSeqs);
         }
-        let mut events = self.events.lock().expect("log");
-        let seq = events.len() as u64;
-        if let Some(op) = &surface_op {
-            self.surface.lock().expect("surface").apply(seq, op)?;
+        if self.appending.swap(true, Ordering::SeqCst) {
+            return Err(SessionError::ReentrantAppend);
         }
-        let event = SessionEvent {
-            seq,
-            time: time.unwrap_or_else(now_ms),
-            data,
-            source_event_seqs,
-            surface_op,
-            ignorable,
+        struct AppendGuard<'a>(&'a AtomicBool);
+        impl Drop for AppendGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = AppendGuard(&self.appending);
+        let event = {
+            let mut events = self.events.lock().expect("log");
+            let seq = events.len() as u64;
+            if let Some(op) = &surface_op {
+                self.surface.lock().expect("surface").apply(seq, op)?;
+            }
+            let event = SessionEvent {
+                seq,
+                time: time.unwrap_or_else(now_ms),
+                data,
+                source_event_seqs,
+                surface_op,
+                ignorable,
+            };
+            events.push(event.clone());
+            event
         };
-        events.push(event.clone());
+        if let Some(sink) = self.publisher.lock().expect("publisher").clone() {
+            sink(&event);
+        }
         Ok(event)
     }
 
@@ -962,12 +994,37 @@ pub fn derive_event_message(data: &SessionEventData) -> Option<Message> {
 #[derive(Default)]
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    emit: Mutex<Option<Context>>,
 }
 
 impl SessionStore {
-    /// Create an empty store.
+    /// Create an empty store. Appends stay silent until [`Self::install`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Provide `ctx.sessions` and publish `session/event` for later appends.
+    pub fn install(ctx: &Context) -> dsh_cordis::Result<Arc<Self>> {
+        let store = Arc::new(Self {
+            sessions: Mutex::new(HashMap::new()),
+            emit: Mutex::new(Some(ctx.clone())),
+        });
+        ctx.provide(Arc::clone(&store))?;
+        Ok(store)
+    }
+
+    fn make_sink(&self, id: &SessionId) -> Option<SessionEventSink> {
+        let ctx = self.emit.lock().expect("session emit").clone()?;
+        let session_id = id.as_str().to_string();
+        Some(Arc::new(move |event: &SessionEvent| {
+            ctx.emit(
+                "session/event",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "event": event,
+                }),
+            );
+        }))
     }
 
     /// Create a session under a caller-supplied id, stamping the run cwd.
@@ -980,6 +1037,9 @@ impl SessionStore {
 
     /// Publish a caller-constructed session (explicit header) into the store.
     pub fn publish(&self, session: Session) -> Arc<Session> {
+        if let Some(sink) = self.make_sink(session.id()) {
+            session.set_publisher(sink);
+        }
         let session = Arc::new(session);
         self.sessions
             .lock()
@@ -1325,6 +1385,91 @@ mod tests {
         let store = SessionStore::new();
         let created = store.create(session_id("c"));
         assert!(created.header().cwd.is_some());
+    }
+
+    #[test]
+    fn detached_append_does_not_emit() {
+        let ctx = Context::new();
+        let heard = Arc::new(Mutex::new(0u32));
+        let count = Arc::clone(&heard);
+        ctx.on("session/event", move |_| {
+            *count.lock().expect("heard") += 1;
+        })
+        .unwrap();
+        Session::new(session_id("detached"))
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        assert_eq!(*heard.lock().expect("heard"), 0);
+    }
+
+    #[test]
+    fn store_backed_append_emits_session_event() {
+        let ctx = Context::new();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::clone(&heard);
+        ctx.on("session/event", move |payload| {
+            events.lock().expect("heard").push(payload);
+        })
+        .unwrap();
+        let store = SessionStore::install(&ctx).unwrap();
+        let session = store.create(session_id("live"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let payloads = heard.lock().expect("heard");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["sessionId"], "live");
+        assert_eq!(payloads[0]["event"]["type"], "turn/start");
+        assert_eq!(payloads[0]["event"]["seq"], 0);
+    }
+
+    #[test]
+    fn constructor_seed_does_not_emit_on_publish() {
+        let ctx = Context::new();
+        let heard = Arc::new(Mutex::new(0u32));
+        let count = Arc::clone(&heard);
+        ctx.on("session/event", move |_| {
+            *count.lock().expect("heard") += 1;
+        })
+        .unwrap();
+        let seed = Session::new(session_id("seed"));
+        seed.append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let store = SessionStore::install(&ctx).unwrap();
+        let session = store.publish(
+            Session::replay(session_id("replay"), seed.events()).unwrap(),
+        );
+        assert_eq!(*heard.lock().expect("heard"), 0);
+        session
+            .append(SessionEventData::TurnEnd {
+                turn: 1,
+                reason: TurnEndReason::Completed,
+            }, None)
+            .unwrap();
+        assert_eq!(*heard.lock().expect("heard"), 1);
+    }
+
+    #[test]
+    fn reentrant_append_from_session_event_fails_loud() {
+        let ctx = Context::new();
+        let store = SessionStore::install(&ctx).unwrap();
+        let session = store.create(session_id("reentrant"));
+        let inner = Arc::clone(&session);
+        let result = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&result);
+        ctx.on("session/event", move |_| {
+            *slot.lock().expect("inner") = Some(inner.append(
+                SessionEventData::TurnStart { turn: 2 },
+                None,
+            ));
+        })
+        .unwrap();
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let inner = result.lock().expect("inner").take().unwrap();
+        assert!(matches!(inner, Err(SessionError::ReentrantAppend)));
+        assert_eq!(session.events().len(), 1);
     }
 }
 

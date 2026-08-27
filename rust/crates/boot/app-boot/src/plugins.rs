@@ -33,7 +33,10 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/cordis-plugin-timer" => provide_marker::<Timer>(ctx),
         "@deepseek-ai/cordis-plugin-hmr" => Ok(()),
         "@deepseek-ai/dsh-llm" => apply_llm(ctx),
-        "@deepseek-ai/dsh-session" => ctx.provide(Arc::new(SessionStore::new())),
+        "@deepseek-ai/dsh-session" => {
+            SessionStore::install(ctx)?;
+            Ok(())
+        }
         "@deepseek-ai/dsh-agent" => ctx.provide(Arc::new(AgentRegistry::new())),
         "@deepseek-ai/dsh-agent-default-model" => apply_default_model(ctx, config),
         "@deepseek-ai/dsh-jobs-local" => {
@@ -228,7 +231,7 @@ fn apply_attachment(ctx: &Context, config: Option<Value>) -> Result<()> {
 
 fn apply_session_query(ctx: &Context, config: Option<Value>) -> Result<()> {
     if !ctx.has_service(dsh_session::SessionStore::KEY) {
-        ctx.provide(Arc::new(dsh_session::SessionStore::new()))?;
+        dsh_session::SessionStore::install(ctx)?;
     }
     let resolved = dsh_session_query_sqlite::Config::resolve(config.as_ref())
         .map_err(CordisError::Validation)?;
