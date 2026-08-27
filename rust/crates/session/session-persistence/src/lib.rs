@@ -26,6 +26,9 @@ pub enum PersistenceError {
     /// Header, schema, or JSON that this build will not interpret.
     #[error("{0}")]
     Format(String),
+    /// No durable artifact exists for this session id.
+    #[error("session \"{0}\" not found")]
+    NotFound(String),
     /// Session append or required-on-read refusal.
     #[error(transparent)]
     Session(#[from] SessionError),

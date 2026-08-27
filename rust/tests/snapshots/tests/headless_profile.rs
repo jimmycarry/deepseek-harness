@@ -66,6 +66,7 @@ fn mount_profile_in(dir: &std::path::Path, task: &str, overlay: Vec<EntryPatch>)
     ctx.provide(Arc::new(HeadlessStartup {
         task: task.into(),
         cwd: Some(dir.to_string_lossy().into_owned()),
+        resume_session_id: None,
     }))
     .unwrap();
     let loader = Loader::new();
@@ -363,6 +364,7 @@ fn replay_negative_max_retries_fails_at_mount() {
     ctx.provide(Arc::new(HeadlessStartup {
         task: "x".into(),
         cwd: Some(dir.to_string_lossy().into_owned()),
+        resume_session_id: None,
     }))
     .unwrap();
     let loader = Loader::new();

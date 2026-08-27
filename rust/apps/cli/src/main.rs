@@ -22,6 +22,8 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     let profile = profile_of(&args).unwrap_or("headless");
+    let resume_session_id = resume_session_id(&args)?;
+    reject_resume_on_stdio(profile, &resume_session_id)?;
     // The stdio server profiles take no positional task; they serve stdin.
     let task = if profile == "acp" || profile == "jsonrpc" {
         None
@@ -40,6 +42,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         ctx.provide(Arc::new(HeadlessStartup {
             task: task.to_string(),
             cwd: None,
+            resume_session_id,
         }))
         .map_err(|error| error.to_string())?;
     }
@@ -73,11 +76,67 @@ fn profile_of(args: &[String]) -> Option<&str> {
         .map(|window| window[1].as_str())
 }
 
+fn reject_resume_on_stdio(profile: &str, resume: &Option<String>) -> Result<(), String> {
+    if resume.is_some() && (profile == "acp" || profile == "jsonrpc") {
+        return Err("error: --resume is a headless option".into());
+    }
+    Ok(())
+}
+
+fn resume_session_id(args: &[String]) -> Result<Option<String>, String> {
+    let mut found = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let id = if arg == "--resume" {
+            i += 1;
+            let value = args.get(i).map(String::as_str).unwrap_or("");
+            if value.is_empty() || value.starts_with('-') {
+                return Err("error: --resume needs a session id".into());
+            }
+            Some(value.to_string())
+        } else if let Some(value) = arg.strip_prefix("--resume=") {
+            if value.is_empty() {
+                return Err("error: --resume needs a session id".into());
+            }
+            Some(value.to_string())
+        } else {
+            None
+        };
+        if let Some(id) = id {
+            if found.is_some() {
+                return Err("error: --resume may be supplied once".into());
+            }
+            found = Some(id);
+        }
+        i += 1;
+    }
+    Ok(found)
+}
+
 fn positional_prompt(args: &[String]) -> Option<&str> {
-    args.iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .find(|arg| *arg != "headless" && *arg != "web" && *arg != "acp" && *arg != "jsonrpc")
-        .map(String::as_str)
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg == "--profile" || arg == "--resume" {
+            skip_value = true;
+            continue;
+        }
+        if arg.starts_with("--profile=") || arg.starts_with("--resume=") {
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        if *arg == "headless" || *arg == "web" || *arg == "acp" || *arg == "jsonrpc" {
+            continue;
+        }
+        return Some(arg.as_str());
+    }
+    None
 }
 
 fn print_dump(args: &[String]) -> Result<(), String> {
@@ -86,4 +145,60 @@ fn print_dump(args: &[String]) -> Result<(), String> {
     let entries = compose_profile(&layers, &[], &[], &[]).map_err(|error| error.to_string())?;
     print!("{}", dump_config(&entries));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn positional_prompt_skips_resume_and_profile_values() {
+        assert_eq!(
+            positional_prompt(&args(&[
+                "--profile",
+                "headless",
+                "--resume",
+                "abc",
+                "do the thing",
+            ])),
+            Some("do the thing")
+        );
+        assert_eq!(
+            positional_prompt(&args(&["--resume=abc", "next"])),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn resume_session_id_reads_space_and_equals_forms() {
+        assert_eq!(
+            resume_session_id(&args(&["--resume", "abc", "task"])).unwrap(),
+            Some("abc".into())
+        );
+        assert_eq!(
+            resume_session_id(&args(&["--resume=abc", "task"])).unwrap(),
+            Some("abc".into())
+        );
+        assert!(resume_session_id(&args(&["--resume"])).unwrap_err().contains("needs a session id"));
+        assert!(resume_session_id(&args(&["--resume", "--profile"]))
+            .unwrap_err()
+            .contains("needs a session id"));
+        assert!(resume_session_id(&args(&["--resume", "a", "--resume", "b"]))
+            .unwrap_err()
+            .contains("once"));
+    }
+
+    #[test]
+    fn resume_is_rejected_on_stdio_profiles() {
+        assert!(reject_resume_on_stdio("acp", &Some("abc".into()))
+            .unwrap_err()
+            .contains("headless"));
+        assert!(reject_resume_on_stdio("jsonrpc", &Some("abc".into())).is_err());
+        assert!(reject_resume_on_stdio("headless", &Some("abc".into())).is_ok());
+        assert!(reject_resume_on_stdio("acp", &None).is_ok());
+    }
 }

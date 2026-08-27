@@ -57,6 +57,7 @@ mod tests {
         ctx.provide(std::sync::Arc::new(dsh_bundle_headless::HeadlessStartup {
             task: "ping".into(),
             cwd: None,
+            resume_session_id: None,
         }))
         .unwrap();
         loader.mount(&ctx, &entries).unwrap();

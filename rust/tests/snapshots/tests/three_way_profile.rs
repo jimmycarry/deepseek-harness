@@ -47,6 +47,7 @@ fn mount_profile(profile: &str, provide_task: bool) -> Context {
         ctx.provide(Arc::new(HeadlessStartup {
             task: TASK.into(),
             cwd: Some(dir.to_string_lossy().into_owned()),
+            resume_session_id: None,
         }))
         .unwrap();
     }

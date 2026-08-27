@@ -186,10 +186,7 @@ impl SessionStoreBackend for SqliteBackend {
             (header, rows)
         };
         let Some(header) = header else {
-            return Err(PersistenceError::Format(format!(
-                "session {} is not in the store",
-                id.as_str()
-            )));
+            return Err(PersistenceError::NotFound(id.as_str().to_string()));
         };
         let header: SessionHeader = serde_json::from_str(&header)
             .map_err(|error| PersistenceError::Format(error.to_string()))?;
@@ -306,6 +303,16 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&newer);
+    }
+
+    #[tokio::test]
+    async fn load_missing_session_is_not_found() {
+        let path = tmp_path("missing");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let err = backend.load(&session_id("nope")).await.unwrap_err();
+        assert!(matches!(err, PersistenceError::NotFound(id) if id == "nope"));
+        assert_eq!(err.to_string(), "session \"nope\" not found");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

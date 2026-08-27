@@ -11,8 +11,9 @@ use dsh_llm::{
     MessageSource, ToolResultMessage, UserMessage,
 };
 use dsh_session::{
-    Session, SessionEventData, SessionId, SurfaceOp, TurnEndReason,
+    Session, SessionEventData, SessionId, SessionStore, SurfaceOp, TurnEndReason,
 };
+use dsh_session_persistence::{PersistenceError, PersistenceRuntime};
 use dsh_session_title::SessionTitleService;
 use dsh_system_prompt::{render_prompt, SystemPrompt};
 use dsh_tools::ToolRuntime;
@@ -46,6 +47,40 @@ impl AgentFactory for AgentLoop {
     fn create(&self, session: Arc<Session>) -> Arc<dyn Agent> {
         Arc::new(LoopAgent::new(self.ctx.clone(), session))
     }
+
+    fn announce_start(&self, agent: &dyn Agent, source: &str) {
+        self.ctx.emit(
+            "agent/session-start",
+            serde_json::json!({
+                "agentId": agent.id().as_str(),
+                "sessionId": agent.session().id().as_str(),
+                "source": source,
+            }),
+        );
+    }
+
+    async fn resume(&self, id: &SessionId) -> Result<Arc<dyn Agent>, AgentError> {
+        let persistence = self
+            .ctx
+            .get::<PersistenceRuntime>()
+            .ok_or(AgentError::NoPersistence)?;
+        let sessions = self.ctx.get::<SessionStore>().ok_or_else(|| {
+            AgentError::Persistence("cannot resume: ctx.sessions is not configured".into())
+        })?;
+        if sessions.get(id).is_some() {
+            return Err(AgentError::LiveSession(id.as_str().to_string()));
+        }
+        let stored = match persistence.load(id).await {
+            Ok(session) => session,
+            Err(PersistenceError::NotFound(missing)) => {
+                return Err(AgentError::SessionNotFound(missing));
+            }
+            Err(error) => return Err(AgentError::Persistence(error.to_string())),
+        };
+        let seeded = Session::from_seed(stored.header().clone(), stored.events())
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
+        Ok(self.create(sessions.publish(seeded)))
+    }
 }
 
 struct LoopAgent {
@@ -60,10 +95,12 @@ struct LoopAgent {
     last_context: Mutex<Option<String>>,
     last_header: Mutex<Option<serde_json::Value>>,
     last_request_context: Mutex<Option<(String, String)>>,
+    request_header_logged: AtomicBool,
 }
 
 impl LoopAgent {
     fn new(ctx: Context, session: Arc<Session>) -> Self {
+        let (last_context, last_header, last_request_context) = fold_loop_state(session.as_ref());
         Self {
             ctx,
             inbox: Arc::new(Inbox::for_session(Arc::clone(&session))),
@@ -73,9 +110,10 @@ impl LoopAgent {
             cancel_reason: Mutex::new(None),
             idle: Notify::new(),
             max_tokens: AtomicBool::new(false),
-            last_context: Mutex::new(None),
-            last_header: Mutex::new(None),
-            last_request_context: Mutex::new(None),
+            last_context: Mutex::new(last_context),
+            last_header: Mutex::new(last_header),
+            last_request_context: Mutex::new(last_request_context),
+            request_header_logged: AtomicBool::new(false),
         }
     }
 
@@ -502,9 +540,11 @@ impl LoopAgent {
         let header = serde_json::Value::Object(header_map);
         let reason = {
             let mut last = self.last_header.lock().expect("header");
-            if last.is_none() {
+            let first_of_instance = !self.request_header_logged.swap(true, Ordering::SeqCst);
+            if first_of_instance {
+                let reason = if last.is_some() { "resume" } else { "initial" };
                 *last = Some(header.clone());
-                "initial"
+                reason
             } else if last.as_ref() != Some(&header) {
                 *last = Some(header.clone());
                 "change"
@@ -539,6 +579,38 @@ impl LoopAgent {
                 .ok();
         }
     }
+}
+
+fn fold_loop_state(
+    session: &Session,
+) -> (
+    Option<String>,
+    Option<serde_json::Value>,
+    Option<(String, String)>,
+) {
+    let mut last_context = None;
+    let mut last_header = None;
+    let mut last_request_context = None;
+    for event in session.events() {
+        match event.data {
+            SessionEventData::UserMessage(message) => {
+                if let MessageSource::Plugin {
+                    form: Some(form), ..
+                } = &message.source
+                {
+                    if form == "snapshot" {
+                        last_context = Some(user_text(&message));
+                    }
+                }
+            }
+            SessionEventData::RequestHeader { header, .. } => last_header = Some(header),
+            SessionEventData::RequestContext { provider, model, .. } => {
+                last_request_context = Some((provider, model));
+            }
+            _ => {}
+        }
+    }
+    (last_context, last_header, last_request_context)
 }
 
 fn user_text(message: &UserMessage) -> String {
@@ -966,5 +1038,208 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn tmp_jsonl(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("dsh-resume-{name}-{nanos}"))
+    }
+
+    fn persistent_ctx(dir: &std::path::Path) -> Context {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(HelloAdapter))))
+            .unwrap();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        dsh_session_persistence_jsonl::install(&ctx, dir).unwrap();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn create_announces_startup() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(HelloAdapter))))
+            .unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        let sources = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&sources);
+        ctx.on("agent/session-start", move |payload| {
+            recorded.lock().expect("sources").push(
+                payload
+                    .get("source")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        })
+        .unwrap();
+        let session = ctx.service::<SessionStore>().unwrap().create_fresh();
+        ctx.service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        assert_eq!(
+            sources.lock().expect("sources").as_slice(),
+            ["startup".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_persisted_continues_history_and_turn_numbering() {
+        let dir = tmp_jsonl("history");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = dsh_session::session_id("sess-resume");
+        let first_len;
+        {
+            let ctx = persistent_ctx(&dir);
+            let session = ctx.service::<SessionStore>().unwrap().create(id.clone());
+            let handle = ctx
+                .service::<AgentRegistry>()
+                .unwrap()
+                .create(session)
+                .unwrap();
+            run_followup(handle.agent.as_ref(), UserMessage::text("first question"))
+                .await
+                .unwrap();
+            first_len = handle.agent.session().events().len();
+            ctx.service::<PersistenceRuntime>()
+                .unwrap()
+                .save(handle.agent.session().as_ref())
+                .await
+                .unwrap();
+            ctx.dispose();
+        }
+        let ctx = persistent_ctx(&dir);
+        let sources = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&sources);
+        ctx.on("agent/session-start", move |payload| {
+            recorded.lock().expect("sources").push(
+                payload
+                    .get("source")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        })
+        .unwrap();
+        let handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .resume_persisted(&id)
+            .await
+            .unwrap();
+        assert_eq!(
+            sources.lock().expect("sources").as_slice(),
+            ["resume".to_string()]
+        );
+        assert_eq!(handle.agent.session().id().as_str(), "sess-resume");
+        assert_eq!(handle.agent.session().first_live_seq(), first_len as u64);
+        assert_eq!(handle.agent.session().events().len(), first_len + 1);
+        assert!(matches!(
+            handle.agent.session().events().last().unwrap().data,
+            SessionEventData::SessionEndSeed {}
+        ));
+        run_followup(handle.agent.as_ref(), UserMessage::text("second question"))
+            .await
+            .unwrap();
+        let turns: Vec<u32> = handle
+            .agent
+            .session()
+            .events()
+            .into_iter()
+            .filter_map(|event| match event.data {
+                SessionEventData::TurnStart { turn } => Some(turn),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turns, vec![1, 2]);
+        let seqs: Vec<u64> = handle
+            .agent
+            .session()
+            .events()
+            .into_iter()
+            .map(|event| event.seq)
+            .collect();
+        assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+        let reasons: Vec<String> = handle
+            .agent
+            .session()
+            .events()
+            .into_iter()
+            .filter_map(|event| match event.data {
+                SessionEventData::RequestHeader { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert!(reasons.contains(&"initial".into()), "{reasons:?}");
+        assert!(reasons.contains(&"resume".into()), "{reasons:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_without_persistence() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SessionStore::new())).unwrap();
+        ctx.provide(Arc::new(LlmRuntime::new(Arc::new(HelloAdapter))))
+            .unwrap();
+        ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
+        AgentLoop::install(&ctx).unwrap();
+        let err = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .resume_persisted(&dsh_session::session_id("nope"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("session persistence is not configured"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_missing_session() {
+        let dir = tmp_jsonl("missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = persistent_ctx(&dir);
+        let err = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .resume_persisted(&dsh_session::session_id("nope"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "session \"nope\" not found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_live_session() {
+        let dir = tmp_jsonl("live");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = persistent_ctx(&dir);
+        let id = dsh_session::session_id("live-resume");
+        let session = ctx.service::<SessionStore>().unwrap().create(id.clone());
+        ctx.service::<AgentRegistry>()
+            .unwrap()
+            .create(session)
+            .unwrap();
+        let err = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .resume_persisted(&id)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot prepare session \"live-resume\" while it is live"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

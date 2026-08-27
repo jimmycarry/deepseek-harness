@@ -64,6 +64,18 @@ pub enum AgentError {
     /// Session is missing.
     #[error("unknown session")]
     UnknownSession,
+    /// `resume` ran without a persistence backend.
+    #[error("cannot resume: session persistence is not configured (load a dsh-session-persistence backend)")]
+    NoPersistence,
+    /// `prepare`/`resume` of an id that is already in the live store.
+    #[error("cannot prepare session \"{0}\" while it is live")]
+    LiveSession(String),
+    /// Persistence has no artifact for this id.
+    #[error("session \"{0}\" not found")]
+    SessionNotFound(String),
+    /// Persistence load or seed reconstruction failed.
+    #[error("{0}")]
+    Persistence(String),
 }
 
 /// One queued inbox entry.
@@ -224,6 +236,15 @@ pub trait Agent: Send + Sync {
 pub trait AgentFactory: Send + Sync {
     /// Build a new agent for `session`.
     fn create(&self, session: Arc<Session>) -> Arc<dyn Agent>;
+    /// Emit `agent/session-start` after the agent is live in the registry.
+    fn announce_start(&self, agent: &dyn Agent, source: &str) {
+        let _ = (agent, source);
+    }
+    /// Load a persisted session by id, seed it, and build an unpublished agent.
+    async fn resume(&self, id: &SessionId) -> Result<Arc<dyn Agent>, AgentError> {
+        let _ = id;
+        Err(AgentError::NoPersistence)
+    }
 }
 
 /// Owner handle.
@@ -276,24 +297,7 @@ impl AgentRegistry {
 
     /// Create an agent under a caller-supplied session.
     pub fn create(&self, session: Arc<Session>) -> Result<AgentHandle, AgentError> {
-        let factory = self
-            .factory
-            .lock()
-            .expect("factory")
-            .clone()
-            .ok_or(AgentError::NoFactory)?;
-        let agent = factory.create(Arc::clone(&session));
-        self.live
-            .lock()
-            .expect("live")
-            .insert(session.id().as_str().to_string(), Arc::clone(&agent));
-        let live = Arc::new(());
-        let _ = live;
-        let id = session.id().as_str().to_string();
-        let live = Arc::clone(&self.live);
-        Ok(AgentHandle::new(agent, move || {
-            live.lock().expect("live").remove(&id);
-        }))
+        self.spawn(session, "startup")
     }
 
     /// Look up a live agent.
@@ -306,9 +310,56 @@ impl AgentRegistry {
         self.live.lock().expect("live").values().cloned().collect()
     }
 
-    /// Resume a persisted session under a new live agent.
+    /// Resume a caller-supplied reconstructed session under a new live agent.
     pub fn resume(&self, session: Arc<Session>) -> Result<AgentHandle, AgentError> {
-        self.create(session)
+        self.spawn(session, "resume")
+    }
+
+    /// Load a persisted session by id, seed it, and resume an agent on it.
+    pub async fn resume_persisted(&self, id: &SessionId) -> Result<AgentHandle, AgentError> {
+        let factory = self
+            .factory
+            .lock()
+            .expect("factory")
+            .clone()
+            .ok_or(AgentError::NoFactory)?;
+        let agent = factory.resume(id).await?;
+        self.enter(agent, "resume")
+    }
+
+    fn spawn(
+        &self,
+        session: Arc<Session>,
+        source: &'static str,
+    ) -> Result<AgentHandle, AgentError> {
+        let factory = self
+            .factory
+            .lock()
+            .expect("factory")
+            .clone()
+            .ok_or(AgentError::NoFactory)?;
+        let agent = factory.create(Arc::clone(&session));
+        self.enter(agent, source)
+    }
+
+    fn enter(
+        &self,
+        agent: Arc<dyn Agent>,
+        source: &'static str,
+    ) -> Result<AgentHandle, AgentError> {
+        let factory = self.factory.lock().expect("factory").clone();
+        self.live.lock().expect("live").insert(
+            agent.id().as_str().to_string(),
+            Arc::clone(&agent),
+        );
+        if let Some(factory) = factory {
+            factory.announce_start(agent.as_ref(), source);
+        }
+        let id = agent.id().as_str().to_string();
+        let live = Arc::clone(&self.live);
+        Ok(AgentHandle::new(agent, move || {
+            live.lock().expect("live").remove(&id);
+        }))
     }
 }
 

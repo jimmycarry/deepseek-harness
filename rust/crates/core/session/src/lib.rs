@@ -9,7 +9,7 @@ use dsh_llm::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
@@ -469,6 +469,10 @@ pub enum SessionEventData {
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
     },
+    /// Constructor-seed boundary. A resumed or forked session appends this
+    /// once after the seed when the stored log does not already end with it.
+    #[serde(rename = "session/end-seed")]
+    SessionEndSeed {},
     /// Compaction lock end.
     #[serde(rename = "compaction/end")]
     CompactionEnd {
@@ -632,8 +636,18 @@ pub fn event_type_name(data: &SessionEventData) -> &str {
         SessionEventData::CompactionStart { .. } => "compaction/start",
         SessionEventData::CompactionSummary { .. } => "compaction/summary",
         SessionEventData::CompactionEnd { .. } => "compaction/end",
+        SessionEventData::SessionEndSeed {} => "session/end-seed",
         SessionEventData::Extension { type_name, .. } => type_name.as_str(),
     }
+}
+
+/// Whether `data` is the constructor-seed marker, typed or as an extension.
+pub fn is_end_seed(data: &SessionEventData) -> bool {
+    matches!(data, SessionEventData::SessionEndSeed {})
+        || matches!(
+            data,
+            SessionEventData::Extension { type_name, .. } if type_name == "session/end-seed"
+        )
 }
 
 /// Event types this build reconstructs without an `ignorable` marker.
@@ -791,6 +805,7 @@ pub struct Session {
     surface: Mutex<SessionSurface>,
     publisher: Mutex<Option<SessionEventSink>>,
     appending: AtomicBool,
+    first_live_seq: AtomicU64,
 }
 
 impl Session {
@@ -810,7 +825,40 @@ impl Session {
             surface: Mutex::new(SessionSurface::default()),
             publisher: Mutex::new(None),
             appending: AtomicBool::new(false),
+            first_live_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Reconstruct a session from a constructor seed (resume, fork, or replay).
+    ///
+    /// `first_live_seq` is the seed length. When the seed does not already end
+    /// with `session/end-seed`, that marker is appended at that seq and is
+    /// itself a constructor write: it must land before the store publisher.
+    pub fn from_seed(
+        header: SessionHeader,
+        events: impl IntoIterator<Item = SessionEvent>,
+    ) -> Result<Self, SessionError> {
+        let session = Self::with_header(header);
+        for event in events {
+            session.append_logged(event)?;
+        }
+        let first_live = session.events().len() as u64;
+        session
+            .first_live_seq
+            .store(first_live, Ordering::SeqCst);
+        let needs_marker = match session.events().last() {
+            Some(event) if is_end_seed(&event.data) => false,
+            _ => true,
+        };
+        if needs_marker {
+            session.append(SessionEventData::SessionEndSeed {}, None)?;
+        }
+        Ok(session)
+    }
+
+    /// First seq appended in this process: the constructor seed length.
+    pub fn first_live_seq(&self) -> u64 {
+        self.first_live_seq.load(Ordering::SeqCst)
     }
 
     /// Attach the store's `session/event` firehose. Detached sessions stay silent.
@@ -1385,6 +1433,73 @@ mod tests {
         let store = SessionStore::new();
         let created = store.create(session_id("c"));
         assert!(created.header().cwd.is_some());
+    }
+
+    #[test]
+    fn from_seed_appends_end_seed_once_and_keeps_first_live_seq() {
+        let source = Session::new(session_id("src"));
+        source
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        source
+            .append(
+                SessionEventData::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Completed,
+                },
+                None,
+            )
+            .unwrap();
+        let seeded = Session::from_seed(source.header().clone(), source.events()).unwrap();
+        assert_eq!(seeded.first_live_seq(), 2);
+        assert_eq!(seeded.events().len(), 3);
+        assert!(is_end_seed(&seeded.events().last().unwrap().data));
+        let reopened = Session::from_seed(seeded.header().clone(), seeded.events()).unwrap();
+        assert_eq!(reopened.first_live_seq(), 3);
+        assert_eq!(reopened.events().len(), 3);
+        assert!(is_end_seed(&reopened.events().last().unwrap().data));
+    }
+
+    #[test]
+    fn empty_seed_appends_end_seed_at_seq_zero() {
+        let seeded = Session::from_seed(Session::new(session_id("empty")).header().clone(), [])
+            .unwrap();
+        assert_eq!(seeded.first_live_seq(), 0);
+        assert_eq!(seeded.events().len(), 1);
+        let wire = serde_json::to_value(&seeded.events()[0]).unwrap();
+        assert_eq!(wire["type"], "session/end-seed");
+        assert_eq!(wire["seq"], 0);
+        assert_eq!(wire["data"], serde_json::json!({}));
+        let parsed: SessionEvent = serde_json::from_value(wire).unwrap();
+        assert!(is_end_seed(&parsed.data));
+    }
+
+    #[test]
+    fn constructor_seed_does_not_emit_after_publish() {
+        let ctx = Context::new();
+        let heard = Arc::new(Mutex::new(0u32));
+        let count = Arc::clone(&heard);
+        ctx.on("session/event", move |_| {
+            *count.lock().expect("heard") += 1;
+        })
+        .unwrap();
+        let source = Session::new(session_id("seed"));
+        source
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let seeded = Session::from_seed(source.header().clone(), source.events()).unwrap();
+        let store = SessionStore::install(&ctx).unwrap();
+        let live = store.publish(seeded);
+        assert_eq!(*heard.lock().expect("heard"), 0);
+        live.append(
+            SessionEventData::TurnEnd {
+                turn: 1,
+                reason: TurnEndReason::Completed,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(*heard.lock().expect("heard"), 1);
     }
 
     #[test]

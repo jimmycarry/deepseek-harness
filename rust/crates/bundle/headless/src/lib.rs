@@ -7,7 +7,7 @@ use dsh_cordis::{Context, CordisError, Result, Service};
 use dsh_cordis_loader::{parse_patch_list, EntryPatch};
 use dsh_llm::UserMessage;
 use dsh_permission_presets::PermissionPresetService;
-use dsh_session::{append_session_knobs, Session, SessionStore};
+use dsh_session::{append_session_knobs, session_id, Session, SessionStore};
 use dsh_session_persistence::PersistenceRuntime;
 use serde_json::Value;
 use std::sync::Arc;
@@ -33,6 +33,8 @@ pub struct HeadlessStartup {
     pub task: String,
     /// Session working directory. `None` uses `std::env::current_dir`.
     pub cwd: Option<String>,
+    /// Persisted session id to resume instead of minting a fresh one.
+    pub resume_session_id: Option<String>,
 }
 
 impl Service for HeadlessStartup {
@@ -57,7 +59,11 @@ pub fn apply_startup(ctx: &Context, config: Option<Value>) -> Result<()> {
             "headless-startup: a task is required, for example: dsh --profile headless \"run the tests\"",
         ));
     }
-    ctx.provide(Arc::new(HeadlessStartup { task, cwd: None }))?;
+    ctx.provide(Arc::new(HeadlessStartup {
+        task,
+        cwd: None,
+        resume_session_id: None,
+    }))?;
     Ok(())
 }
 
@@ -86,15 +92,23 @@ pub async fn run_session(ctx: &Context) -> std::result::Result<Arc<Session>, Str
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
     });
-    let session = ctx
-        .service::<SessionStore>()
-        .map_err(|error| error.to_string())?
-        .create_in(cwd);
-    let handle = ctx
-        .service::<AgentRegistry>()
-        .map_err(|error| error.to_string())?
-        .create(session)
-        .map_err(|error| error.to_string())?;
+    let handle = {
+        let agents = ctx
+            .service::<AgentRegistry>()
+            .map_err(|error| error.to_string())?;
+        if let Some(id) = startup.resume_session_id.as_deref() {
+            agents
+                .resume_persisted(&session_id(id))
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            let session = ctx
+                .service::<SessionStore>()
+                .map_err(|error| error.to_string())?
+                .create_in(cwd);
+            agents.create(session).map_err(|error| error.to_string())?
+        }
+    };
     if let Some(presets) = ctx.get::<PermissionPresetService>() {
         presets
             .pin_initial(handle.agent.session().as_ref())

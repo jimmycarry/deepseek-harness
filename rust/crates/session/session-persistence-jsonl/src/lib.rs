@@ -151,7 +151,13 @@ pub async fn read_jsonl(
     path: impl AsRef<Path>,
     id: &SessionId,
 ) -> Result<Session, PersistenceError> {
-    let body = fs::read_to_string(path).await?;
+    let body = match fs::read_to_string(&path).await {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PersistenceError::NotFound(id.as_str().to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
     let header_text = lines
         .next()
@@ -307,6 +313,17 @@ mod tests {
         install(&ctx, &dir).unwrap();
         assert!(ctx.has_service("sessionPersistence"));
         ctx.dispose();
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn load_missing_file_is_not_found() {
+        let dir = tmp_dir("missing");
+        fs::create_dir_all(&dir).await.unwrap();
+        let err = read_jsonl(dir.join("nope.jsonl"), &session_id("nope"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PersistenceError::NotFound(id) if id == "nope"));
         let _ = fs::remove_dir_all(&dir).await;
     }
 }
