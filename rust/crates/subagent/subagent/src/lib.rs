@@ -13,6 +13,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+mod delegation;
+
+pub use delegation::{
+    append_delegated_policy_overrides, bind_prompt, capture_delegated_policy_overrides,
+    DelegatedPolicyOverrides, SUBAGENT_DELEGATION_CONTEXT,
+};
+
 /// Registry failures.
 #[derive(Debug, Error)]
 pub enum SubagentError {
@@ -137,6 +144,7 @@ impl SubagentRuntime {
                 .map_err(|error| dsh_cordis::CordisError::Validation(error))?;
         }
         ctx.provide(Arc::clone(&runtime))?;
+        bind_prompt(ctx)?;
         Ok(runtime)
     }
 
@@ -260,6 +268,19 @@ impl SubagentRuntime {
                 "tool-subagent: provider \"{provider}\" does not support `backgroundMode: continuable`"
             ));
         }
+        // Snapshot before any child session exists: a later parent switch
+        // belongs to the parent's future, not to this child.
+        let inherited = {
+            let ctx = self
+                .ctx
+                .lock()
+                .expect("subagents ctx")
+                .clone()
+                .ok_or_else(|| {
+                    "continuable subagents require an installed subagent service".to_string()
+                })?;
+            capture_delegated_policy_overrides(&ctx, Some(parent.session().as_ref()))
+        };
         let (sessions, agents) = self.host()?;
         let parent_header = parent.session().header().clone();
         let header = SessionHeader::for_subagent_child(Some(&parent_header), parent.id().clone());
@@ -287,6 +308,8 @@ impl SubagentRuntime {
                 },
                 None,
             )
+            .map_err(|error| error.to_string())?;
+        append_delegated_policy_overrides(child.as_ref(), &inherited)
             .map_err(|error| error.to_string())?;
         let handle = agents
             .create(Arc::clone(&child))
@@ -801,7 +824,13 @@ impl Service for SubagentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dsh_agent::{
+        Agent, AgentCancelCause, AgentError, AgentFactory, AgentStatus, Inbox, InboxTarget,
+    };
+    use dsh_sandbox::SandboxMode;
+    use dsh_sandbox_policy::set_sandbox_mode;
     use dsh_session::session_id;
+    use dsh_user_approval::{effective_approval_policy, ApprovalPolicy};
 
     struct Fake;
 
@@ -825,6 +854,107 @@ mod tests {
         }
     }
 
+    struct ContinuableFake;
+
+    #[async_trait]
+    impl SubagentProvider for ContinuableFake {
+        fn name(&self) -> &str {
+            "spawn"
+        }
+        fn inherits_parent_context(&self) -> bool {
+            false
+        }
+        fn supports_continuable(&self) -> bool {
+            true
+        }
+        async fn start(
+            &self,
+            request: SubagentStartRequest,
+        ) -> std::result::Result<SubagentResult, SubagentError> {
+            Ok(SubagentResult {
+                output: request.prompt,
+                id: session_id("child"),
+                stop_reason: "completed".into(),
+            })
+        }
+    }
+
+    struct StubAgent {
+        session: Arc<Session>,
+        inbox: Arc<Inbox>,
+    }
+
+    #[async_trait]
+    impl Agent for StubAgent {
+        fn id(&self) -> &SessionId {
+            self.session.id()
+        }
+        fn session(&self) -> Arc<Session> {
+            Arc::clone(&self.session)
+        }
+        fn inbox(&self) -> Arc<Inbox> {
+            Arc::clone(&self.inbox)
+        }
+        fn status(&self) -> AgentStatus {
+            AgentStatus::Idle
+        }
+        fn send(&self, _: UserMessage, _: InboxTarget, _: bool) {}
+        fn cancel(&self, _: AgentCancelCause) {}
+        async fn when_idle(&self) {}
+        async fn run(&self) -> std::result::Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    struct StubFactory;
+
+    impl AgentFactory for StubFactory {
+        fn create(&self, session: Arc<Session>) -> Arc<dyn Agent> {
+            Arc::new(StubAgent {
+                inbox: Arc::new(Inbox::for_session(Arc::clone(&session))),
+                session,
+            })
+        }
+    }
+
+    fn continuable_host(
+        with_approval: bool,
+    ) -> (
+        Context,
+        Arc<SubagentRuntime>,
+        dsh_agent::AgentHandle,
+        Arc<SessionStore>,
+    ) {
+        let ctx = Context::new();
+        let store = Arc::new(SessionStore::new());
+        ctx.provide(Arc::clone(&store)).unwrap();
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        ctx.provide(Arc::new(agents)).unwrap();
+        dsh_sandbox_policy::install(
+            &ctx,
+            Some(&serde_json::json!({
+                "mode": "workspace-write",
+                "workspaceRoot": std::env::temp_dir().to_string_lossy()
+            })),
+        )
+        .unwrap();
+        if with_approval {
+            dsh_user_approval::install(&ctx, None).unwrap();
+        }
+        let runtime = SubagentRuntime::install(&ctx).unwrap();
+        runtime
+            .register_provider(Arc::new(ContinuableFake))
+            .unwrap();
+        let parent_session = store.create(session_id("parent"));
+        let parent = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(parent_session)
+            .unwrap();
+        (ctx, runtime, parent, store)
+    }
+
     #[tokio::test]
     async fn start_records_result() {
         let runtime = SubagentRuntime::new();
@@ -843,5 +973,170 @@ mod tests {
             .unwrap();
         assert_eq!(result.output, "ping");
         assert_eq!(runtime.results(), vec!["ping".to_string()]);
+    }
+
+    #[test]
+    fn start_continuable_seeds_parent_sandbox_and_pins_approval() {
+        let (_ctx, runtime, parent, store) = continuable_host(true);
+        set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::DangerFullAccess)
+            .unwrap();
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        let child = store.get(&started.child_id).unwrap();
+        let events = child.events();
+        let policy: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.data,
+                    SessionEventData::SandboxMode { .. } | SessionEventData::ApprovalPolicy { .. }
+                )
+            })
+            .collect();
+        assert_eq!(policy.len(), 2);
+        match &policy[0].data {
+            SessionEventData::SandboxMode { mode, source } => {
+                assert_eq!(mode, "danger-full-access");
+                assert_eq!(source.as_deref(), Some("delegation"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &policy[1].data {
+            SessionEventData::ApprovalPolicy { policy, source } => {
+                assert_eq!(policy, "never");
+                assert_eq!(source.as_deref(), Some("delegation"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            effective_approval_policy(&events),
+            Some(ApprovalPolicy::Never)
+        );
+    }
+
+    #[test]
+    fn start_continuable_skips_unswitched_sandbox_and_still_pins_approval() {
+        let (_ctx, runtime, parent, store) = continuable_host(true);
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        let child = store.get(&started.child_id).unwrap();
+        let events = child.events();
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event.data, SessionEventData::SandboxMode { .. })));
+        match &events
+            .iter()
+            .find(|event| matches!(event.data, SessionEventData::ApprovalPolicy { .. }))
+            .unwrap()
+            .data
+        {
+            SessionEventData::ApprovalPolicy { policy, source } => {
+                assert_eq!(policy, "never");
+                assert_eq!(source.as_deref(), Some("delegation"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_continuable_omits_approval_when_the_service_is_absent() {
+        let (_ctx, runtime, parent, store) = continuable_host(false);
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        let child = store.get(&started.child_id).unwrap();
+        assert!(child.events().iter().all(|event| {
+            !matches!(
+                event.data,
+                SessionEventData::SandboxMode { .. } | SessionEventData::ApprovalPolicy { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn start_continuable_keeps_the_captured_mode_after_a_later_parent_switch() {
+        let (_ctx, runtime, parent, store) = continuable_host(true);
+        set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::ReadOnly).unwrap();
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        set_sandbox_mode(
+            parent.agent.session().as_ref(),
+            SandboxMode::DangerFullAccess,
+        )
+        .unwrap();
+        let child = store.get(&started.child_id).unwrap();
+        assert_eq!(
+            dsh_sandbox_policy::effective_sandbox_mode(&child.events()),
+            Some(SandboxMode::ReadOnly)
+        );
+        assert_eq!(
+            dsh_sandbox_policy::effective_sandbox_mode(&parent.agent.session().events()),
+            Some(SandboxMode::DangerFullAccess)
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_resume_does_not_reseed_delegation_policy() {
+        let (_ctx, runtime, parent, store) = continuable_host(true);
+        set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::ReadOnly).unwrap();
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        runtime.run_pending().await;
+        runtime
+            .followup(
+                &parent.agent,
+                &started.child_id,
+                vec![ContentBlock::text("continue")],
+                MessageSource::User,
+            )
+            .unwrap();
+        let child = store.get(&started.child_id).unwrap();
+        let sandbox: Vec<_> = child
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event.data, SessionEventData::SandboxMode { .. }))
+            .collect();
+        let approval: Vec<_> = child
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event.data, SessionEventData::ApprovalPolicy { .. }))
+            .collect();
+        assert_eq!(sandbox.len(), 1);
+        assert_eq!(approval.len(), 1);
+        match &sandbox[0].data {
+            SessionEventData::SandboxMode { source, .. } => {
+                assert_eq!(source.as_deref(), Some("delegation"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

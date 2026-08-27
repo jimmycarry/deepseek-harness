@@ -18,4 +18,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 dsh-llm-replay.workspace = true
+dsh-sandbox.workspace = true
+dsh-sandbox-policy.workspace = true
+dsh-system-prompt.workspace = true
+dsh-user-approval.workspace = true
 tokio.workspace = true

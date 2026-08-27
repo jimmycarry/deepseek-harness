@@ -284,12 +284,18 @@ pub enum SessionEventData {
     SandboxMode {
         /// Mode name.
         mode: String,
+        /// `"delegation"` when a child start seeded this override; omitted for a runtime switch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// Approval policy written by the permission preset or an override.
     #[serde(rename = "approval/policy")]
     ApprovalPolicy {
         /// Policy name (`ask` or `never`).
         policy: String,
+        /// `"delegation"` when a child start seeded this override; omitted for a runtime switch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// An approval question was put to the answerer chain — log-only audit.
     #[serde(rename = "approval/asked")]
@@ -1179,6 +1185,51 @@ mod tests {
     }
 
     #[test]
+    fn policy_source_omits_when_absent_and_round_trips_when_present() {
+        let session = Session::new(session_id("s"));
+        session
+            .append(
+                SessionEventData::SandboxMode {
+                    mode: "read-only".into(),
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        session
+            .append(
+                SessionEventData::ApprovalPolicy {
+                    policy: "never".into(),
+                    source: Some("delegation".into()),
+                },
+                None,
+            )
+            .unwrap();
+        let sandbox = serde_json::to_value(&session.events()[0]).unwrap();
+        assert_eq!(sandbox["type"], "sandbox/mode");
+        assert_eq!(sandbox["data"]["mode"], "read-only");
+        assert!(sandbox["data"].get("source").is_none());
+        let approval = serde_json::to_value(&session.events()[1]).unwrap();
+        assert_eq!(
+            approval["data"],
+            serde_json::json!({ "policy": "never", "source": "delegation" })
+        );
+        let restored: SessionEventData =
+            serde_json::from_value(serde_json::json!({
+                "type": "sandbox/mode",
+                "data": { "mode": "workspace-write", "source": "other" }
+            }))
+            .unwrap();
+        match restored {
+            SessionEventData::SandboxMode { mode, source } => {
+                assert_eq!(mode, "workspace-write");
+                assert_eq!(source.as_deref(), Some("other"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn extension_events_nest_payload_under_data() {
         let session = Session::new(session_id("s"));
         session
@@ -1290,10 +1341,17 @@ pub fn append_session_knobs(
         },
         None,
     )?;
-    session.append(SessionEventData::SandboxMode { mode: mode.into() }, None)?;
+    session.append(
+        SessionEventData::SandboxMode {
+            mode: mode.into(),
+            source: None,
+        },
+        None,
+    )?;
     session.append(
         SessionEventData::ApprovalPolicy {
             policy: policy.into(),
+            source: None,
         },
         None,
     )?;

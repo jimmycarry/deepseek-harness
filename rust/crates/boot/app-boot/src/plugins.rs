@@ -518,6 +518,7 @@ fn apply_system_prompt(ctx: &Context, config: Option<Value>) -> Result<()> {
     }
     dsh_sandbox_policy::bind_prompt(ctx)?;
     dsh_user_approval::bind_prompt(ctx)?;
+    dsh_subagent::bind_prompt(ctx)?;
     Ok(())
 }
 

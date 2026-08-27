@@ -239,10 +239,10 @@ fn fold_knobs(events: &[SessionEvent]) -> KnobState {
             SessionEventData::PermissionPreset { preset } => {
                 state.preset = Some(preset.clone());
             }
-            SessionEventData::SandboxMode { mode } => {
+            SessionEventData::SandboxMode { mode, .. } => {
                 state.sandbox = SandboxMode::parse(mode);
             }
-            SessionEventData::ApprovalPolicy { policy } => {
+            SessionEventData::ApprovalPolicy { policy, .. } => {
                 state.approval = ApprovalPolicy::parse(policy);
             }
             _ => {}
@@ -460,10 +460,10 @@ fn apply_knob_json(state: &Value, event: &SessionEvent) -> Value {
         SessionEventData::PermissionPreset { preset } => {
             next["preset"] = json!(preset);
         }
-        SessionEventData::SandboxMode { mode } => {
+        SessionEventData::SandboxMode { mode, .. } => {
             next["sandbox"] = json!(mode);
         }
-        SessionEventData::ApprovalPolicy { policy } => {
+        SessionEventData::ApprovalPolicy { policy, .. } => {
             next["approval"] = json!(policy);
         }
         _ => return state.clone(),

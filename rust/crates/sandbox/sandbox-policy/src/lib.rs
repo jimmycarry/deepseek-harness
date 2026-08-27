@@ -75,7 +75,7 @@ impl SandboxPolicyService {
 /// Last `sandbox/mode` event in log order, or `None` when the session never switched.
 pub fn effective_sandbox_mode(events: &[SessionEvent]) -> Option<SandboxMode> {
     for event in events.iter().rev() {
-        if let SessionEventData::SandboxMode { mode } = &event.data {
+        if let SessionEventData::SandboxMode { mode, .. } = &event.data {
             return SandboxMode::parse(mode);
         }
     }
@@ -91,6 +91,7 @@ pub fn set_sandbox_mode(session: &Session, mode: SandboxMode) -> std::result::Re
         .append(
             SessionEventData::SandboxMode {
                 mode: mode.as_str().to_string(),
+                source: None,
             },
             None,
         )

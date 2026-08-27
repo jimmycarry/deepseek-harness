@@ -244,7 +244,7 @@ impl ApprovalService {
 /// Last `approval/policy` event in log order, or `None` when the session never switched.
 pub fn effective_approval_policy(events: &[SessionEvent]) -> Option<ApprovalPolicy> {
     for event in events.iter().rev() {
-        if let SessionEventData::ApprovalPolicy { policy } = &event.data {
+        if let SessionEventData::ApprovalPolicy { policy, .. } = &event.data {
             return ApprovalPolicy::parse(policy);
         }
     }
@@ -263,6 +263,7 @@ pub fn set_approval_policy(
         .append(
             SessionEventData::ApprovalPolicy {
                 policy: policy.as_str().to_string(),
+                source: None,
             },
             None,
         )

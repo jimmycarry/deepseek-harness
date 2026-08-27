@@ -872,6 +872,32 @@ async fn continuable_settlement_turn_profile() {
     assert_eq!(descriptor["data"]["label"], "child task");
     assert_eq!(turn_numbers(&child_events), vec![1]);
     assert_eq!(child.last_assistant_text().as_deref(), Some("CHILD_RESULT"));
+    let sandbox: Vec<_> = child_events
+        .iter()
+        .filter(|event| event["type"] == "sandbox/mode")
+        .collect();
+    assert_eq!(sandbox.len(), 1, "{child_events:?}");
+    assert_eq!(sandbox[0]["data"]["source"], "delegation");
+    let approval: Vec<_> = child_events
+        .iter()
+        .filter(|event| event["type"] == "approval/policy")
+        .collect();
+    assert_eq!(approval.len(), 1);
+    assert_eq!(
+        approval[0]["data"],
+        serde_json::json!({ "policy": "never", "source": "delegation" })
+    );
+    let context = child_events.iter().find(|event| {
+        event["type"] == "user/message"
+            && event["data"]["source"]["plugin"] == "@deepseek-ai/dsh-system-prompt"
+    });
+    let context_text = context
+        .and_then(|event| event["data"]["content"][0]["text"].as_str())
+        .unwrap_or("");
+    assert!(
+        context_text.contains("You are a delegated subagent"),
+        "{context_text}"
+    );
 }
 
 #[tokio::test]
@@ -1066,6 +1092,18 @@ async fn send_message_resumes_settled_child() {
     // The resumed continuation extends the same log instead of restarting at 1.
     assert_eq!(turn_numbers(&child_events), vec![1, 2]);
     assert_eq!(child.last_assistant_text().as_deref(), Some("SECOND_OK"));
+    let approval: Vec<_> = child_events
+        .iter()
+        .filter(|event| event["type"] == "approval/policy")
+        .collect();
+    assert_eq!(approval.len(), 1);
+    assert_eq!(approval[0]["data"]["source"], "delegation");
+    let sandbox: Vec<_> = child_events
+        .iter()
+        .filter(|event| event["type"] == "sandbox/mode")
+        .collect();
+    assert_eq!(sandbox.len(), 1);
+    assert_eq!(sandbox[0]["data"]["source"], "delegation");
 }
 
 #[tokio::test]
