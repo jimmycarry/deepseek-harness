@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(prompt["result"]["stopReason"], "cancelled", "{body}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_writes_chunk_before_the_prompt_response() {
         let ctx = Context::new();
         apply_replay(&ctx, "ONE").unwrap();
