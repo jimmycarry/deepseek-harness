@@ -594,6 +594,7 @@ impl Tool for StrReplaceEditorTool {
             name: self.name().into(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }

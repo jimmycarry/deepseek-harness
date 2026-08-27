@@ -428,7 +428,7 @@ async fn bash_turn_profile_types_and_payloads() {
             "tool": {
                 "id": "c1",
                 "name": "bash",
-                "arguments": "{\"command\":\"echo hello\"}"
+                "arguments": "{\"command\":\"echo hello\",\"description\":\"Print hello to stdout\"}"
             }
         },
         { "text": "done" }
@@ -739,7 +739,7 @@ async fn background_bash_job_turn_profile() {
             "tool": {
                 "id": "c1",
                 "name": "bash",
-                "arguments": "{\"command\":\"echo hello\",\"run_in_background\":true}"
+                "arguments": "{\"command\":\"echo hello\",\"description\":\"Print hello to stdout\",\"run_in_background\":true}"
             }
         },
         {
@@ -1116,7 +1116,7 @@ async fn spill_policy_turn_profile() {
             "tool": {
                 "id": "c1",
                 "name": "bash",
-                "arguments": "{\"command\":\"yes x | head -c 60000\"}"
+                "arguments": "{\"command\":\"yes x | head -c 60000\",\"description\":\"Generate oversized stdout for spill\"}"
             }
         },
         { "text": "spilled" }
@@ -1146,15 +1146,15 @@ async fn repeat_tool_reminder_profile() {
     let turns = serde_json::json!([
         {
             "text": "",
-            "tool": { "id": "c1", "name": "bash", "arguments": "{\"command\":\"echo hi\"}" }
+            "tool": { "id": "c1", "name": "bash", "arguments": "{\"command\":\"echo hi\",\"description\":\"Print hi to stdout\"}" }
         },
         {
             "text": "",
-            "tool": { "id": "c2", "name": "bash", "arguments": "{\"command\":\"echo hi\"}" }
+            "tool": { "id": "c2", "name": "bash", "arguments": "{\"command\":\"echo hi\",\"description\":\"Print hi to stdout\"}" }
         },
         {
             "text": "",
-            "tool": { "id": "c3", "name": "bash", "arguments": "{\"command\":\"echo hi\"}" }
+            "tool": { "id": "c3", "name": "bash", "arguments": "{\"command\":\"echo hi\",\"description\":\"Print hi to stdout\"}" }
         },
         { "text": "stopped" }
     ]);
@@ -1820,7 +1820,7 @@ async fn bash_injects_dsh_env_profile() {
             "tool": {
                 "id": "c1",
                 "name": "bash",
-                "arguments": "{\"command\":\"printf '%s\\n' DSH_HOME=$DSH_HOME DSH_SHELL=$DSH_SHELL DSH_SESSION_ID=$DSH_SESSION_ID\"}"
+                "arguments": "{\"command\":\"printf '%s\\n' DSH_HOME=$DSH_HOME DSH_SHELL=$DSH_SHELL DSH_SESSION_ID=$DSH_SESSION_ID\",\"description\":\"Print managed DSH environment facts\"}"
             }
         },
         { "text": "done" }

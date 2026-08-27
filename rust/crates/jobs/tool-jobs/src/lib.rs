@@ -261,6 +261,7 @@ final-output jobs return their result after settlement. Every response ends with
             name: self.name().to_string(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }
@@ -321,6 +322,7 @@ impl Tool for JobListTool {
             name: self.name().to_string(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }
@@ -376,6 +378,7 @@ impl Tool for JobKillTool {
             name: self.name().to_string(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }

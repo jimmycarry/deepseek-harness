@@ -99,6 +99,7 @@ failure means the message was NOT delivered."
             name: self.name().to_string(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }
@@ -167,6 +168,7 @@ an accepted no-op."
             name: self.name().to_string(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }
@@ -231,6 +233,7 @@ candidates for `interrupt_agent` only."
             name: self.name().to_string(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }

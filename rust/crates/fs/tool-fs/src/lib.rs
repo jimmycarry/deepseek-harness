@@ -65,6 +65,7 @@ impl Tool for ReadTool {
             name: self.name().into(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }
@@ -193,6 +194,7 @@ impl Tool for WriteTool {
             name: self.name().into(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }
@@ -336,6 +338,7 @@ impl Tool for EditTool {
             name: self.name().into(),
             args,
             agent_id: None,
+            call_id: None,
         })
         .await
     }
@@ -666,6 +669,7 @@ mod tests {
                 name: "write".into(),
                 args: json!({ "file_path": "fresh.txt", "content": "x" }),
                 agent_id: None,
+                call_id: None,
             })
             .await
             .unwrap();
@@ -788,6 +792,7 @@ mod tests {
                 name: "write".into(),
                 args: json!({ "file_path": "a.txt", "content": "x" }),
                 agent_id: None,
+                call_id: None,
             })
             .await
             .unwrap();
@@ -820,6 +825,7 @@ mod tests {
                     "sandbox_permissions": "workspace-write"
                 }),
                 agent_id: None,
+                call_id: None,
             })
             .await
             .unwrap();
@@ -836,6 +842,7 @@ mod tests {
                     "justification": "why"
                 }),
                 agent_id: None,
+                call_id: None,
             })
             .await
             .unwrap();
@@ -867,6 +874,7 @@ mod tests {
                 name: "write".into(),
                 args: args.clone(),
                 agent_id: Some("sess-fs-esc".into()),
+                call_id: None,
             })
             .await
             .unwrap();
@@ -879,6 +887,7 @@ mod tests {
                 name: "write".into(),
                 args,
                 agent_id: None,
+                call_id: None,
             })
             .await
             .unwrap();
@@ -970,6 +979,7 @@ mod tests {
                     "justification": "the test needs it"
                 }),
                 agent_id: Some(handle.agent.session().id().as_str().to_string()),
+                call_id: None,
             })
             .await
             .unwrap();

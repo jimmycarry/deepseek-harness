@@ -553,15 +553,15 @@ mod tests {
     use async_trait::async_trait;
     use dsh_sandbox::SandboxMode;
     use dsh_session::{session_id, SessionStore};
-    use dsh_shell::{ShellError, ShellExecutor, ShellSpec};
+    use dsh_shell::{ShellError, ShellExecutor, ShellRunResult, ShellSpec};
     use dsh_user_approval::install as install_approval;
 
     struct NoopShell;
 
     #[async_trait]
     impl ShellExecutor for NoopShell {
-        async fn run(&self, _spec: ShellSpec) -> std::result::Result<String, ShellError> {
-            Ok(String::new())
+        async fn run(&self, _spec: ShellSpec) -> std::result::Result<ShellRunResult, ShellError> {
+            Ok(ShellRunResult::from_stdout(""))
         }
     }
 

@@ -205,6 +205,8 @@ dependencies = [
  "dsh-llm",
  "dsh-session",
  "dsh-session-checkpoint-policy",
+ "dsh-session-persistence",
+ "dsh-session-persistence-jsonl",
  "dsh-session-title",
  "dsh-system-prompt",
  "dsh-tools",
@@ -421,6 +423,8 @@ dependencies = [
  "dsh-cordis",
  "dsh-shell",
  "dsh-subprocess",
+ "dsh-subprocess-local",
+ "tokio",
 ]
 
 [[package]]

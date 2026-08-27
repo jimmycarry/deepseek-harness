@@ -447,13 +447,16 @@ impl LoopAgent {
                     .ok();
                 call_seqs.push(event.map(|event| event.seq));
             }
-            let scheduled: Vec<(String, serde_json::Value)> = calls
+            let scheduled: Vec<dsh_tools::ScheduledTool> = calls
                 .iter()
                 .map(|call| {
-                    let name = call.name.clone();
                     let args =
                         serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
-                    (name, args)
+                    dsh_tools::ScheduledTool {
+                        name: call.name.clone(),
+                        args,
+                        call_id: Some(call.id.as_str().to_string()),
+                    }
                 })
                 .collect();
             let outcomes = tools

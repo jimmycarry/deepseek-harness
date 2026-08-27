@@ -6,14 +6,37 @@
 use async_trait::async_trait;
 use dsh_bash_local::BashLocal;
 use dsh_cordis::Context;
-use dsh_sandbox::{SandboxError, SandboxExecutionPolicy, SandboxMode, SandboxRuntime};
-use dsh_shell::{ShellError, ShellExecutor, ShellRuntime, ShellSpec};
-use dsh_subprocess::{resolve, SpawnRequest, SubprocessRuntime};
-use std::sync::Arc;
+use dsh_sandbox::{
+    SandboxEnforcement, SandboxError, SandboxExecutionPolicy, SandboxMode, SandboxRuntime,
+};
+use dsh_shell::{
+    ShellChild, ShellChildExit, ShellError, ShellExecutor, ShellRuntime, ShellRunResult,
+    ShellSandboxInfo, ShellSpec,
+};
+use dsh_subprocess::SubprocessRuntime;
+use std::sync::{Arc, Mutex};
 
 /// Plugin role name.
 pub fn name() -> &'static str {
     "dsh-bash-sandbox"
+}
+
+/// Match a non-zero exit against case-insensitive stderr signatures.
+pub fn matches_signature(
+    exit_code: Option<i32>,
+    stderr: &str,
+    signatures: &[String],
+) -> bool {
+    let Some(code) = exit_code else {
+        return false;
+    };
+    if code == 0 {
+        return false;
+    }
+    let lowered = stderr.to_ascii_lowercase();
+    signatures
+        .iter()
+        .any(|signature| lowered.contains(&signature.to_ascii_lowercase()))
 }
 
 /// Deployment policy read from `ctx.sandboxPolicy` at apply time.
@@ -25,10 +48,65 @@ pub struct Config {
     pub workspace_root: String,
 }
 
+struct ProcessFacts {
+    mode: SandboxMode,
+    enforcement: SandboxEnforcement,
+    denial_signatures: Vec<String>,
+}
+
+struct ConfinedChild {
+    inner: Box<dyn ShellChild>,
+    facts: ProcessFacts,
+    sandbox: Mutex<Option<ShellSandboxInfo>>,
+}
+
+impl ConfinedChild {
+    fn stamp(&self, exit: &ShellChildExit) {
+        let mut slot = self.sandbox.lock().expect("sandbox facts");
+        if slot.is_some() {
+            return;
+        }
+        let denied = matches_signature(
+            exit.exit_code,
+            &self.inner.collected_stderr(),
+            &self.facts.denial_signatures,
+        );
+        *slot = Some(ShellSandboxInfo {
+            mode: self.facts.mode,
+            denied,
+            enforcement: Some(self.facts.enforcement),
+            runner_failed: None,
+        });
+    }
+}
+
+impl ShellChild for ConfinedChild {
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    fn wait(&self) -> Result<ShellChildExit, ShellError> {
+        let exit = self.inner.wait()?;
+        self.stamp(&exit);
+        Ok(exit)
+    }
+
+    fn read_output(&self) -> String {
+        self.inner.read_output()
+    }
+
+    fn collected_stderr(&self) -> String {
+        self.inner.collected_stderr()
+    }
+
+    fn sandbox_info(&self) -> Option<ShellSandboxInfo> {
+        self.sandbox.lock().expect("sandbox facts").clone()
+    }
+}
+
 /// Bash executor that confines through `ctx.sandbox` except under full access.
 pub struct BashSandbox {
     local: BashLocal,
-    subprocess: Arc<SubprocessRuntime>,
     sandbox: Arc<SandboxRuntime>,
     mode: SandboxMode,
     workspace_root: String,
@@ -47,8 +125,7 @@ impl BashSandbox {
             return Err("bash-sandbox: workspace_root must be a non-empty path".into());
         }
         Ok(Self {
-            local: BashLocal::new(Arc::clone(&subprocess)),
-            subprocess,
+            local: BashLocal::new(subprocess),
             sandbox,
             mode,
             workspace_root: config.workspace_root,
@@ -61,47 +138,83 @@ impl BashSandbox {
             workspace_root: self.workspace_root.clone(),
         }
     }
+
+    fn confine(
+        &self,
+        spec: &ShellSpec,
+        policy: &SandboxExecutionPolicy,
+    ) -> Result<dsh_sandbox::ConfinedArgv, ShellError> {
+        self.sandbox
+            .confine(
+                &["bash".into(), "-c".into(), spec.command.clone()],
+                policy,
+            )
+            .map_err(|error| match error {
+                SandboxError::Unavailable { message, .. } => ShellError::Unavailable(message),
+            })
+    }
 }
 
 #[async_trait]
 impl ShellExecutor for BashSandbox {
-    async fn run(&self, spec: ShellSpec) -> Result<String, ShellError> {
+    fn resolve(&self, request: dsh_shell::ShellRequest) -> ShellSpec {
+        let mut spec = self.local.resolve(request);
+        if spec.sandbox_policy.is_none() {
+            spec.sandbox_policy = Some(self.policy());
+        }
+        spec
+    }
+
+    async fn run(&self, spec: ShellSpec) -> Result<ShellRunResult, ShellError> {
         let policy = spec
             .sandbox_policy
             .clone()
             .unwrap_or_else(|| self.policy());
         if policy.mode == SandboxMode::DangerFullAccess {
-            return self.local.run(spec).await;
+            let mut result = self.local.run(spec).await?;
+            result.sandbox = Some(ShellSandboxInfo {
+                mode: SandboxMode::DangerFullAccess,
+                denied: false,
+                enforcement: None,
+                runner_failed: None,
+            });
+            return Ok(result);
         }
-        let confined = self
-            .sandbox
-            .confine(
-                &["bash".into(), "-c".into(), spec.command.clone()],
-                &policy,
-            )
-            .map_err(|error| match error {
-                SandboxError::Unavailable { message, .. } => ShellError::Unavailable(message),
-            })?;
-        let program =
-            confined.argv.first().cloned().ok_or_else(|| {
-                ShellError::Failed("sandbox confine returned an empty argv".into())
-            })?;
-        let args = confined.argv[1..].to_vec();
-        let spawn = resolve(SpawnRequest {
-            program,
-            args,
-            cwd: spec.cwd,
-            dsh_env: spec.dsh_env,
+        let confined = self.confine(&spec, &policy)?;
+        let mut result = self.local.run_argv(spec, &confined.argv).await?;
+        let denied = matches_signature(
+            result.exit_code,
+            &result.stderr.text,
+            &confined.denial_signatures,
+        );
+        result.sandbox = Some(ShellSandboxInfo {
+            mode: policy.mode,
+            denied,
+            enforcement: Some(confined.enforcement),
+            runner_failed: None,
         });
-        let output = self
-            .subprocess
-            .run(spawn)
-            .await
-            .map_err(|error| ShellError::Failed(error.to_string()))?;
-        if output.status != 0 {
-            return Err(ShellError::Failed(output.stderr));
+        Ok(result)
+    }
+
+    fn start(&self, spec: ShellSpec) -> Result<Box<dyn ShellChild>, ShellError> {
+        let policy = spec
+            .sandbox_policy
+            .clone()
+            .unwrap_or_else(|| self.policy());
+        if policy.mode == SandboxMode::DangerFullAccess {
+            return self.local.start(spec);
         }
-        Ok(output.stdout)
+        let confined = self.confine(&spec, &policy)?;
+        let inner = self.local.start_argv(&spec, &confined.argv)?;
+        Ok(Box::new(ConfinedChild {
+            inner,
+            facts: ProcessFacts {
+                mode: policy.mode,
+                enforcement: confined.enforcement,
+                denial_signatures: confined.denial_signatures,
+            },
+            sandbox: Mutex::new(None),
+        }))
     }
 }
 
@@ -145,6 +258,22 @@ mod tests {
         )
     }
 
+    #[test]
+    fn matches_signature_requires_nonzero_and_dialect() {
+        assert!(!matches_signature(Some(0), "read-only file system", &[
+            "read-only file system".into()
+        ]));
+        assert!(!matches_signature(None, "read-only file system", &[
+            "read-only file system".into()
+        ]));
+        assert!(matches_signature(Some(1), "touch: Read-only file system", &[
+            "read-only file system".into()
+        ]));
+        assert!(!matches_signature(Some(1), "permission denied", &[
+            "read-only file system".into()
+        ]));
+    }
+
     #[tokio::test]
     async fn danger_full_access_runs_unconfined() {
         let (subprocess, sandbox, config) = runtime("danger-full-access");
@@ -152,13 +281,15 @@ mod tests {
         let out = bash
             .run(resolve_shell(ShellRequest {
                 command: "echo hello".into(),
-                cwd: None,
-                dsh_env: None,
-                sandbox_policy: None,
+                ..ShellRequest::default()
             }))
             .await
             .unwrap();
-        assert_eq!(out.trim(), "hello");
+        assert_eq!(out.stdout.text.trim(), "hello");
+        let sandbox = out.sandbox.expect("full-access stamps sandbox");
+        assert_eq!(sandbox.mode, SandboxMode::DangerFullAccess);
+        assert!(!sandbox.denied);
+        assert!(sandbox.enforcement.is_none());
     }
 
     #[tokio::test]
@@ -168,13 +299,11 @@ mod tests {
         let result = bash
             .run(resolve_shell(ShellRequest {
                 command: "echo hello".into(),
-                cwd: None,
-                dsh_env: None,
-                sandbox_policy: None,
+                ..ShellRequest::default()
             }))
             .await;
         match result {
-            Ok(out) => assert_eq!(out.trim(), "hello"),
+            Ok(out) => assert_eq!(out.stdout.text.trim(), "hello"),
             Err(ShellError::Unavailable(message)) => {
                 assert!(message.contains("workspace-write"));
                 assert!(message.contains("refusing to run the command unconfined"));

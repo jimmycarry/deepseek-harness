@@ -102,7 +102,7 @@ async fn bash_turn_snapshot() {
                 tool: Some(ReplayToolCall {
                     id: "c1".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"echo hello"}"#.into(),
+                    arguments: r#"{"command":"echo hello","description":"Print hello to stdout"}"#.into(),
                 }),
                 finish: None,
                 error: None,
@@ -676,7 +676,7 @@ async fn background_bash_job_snapshot() {
                 tool: Some(ReplayToolCall {
                     id: "c1".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"echo hello","run_in_background":true}"#.into(),
+                    arguments: r#"{"command":"echo hello","description":"Print hello to stdout","run_in_background":true}"#.into(),
                 }),
                 finish: None,
                 error: None,
@@ -747,7 +747,7 @@ async fn repeat_tool_reminder_snapshot() {
                 tool: Some(ReplayToolCall {
                     id: "c1".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"echo hi"}"#.into(),
+                    arguments: r#"{"command":"echo hi","description":"Print hi to stdout"}"#.into(),
                 }),
                 finish: None,
                 error: None,
@@ -757,7 +757,7 @@ async fn repeat_tool_reminder_snapshot() {
                 tool: Some(ReplayToolCall {
                     id: "c2".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"echo hi"}"#.into(),
+                    arguments: r#"{"command":"echo hi","description":"Print hi to stdout"}"#.into(),
                 }),
                 finish: None,
                 error: None,
@@ -767,7 +767,7 @@ async fn repeat_tool_reminder_snapshot() {
                 tool: Some(ReplayToolCall {
                     id: "c3".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"echo hi"}"#.into(),
+                    arguments: r#"{"command":"echo hi","description":"Print hi to stdout"}"#.into(),
                 }),
                 finish: None,
                 error: None,
@@ -831,7 +831,7 @@ async fn spill_policy_turn_snapshot() {
                 tool: Some(ReplayToolCall {
                     id: "c1".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"yes x | head -c 60000"}"#.into(),
+                    arguments: r#"{"command":"yes x | head -c 60000","description":"Generate oversized stdout for spill"}"#.into(),
                 }),
                 finish: None,
                 error: None,

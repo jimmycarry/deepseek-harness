@@ -17,6 +17,31 @@ pub struct ToolCall {
     pub args: Value,
     /// Calling agent's session id, when the agent loop invoked the tool.
     pub agent_id: Option<String>,
+    /// Session `tool/call` id, forwarded into approval requests.
+    pub call_id: Option<String>,
+}
+
+impl ToolCall {
+    /// Direct execute path without a live agent or call id.
+    pub fn new(name: impl Into<String>, args: Value) -> Self {
+        Self {
+            name: name.into(),
+            args,
+            agent_id: None,
+            call_id: None,
+        }
+    }
+}
+
+/// One model-ordered tool invocation for [`ToolRuntime::execute_many_for`].
+#[derive(Debug, Clone)]
+pub struct ScheduledTool {
+    /// Advertised tool name.
+    pub name: String,
+    /// Parsed arguments.
+    pub args: Value,
+    /// Session `tool/call` id, when the loop supplied one.
+    pub call_id: Option<String>,
 }
 
 /// Outcome of one pipeline run, including post-execute contexts.
@@ -282,6 +307,7 @@ impl ToolRuntime {
             name: name.to_string(),
             args: args.clone(),
             agent_id: agent_id.map(str::to_string),
+            call_id: None,
         };
         if let Some(agent_id) = agent_id {
             if ctx.has_service(dsh_session_checkpoint_policy::CheckpointPolicy::KEY) {
@@ -309,7 +335,18 @@ impl ToolRuntime {
         ctx: &Context,
         calls: Vec<(String, Value)>,
     ) -> Vec<Result<ToolOutcome, ToolError>> {
-        self.execute_many_for(ctx, calls, None)
+        self.execute_many_for(
+            ctx,
+            calls
+                .into_iter()
+                .map(|(name, args)| ScheduledTool {
+                    name,
+                    args,
+                    call_id: None,
+                })
+                .collect(),
+            None,
+        )
             .await
             .into_iter()
             .map(|result| match result {
@@ -337,7 +374,7 @@ impl ToolRuntime {
     pub async fn execute_many_for(
         &self,
         ctx: &Context,
-        calls: Vec<(String, Value)>,
+        calls: Vec<ScheduledTool>,
         agent_id: Option<&str>,
     ) -> Vec<Result<ToolExecutionResult, ToolError>> {
         enum Prepared {
@@ -353,11 +390,15 @@ impl ToolRuntime {
                 name: String,
                 tool: Arc<dyn Tool>,
                 args: Value,
+                call_id: Option<String>,
             },
         }
 
         let mut prepared = Vec::with_capacity(calls.len());
-        for (name, args) in calls {
+        for scheduled in calls {
+            let name = scheduled.name;
+            let args = scheduled.args;
+            let call_id = scheduled.call_id;
             let pre = ctx.waterfall(
                 "tools/pre-execute",
                 serde_json::json!({ "name": name, "args": args }),
@@ -370,7 +411,12 @@ impl ToolRuntime {
                 }
             }
             match self.get(&name).filter(|tool| tool.enabled_for(agent_id)) {
-                Some(tool) => prepared.push(Prepared::Ready { name, tool, args }),
+                Some(tool) => prepared.push(Prepared::Ready {
+                    name,
+                    tool,
+                    args,
+                    call_id,
+                }),
                 None => prepared.push(Prepared::Unknown { name, args }),
             }
         }
@@ -422,12 +468,19 @@ impl ToolRuntime {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_parallel()));
         let mut set = tokio::task::JoinSet::new();
         for (index, item) in prepared.iter().enumerate() {
-            if let Prepared::Ready { name, tool, args } = item {
+            if let Prepared::Ready {
+                name,
+                tool,
+                args,
+                call_id,
+            } = item
+            {
                 let tool = Arc::clone(tool);
                 let call = ToolCall {
                     name: name.clone(),
                     args: args.clone(),
                     agent_id: agent_id.map(str::to_string),
+                    call_id: call_id.clone(),
                 };
                 let semaphore = Arc::clone(&semaphore);
                 let body_ctx = ctx.clone();
@@ -651,6 +704,57 @@ mod tests {
         );
         assert_eq!(posts.lock().expect("posts").as_slice(), ["slow", "fast"]);
         assert_eq!(starts.lock().expect("starts").len(), 2);
+    }
+
+    struct CallIdTool {
+        seen: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Tool for CallIdTool {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn description(&self) -> &str {
+            "records call id"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(&self, args: Value) -> Result<ToolOutcome, ToolError> {
+            self.execute_call(&ToolCall::new(self.name(), args)).await
+        }
+        async fn execute_call(&self, call: &ToolCall) -> Result<ToolOutcome, ToolError> {
+            *self.seen.lock().expect("call id") = call.call_id.clone();
+            Ok(ToolOutcome::text("ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_many_for_forwards_call_id() {
+        let ctx = Context::new();
+        let tools = Arc::new(ToolRuntime::new());
+        let probe = Arc::new(CallIdTool {
+            seen: Mutex::new(None),
+        });
+        tools.insert(Arc::clone(&probe) as Arc<dyn Tool>);
+        ctx.provide(Arc::clone(&tools)).unwrap();
+        let results = tools
+            .execute_many_for(
+                &ctx,
+                vec![ScheduledTool {
+                    name: "probe".into(),
+                    args: serde_json::json!({}),
+                    call_id: Some("c1".into()),
+                }],
+                None,
+            )
+            .await;
+        assert!(results[0].as_ref().unwrap().outcome.content[0] == ContentBlock::text("ok"));
+        assert_eq!(
+            probe.seen.lock().expect("call id").as_deref(),
+            Some("c1")
+        );
     }
 
     #[tokio::test]

@@ -247,6 +247,7 @@ mod tests {
             name: "todo_write".into(),
             args,
             agent_id: agent_id.map(str::to_string),
+            call_id: None,
         }
     }
 

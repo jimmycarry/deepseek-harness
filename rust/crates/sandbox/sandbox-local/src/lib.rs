@@ -188,6 +188,7 @@ impl ProcessConfiner for LocalConfiner {
             return Ok(ConfinedArgv {
                 argv: argv.to_vec(),
                 enforcement: SandboxEnforcement::Full,
+                denial_signatures: Vec::new(),
             });
         }
         match select_linux_runner() {
@@ -199,6 +200,7 @@ impl ProcessConfiner for LocalConfiner {
                 Ok(ConfinedArgv {
                     argv: wrapped,
                     enforcement: SandboxEnforcement::Full,
+                    denial_signatures: vec!["read-only file system".into()],
                 })
             }
             Some(LinuxRunner::Landlock { path }) => {
@@ -209,6 +211,7 @@ impl ProcessConfiner for LocalConfiner {
                 Ok(ConfinedArgv {
                     argv: wrapped,
                     enforcement: SandboxEnforcement::Partial,
+                    denial_signatures: vec!["permission denied".into()],
                 })
             }
             None => Err(SandboxError::unavailable(policy.mode.as_str(), None)),
@@ -317,6 +320,47 @@ mod tests {
                 "/tmp/ws"
             ]
         );
+    }
+
+    #[test]
+    fn danger_full_access_reports_empty_denial_signatures() {
+        let confined = LocalConfiner
+            .confine(
+                &["true".into()],
+                &SandboxExecutionPolicy {
+                    mode: SandboxMode::DangerFullAccess,
+                    workspace_root: "/tmp".into(),
+                },
+            )
+            .unwrap();
+        assert!(confined.denial_signatures.is_empty());
+        assert_eq!(confined.argv, ["true"]);
+    }
+
+    #[test]
+    fn confine_reports_backend_denial_signatures() {
+        let Some(runner) = select_linux_runner() else {
+            return;
+        };
+        let confined = LocalConfiner
+            .confine(
+                &["true".into()],
+                &SandboxExecutionPolicy {
+                    mode: SandboxMode::ReadOnly,
+                    workspace_root: "/tmp".into(),
+                },
+            )
+            .unwrap();
+        match runner {
+            LinuxRunner::Bwrap => {
+                assert_eq!(confined.denial_signatures, ["read-only file system"]);
+                assert_eq!(confined.enforcement, SandboxEnforcement::Full);
+            }
+            LinuxRunner::Landlock { .. } => {
+                assert_eq!(confined.denial_signatures, ["permission denied"]);
+                assert_eq!(confined.enforcement, SandboxEnforcement::Partial);
+            }
+        }
     }
 
     #[test]

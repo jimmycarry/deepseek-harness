@@ -372,6 +372,7 @@ mod tests {
             name: "exit_plan_mode".into(),
             args,
             agent_id: agent_id.map(str::to_string),
+            call_id: None,
         }
     }
 

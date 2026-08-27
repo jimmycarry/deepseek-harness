@@ -73,6 +73,8 @@ pub struct ConfinedArgv {
     pub argv: Vec<String>,
     /// Enforcement completeness the selected backend achieves.
     pub enforcement: SandboxEnforcement,
+    /// Case-insensitive stderr substrings this backend emits on a file-effect denial.
+    pub denial_signatures: Vec<String>,
 }
 
 /// Fail-closed code when a confined mode cannot be enforced.

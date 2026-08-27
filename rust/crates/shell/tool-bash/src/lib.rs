@@ -6,19 +6,21 @@ use dsh_agent::AgentRegistry;
 use dsh_cordis::Context;
 use dsh_jobs::{JobHooks, JobOutcome, JobRegistry, JobStart, JobStatus};
 use dsh_sandbox::{
-    approve_escalation, escalation_audit_reason, validate_escalation_args, EscalationIngredients,
-    EscalationRequest, ESCALATION_TARGETS,
+    approve_escalation, escalation_audit_reason, escalation_hint_marker, sandbox_denial_marker,
+    validate_escalation_args, EscalationIngredients, EscalationRequest, ESCALATION_TARGETS,
 };
 use dsh_sandbox_policy::{resolve_from_context, SandboxPolicyService};
 use dsh_session::session_id;
-use dsh_shell::{resolve, DSH_ENV_PREFIX, ShellRequest, ShellRuntime};
+use dsh_shell::{
+    CollectedOutput, DSH_ENV_PREFIX, ShellChild, ShellChildExit, ShellRequest, ShellRunResult,
+    ShellRuntime, ShellSandboxInfo,
+};
 use dsh_shell_env::ShellEnvRegistry;
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome};
 use dsh_user_approval::{ApprovalRequest, ApprovalService};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Deployment-varying background switch.
@@ -92,6 +94,189 @@ pub fn require_confining_policy(ctx: &Context, shell: &ShellRuntime) -> Result<(
     Ok(())
 }
 
+fn stream_text(output: &CollectedOutput) -> String {
+    if !output.truncated {
+        return output.text.clone();
+    }
+    format!(
+        "{}\n[output truncated; full output: {}]",
+        output.text,
+        output.spill_path.as_deref().unwrap_or("(unavailable)")
+    )
+}
+
+/// Shape one finished run into the text the model sees.
+pub fn render_result(result: &ShellRunResult, advertises_escalation: bool) -> String {
+    let out = stream_text(&result.stdout);
+    let err = stream_text(&result.stderr);
+    let mut body = out;
+    if !err.is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(&err);
+    }
+    if body.is_empty() {
+        body = "(no output)".into();
+    }
+    let mut markers = Vec::new();
+    if result.sandbox.as_ref().is_some_and(|info| info.denied) {
+        let mode = result.sandbox.as_ref().expect("denied implies sandbox").mode;
+        markers.push(sandbox_denial_marker(mode));
+        if advertises_escalation {
+            markers.push(escalation_hint_marker("command"));
+        }
+    }
+    if result.timed_out {
+        markers.push(format!("[timed out after {}ms]", result.timeout_ms));
+    }
+    if let Some(signal) = &result.signal {
+        markers.push(format!("[killed by signal: {signal}]"));
+    } else if result.exit_code != Some(0) {
+        let code = result
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "null".into());
+        markers.push(format!("[exit code: {code}]"));
+    }
+    if markers.is_empty() {
+        return body;
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&markers.join("\n"));
+    body
+}
+
+fn render_process_read(
+    delta: &str,
+    sandbox: Option<&ShellSandboxInfo>,
+    advertises_escalation: bool,
+) -> String {
+    let mut notices = Vec::new();
+    if sandbox.is_some_and(|info| info.runner_failed == Some(true)) {
+        let mode = sandbox.expect("runnerFailed implies sandbox").mode;
+        notices.push(format!(
+            "[sandbox: the sandbox runner itself failed under {} mode — the command did not run; this is a sandbox problem, not a command failure]",
+            mode.as_str()
+        ));
+    } else if sandbox.is_some_and(|info| info.denied) {
+        let mode = sandbox.expect("denied implies sandbox").mode;
+        notices.push(sandbox_denial_marker(mode));
+        if advertises_escalation {
+            notices.push(escalation_hint_marker("command"));
+        }
+    }
+    if notices.is_empty() {
+        return delta.to_string();
+    }
+    let separator = if !delta.is_empty() && !delta.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    format!("{delta}{separator}{}", notices.join("\n"))
+}
+
+fn process_outcome(exit: &ShellChildExit) -> JobOutcome {
+    if exit.killed {
+        JobOutcome {
+            status: JobStatus::Killed,
+            detail: Some(
+                exit.signal
+                    .as_ref()
+                    .map(|signal| format!("signal: {signal}"))
+                    .unwrap_or_else(|| "killed before exit".into()),
+            ),
+            output: None,
+        }
+    } else {
+        JobOutcome {
+            status: JobStatus::Completed,
+            detail: Some(format!("exit code: {}", exit.exit_code.unwrap_or(0))),
+            output: None,
+        }
+    }
+}
+
+fn job_hooks_from_child(child: Box<dyn ShellChild>, advertises_escalation: bool) -> JobHooks {
+    let child: Arc<dyn ShellChild> = Arc::from(child);
+    let cancel_child = Arc::clone(&child);
+    let wait_child = Arc::clone(&child);
+    let read_child = Arc::clone(&child);
+    JobHooks {
+        cancel: Arc::new(move |_| cancel_child.cancel()),
+        wait_done: Arc::new(move || match wait_child.wait() {
+            Ok(exit) => process_outcome(&exit),
+            Err(error) => JobOutcome {
+                status: JobStatus::Failed,
+                detail: Some(error.to_string()),
+                output: None,
+            },
+        }),
+        read_output: Some(Arc::new(move || {
+            render_process_read(
+                &read_child.read_output(),
+                read_child.sandbox_info().as_ref(),
+                advertises_escalation,
+            )
+        })),
+    }
+}
+
+fn canonical_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+fn resolve_workdir(model_workdir: Option<&str>, session_cwd: Option<String>) -> Option<String> {
+    match model_workdir {
+        None => session_cwd,
+        Some(model) => {
+            if Path::new(model).is_absolute() {
+                Some(model.to_string())
+            } else if let Some(base) = session_cwd {
+                Some(Path::new(&base).join(model).to_string_lossy().into_owned())
+            } else {
+                Some(model.to_string())
+            }
+        }
+    }
+}
+
+fn validate_bash_args(
+    args: &Value,
+) -> Result<(String, Option<u64>, Option<String>), String> {
+    let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+    if command.trim().is_empty() {
+        return Err("invalid command: expected a non-empty string".into());
+    }
+    let description = args.get("description").and_then(Value::as_str).unwrap_or("");
+    if description.trim().is_empty() {
+        return Err("invalid description: expected a non-empty string".into());
+    }
+    let timeout_ms = if let Some(value) = args.get("timeoutMs") {
+        match value.as_f64() {
+            Some(number) if number.is_finite() && number > 0.0 => Some(number as u64),
+            _ => {
+                return Err(format!(
+                    "invalid timeoutMs: expected a positive number, got {value}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    let workdir = args
+        .get("workdir")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((command.to_string(), timeout_ms, workdir))
+}
+
 /// `bash` tool.
 pub struct BashTool {
     shell: Arc<ShellRuntime>,
@@ -156,6 +341,18 @@ impl BashTool {
         self.shell.sandbox_mode().is_some()
     }
 
+    fn session_cwd(&self, agent_id: Option<&str>) -> Option<String> {
+        let ctx = self.lookup.as_ref()?;
+        let id = agent_id?;
+        ctx.get::<AgentRegistry>()?
+            .get(&session_id(id))?
+            .session()
+            .header()
+            .cwd
+            .clone()
+            .map(|cwd| canonical_path(&cwd))
+    }
+
     async fn approve_if_requested(
         &self,
         call: &ToolCall,
@@ -194,6 +391,7 @@ impl BashTool {
         let has_approver = approver.is_some();
         let has_agent = agent.is_some();
         let ctx = ctx.clone();
+        let call_id = call.call_id.clone();
         let approved = approve_escalation(
             EscalationRequest {
                 requested_mode: requested,
@@ -218,7 +416,7 @@ impl BashTool {
                         agent.session().as_ref(),
                         ApprovalRequest {
                             tool_name: "bash".into(),
-                            call_id: None,
+                            call_id,
                             reason: Some(reason),
                         },
                     )
@@ -245,7 +443,34 @@ impl Tool for BashTool {
 
     fn parameters(&self) -> Value {
         let mut properties = serde_json::Map::new();
-        properties.insert("command".into(), json!({ "type": "string" }));
+        properties.insert(
+            "command".into(),
+            json!({
+                "type": "string",
+                "description": "The bash command to execute."
+            }),
+        );
+        properties.insert(
+            "description".into(),
+            json!({
+                "type": "string",
+                "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\"."
+            }),
+        );
+        properties.insert(
+            "timeoutMs".into(),
+            json!({
+                "type": "number",
+                "description": "Timeout in milliseconds. The executor applies its configured default and cap, and kills the command on expiry."
+            }),
+        );
+        properties.insert(
+            "workdir".into(),
+            json!({
+                "type": "string",
+                "description": "Working directory for this command. Defaults to the session workspace; a relative path is resolved against it."
+            }),
+        );
         if self.enable_run_in_background {
             properties.insert(
                 "run_in_background".into(),
@@ -279,32 +504,39 @@ impl Tool for BashTool {
         json!({
             "type": "object",
             "properties": properties,
-            "required": ["command"]
+            "required": ["command", "description"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<ToolOutcome, ToolError> {
-        self.execute_call(&ToolCall {
-            name: self.name().to_string(),
-            args,
-            agent_id: None,
-        })
-        .await
+        self.execute_call(&ToolCall::new(self.name(), args)).await
     }
 
     async fn execute_call(&self, call: &ToolCall) -> Result<ToolOutcome, ToolError> {
-        let command = call
-            .args
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::Body("command required".into()))?;
+        let (command, timeout_ms, workdir) = match validate_bash_args(&call.args) {
+            Ok(parsed) => parsed,
+            Err(message) => return Ok(ToolOutcome::error(message)),
+        };
         let standing = self
             .lookup
             .as_ref()
             .and_then(|ctx| resolve_from_context(ctx, call.agent_id.as_deref()));
-        let policy = match self.approve_if_requested(call, standing).await {
+        let policy = match self.approve_if_requested(call, standing.clone()).await {
             Ok(policy) => policy,
             Err(message) => return Ok(ToolOutcome::error(message)),
+        };
+        let session_cwd = standing
+            .as_ref()
+            .map(|policy| policy.workspace_root.clone())
+            .or_else(|| self.session_cwd(call.agent_id.as_deref()));
+        let cwd = resolve_workdir(workdir.as_deref(), session_cwd);
+        let dsh_env = collect_dsh_env(self.shell_env.as_deref(), call.agent_id.as_deref())?;
+        let request = ShellRequest {
+            command: command.clone(),
+            cwd,
+            dsh_env,
+            sandbox_policy: policy,
+            timeout_ms,
         };
         if call.args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
             if !self.enable_run_in_background {
@@ -317,28 +549,29 @@ impl Tool for BashTool {
                     "Error: background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs",
                 ));
             };
-            let command = command.to_string();
-            let owner = call.agent_id.clone();
-            let dsh_env = collect_dsh_env(self.shell_env.as_deref(), call.agent_id.as_deref())?;
+            let shell = Arc::clone(&self.shell);
+            let spec = shell.resolve(request);
+            let advertises = self.advertises_escalation();
             match jobs.start(JobStart {
                 kind: "bash".into(),
-                label: command.clone(),
+                label: command,
                 output_limit_bytes: None,
-                owner_session: owner,
-                run: Box::new(move || spawn_bash(command, None, dsh_env)),
+                owner_session: call.agent_id.clone(),
+                run: Box::new(move || {
+                    let child = shell.start(spec).map_err(|error| error.to_string())?;
+                    Ok(job_hooks_from_child(child, advertises))
+                }),
             }) {
                 Ok(id) => Ok(ToolOutcome::text(format!("started background job {id}"))),
                 Err(error) => Ok(ToolOutcome::error(format!("Error: {error}"))),
             }
         } else {
-            let spec = resolve(ShellRequest {
-                command: command.into(),
-                cwd: None,
-                dsh_env: collect_dsh_env(self.shell_env.as_deref(), call.agent_id.as_deref())?,
-                sandbox_policy: policy,
-            });
+            let spec = self.shell.resolve(request);
             match self.shell.run(spec).await {
-                Ok(stdout) => Ok(ToolOutcome::text(stdout)),
+                Ok(result) => Ok(ToolOutcome::text(render_result(
+                    &result,
+                    self.advertises_escalation(),
+                ))),
                 Err(error) => Ok(ToolOutcome::error(error.to_string())),
             }
         }
@@ -358,104 +591,6 @@ fn collect_dsh_env(
         .map_err(|error| ToolError::Body(error.to_string()))
 }
 
-fn apply_dsh_env(command: &mut Command, dsh_env: &Option<BTreeMap<String, String>>) {
-    let Some(overlay) = dsh_env else {
-        return;
-    };
-    let mut env: BTreeMap<String, String> = std::env::vars()
-        .filter(|(key, _)| !key.to_ascii_uppercase().starts_with("DSH_"))
-        .collect();
-    env.extend(overlay.iter().map(|(key, value)| (key.clone(), value.clone())));
-    command.env_clear();
-    command.envs(env);
-}
-
-fn spawn_bash(
-    command: String,
-    cwd: Option<String>,
-    dsh_env: Option<BTreeMap<String, String>>,
-) -> Result<JobHooks, String> {
-    let mut cmd = Command::new("/bin/bash");
-    cmd.arg("-lc")
-        .arg(&command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    apply_dsh_env(&mut cmd, &dsh_env);
-    let mut child = cmd.spawn().map_err(|error| error.to_string())?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let unread = Arc::new(Mutex::new(String::new()));
-    let mut readers = Vec::new();
-    let unread_out = Arc::clone(&unread);
-    if let Some(mut pipe) = stdout {
-        readers.push(std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = pipe.read_to_string(&mut buf);
-            unread_out.lock().expect("bash out").push_str(&buf);
-        }));
-    }
-    let unread_err = Arc::clone(&unread);
-    if let Some(mut pipe) = stderr {
-        readers.push(std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = pipe.read_to_string(&mut buf);
-            if !buf.is_empty() {
-                let mut guard = unread_err.lock().expect("bash err");
-                if !guard.is_empty() && !guard.ends_with('\n') {
-                    guard.push('\n');
-                }
-                guard.push_str(&buf);
-            }
-        }));
-    }
-    let child = Arc::new(Mutex::new(Some(child)));
-    let wait_child = Arc::clone(&child);
-    let cancel_child = Arc::clone(&child);
-    let read_unread = Arc::clone(&unread);
-    let readers = Arc::new(Mutex::new(readers));
-    let wait_readers = Arc::clone(&readers);
-    Ok(JobHooks {
-        cancel: Arc::new(move |_| {
-            if let Some(child) = cancel_child.lock().expect("bash child").as_mut() {
-                let _ = child.kill();
-            }
-        }),
-        wait_done: Arc::new(move || {
-            let status = wait_child
-                .lock()
-                .expect("bash child")
-                .take()
-                .and_then(|mut child| child.wait().ok());
-            for handle in wait_readers.lock().expect("bash readers").drain(..) {
-                let _ = handle.join();
-            }
-            let killed = status
-                .as_ref()
-                .is_some_and(|status| status.code().is_none());
-            let code = status.and_then(|status| status.code()).unwrap_or(0);
-            if killed {
-                JobOutcome {
-                    status: JobStatus::Killed,
-                    detail: Some("killed before exit".into()),
-                    output: None,
-                }
-            } else {
-                JobOutcome {
-                    status: JobStatus::Completed,
-                    detail: Some(format!("exit code: {code}")),
-                    output: None,
-                }
-            }
-        }),
-        read_output: Some(Arc::new(move || {
-            std::mem::take(&mut *read_unread.lock().expect("bash out"))
-        })),
-    })
-}
-
 pub fn name() -> &'static str {
     "dsh-tool-bash"
 }
@@ -463,7 +598,7 @@ pub fn name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_sandbox::SandboxMode;
+    use dsh_sandbox::{SandboxEnforcement, SandboxMode};
     use dsh_shell::{ShellError, ShellExecutor, ShellSpec};
 
     #[test]
@@ -477,14 +612,14 @@ mod tests {
 
     #[async_trait]
     impl ShellExecutor for RecordingBash {
-        async fn run(&self, spec: ShellSpec) -> Result<String, ShellError> {
+        async fn run(&self, spec: ShellSpec) -> Result<ShellRunResult, ShellError> {
             self.modes.lock().expect("modes").push(
                 spec.sandbox_policy
                     .as_ref()
                     .map(|policy| policy.mode.as_str().to_string())
                     .unwrap_or_default(),
             );
-            Ok(String::new())
+            Ok(ShellRunResult::from_stdout(""))
         }
     }
 
@@ -531,6 +666,16 @@ mod tests {
             json!(["workspace-write", "danger-full-access"])
         );
         assert!(tool.description().contains("approval prompt"));
+        assert_eq!(
+            parameters["required"],
+            json!(["command", "description"])
+        );
+        assert!(props.contains_key("timeoutMs"));
+        assert!(props.contains_key("workdir"));
+        assert_eq!(
+            props["description"]["description"],
+            "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\"."
+        );
     }
 
     #[tokio::test]
@@ -552,6 +697,7 @@ mod tests {
         let missing = tool
             .execute(json!({
                 "command": "true",
+                "description": "no-op",
                 "sandbox_permissions": "workspace-write"
             }))
             .await
@@ -564,6 +710,7 @@ mod tests {
         let unadvertised = plain
             .execute(json!({
                 "command": "true",
+                "description": "no-op",
                 "sandbox_permissions": "workspace-write",
                 "justification": "why"
             }))
@@ -593,6 +740,7 @@ mod tests {
         let outcome = tool
             .execute(json!({
                 "command": "true",
+                "description": "no-op",
                 "sandbox_permissions": "workspace-write",
                 "justification": "why"
             }))
@@ -600,5 +748,61 @@ mod tests {
             .unwrap();
         assert!(text(&outcome).contains("not strictly wider"));
         assert!(backend.modes.lock().expect("modes").is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_bash_args_matches_typescript_sentences() {
+        let tool = BashTool::new(Arc::new(ShellRuntime::new(Arc::new(RecordingBash {
+            modes: Mutex::new(Vec::new()),
+        }))));
+        assert_eq!(
+            text(
+                &tool
+                    .execute(json!({ "command": "   ", "description": "ok" }))
+                    .await
+                    .unwrap()
+            ),
+            "invalid command: expected a non-empty string"
+        );
+        assert_eq!(
+            text(
+                &tool
+                    .execute(json!({ "command": "true" }))
+                    .await
+                    .unwrap()
+            ),
+            "invalid description: expected a non-empty string"
+        );
+        assert_eq!(
+            text(
+                &tool
+                    .execute(json!({
+                        "command": "true",
+                        "description": "ok",
+                        "timeoutMs": 0
+                    }))
+                    .await
+                    .unwrap()
+            ),
+            "invalid timeoutMs: expected a positive number, got 0"
+        );
+    }
+
+    #[test]
+    fn render_result_appends_denial_and_exit_markers() {
+        let mut result = ShellRunResult::from_stdout("denied\n");
+        result.exit_code = Some(1);
+        result.stderr.text = "touch: Read-only file system\n".into();
+        result.sandbox = Some(ShellSandboxInfo {
+            mode: SandboxMode::ReadOnly,
+            denied: true,
+            enforcement: Some(SandboxEnforcement::Full),
+            runner_failed: None,
+        });
+        let text = render_result(&result, true);
+        assert!(text.contains("[stderr]"));
+        assert!(text.contains("[sandbox: file access denied under read-only mode]"));
+        assert!(text.contains("sandbox_permissions"));
+        assert!(text.contains("[exit code: 1]"));
     }
 }
