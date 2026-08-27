@@ -1184,6 +1184,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn expect_agent_err<T>(result: Result<T, AgentError>) -> AgentError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected AgentError"),
+        }
+    }
+
     #[tokio::test]
     async fn resume_rejects_without_persistence() {
         let ctx = Context::new();
@@ -1192,12 +1199,12 @@ mod tests {
             .unwrap();
         ctx.provide(Arc::new(AgentRegistry::new())).unwrap();
         AgentLoop::install(&ctx).unwrap();
-        let err = ctx
-            .service::<AgentRegistry>()
-            .unwrap()
-            .resume_persisted(&dsh_session::session_id("nope"))
-            .await
-            .unwrap_err();
+        let err = expect_agent_err(
+            ctx.service::<AgentRegistry>()
+                .unwrap()
+                .resume_persisted(&dsh_session::session_id("nope"))
+                .await,
+        );
         assert!(
             err.to_string().contains("session persistence is not configured"),
             "{err}"
@@ -1209,12 +1216,12 @@ mod tests {
         let dir = tmp_jsonl("missing");
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = persistent_ctx(&dir);
-        let err = ctx
-            .service::<AgentRegistry>()
-            .unwrap()
-            .resume_persisted(&dsh_session::session_id("nope"))
-            .await
-            .unwrap_err();
+        let err = expect_agent_err(
+            ctx.service::<AgentRegistry>()
+                .unwrap()
+                .resume_persisted(&dsh_session::session_id("nope"))
+                .await,
+        );
         assert_eq!(err.to_string(), "session \"nope\" not found");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1230,12 +1237,12 @@ mod tests {
             .unwrap()
             .create(session)
             .unwrap();
-        let err = ctx
-            .service::<AgentRegistry>()
-            .unwrap()
-            .resume_persisted(&id)
-            .await
-            .unwrap_err();
+        let err = expect_agent_err(
+            ctx.service::<AgentRegistry>()
+                .unwrap()
+                .resume_persisted(&id)
+                .await,
+        );
         assert_eq!(
             err.to_string(),
             "cannot prepare session \"live-resume\" while it is live"
