@@ -313,7 +313,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("missing sqlite session must be NotFound"),
         };
-        assert!(matches!(err, PersistenceError::NotFound(id) if id == "nope"));
+        assert!(matches!(err, PersistenceError::NotFound(ref id) if id == "nope"));
         assert_eq!(err.to_string(), "session \"nope\" not found");
         let _ = std::fs::remove_file(&path);
     }
