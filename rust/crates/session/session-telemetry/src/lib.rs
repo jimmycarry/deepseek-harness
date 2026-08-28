@@ -633,12 +633,20 @@ mod tests {
 
     impl SessionTelemetrySink for FakeBackend {
         fn emit(&self, record: SessionTelemetryRecord) {
-            if let Some(seq) = *self.fail_seq.lock().expect("fail seq") {
+            let reject = self
+                .fail_seq
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(seq) = reject {
                 if record.attributes.get("event.seq").and_then(Value::as_u64) == Some(seq) {
                     panic!("backend rejected seq {seq}");
                 }
             }
-            self.records.lock().expect("records").push(record);
+            self.records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(record);
         }
 
         fn flush(&self) {
