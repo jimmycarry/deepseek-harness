@@ -5,7 +5,7 @@ use dsh_atomic_write::{write_file_atomic, AtomicWriteError, WriteFileAtomicOptio
 use dsh_cordis::Context;
 use dsh_session::{
     now_ms, refuse_unknown, session_event_from_value, Session, SessionEvent, SessionEventData,
-    SessionHeader, SessionId, TurnEndReason, SESSION_FORMAT_VERSION,
+    SessionHeader, SessionId, SessionStore, TurnEndReason, SESSION_FORMAT_VERSION,
 };
 use dsh_session_persistence::{
     PersistenceError, PersistenceRuntime, SessionLocation, SessionStoreBackend,
@@ -70,6 +70,10 @@ impl SessionStoreBackend for JsonlBackend {
 }
 
 /// Provide [`PersistenceRuntime`] over a JSONL directory.
+///
+/// Dispose drains every live session with a synchronous rewrite so a
+/// post-checkpoint append (including `/feedback`) reaches disk. The
+/// disposer cannot await, so this path uses `std::fs` rather than Tokio.
 pub fn install(
     ctx: &Context,
     dir: impl AsRef<Path>,
@@ -77,14 +81,27 @@ pub fn install(
     let backend = Arc::new(JsonlBackend::new(dir.as_ref()));
     let runtime = Arc::new(PersistenceRuntime::new(backend));
     ctx.provide(Arc::clone(&runtime))?;
+    let drain_dir = dir.as_ref().to_path_buf();
+    let lookup = ctx.clone();
+    ctx.effect("jsonl persistence drain", move || {
+        move || {
+            let Some(store) = lookup.get::<SessionStore>() else {
+                return;
+            };
+            let backend = JsonlBackend::new(&drain_dir);
+            for session in store.live() {
+                if let Err(error) =
+                    write_jsonl_sync(&backend.path_for(session.id()), session.as_ref())
+                {
+                    eprintln!("session-persistence-jsonl: dispose drain failed: {error}");
+                }
+            }
+        }
+    })?;
     Ok(runtime)
 }
 
-/// Write the session header line plus one JSON object per event line.
-pub async fn write_jsonl(
-    path: impl AsRef<Path>,
-    session: &Session,
-) -> Result<(), PersistenceError> {
+fn encode_jsonl(session: &Session) -> Result<String, PersistenceError> {
     let mut body = serde_json::to_string(&header_line(session.header()))
         .map_err(|error| PersistenceError::Format(error.to_string()))?;
     body.push('\n');
@@ -94,9 +111,17 @@ pub async fn write_jsonl(
         })?);
         body.push('\n');
     }
+    Ok(body)
+}
+
+/// Write the session header line plus one JSON object per event line.
+pub async fn write_jsonl(
+    path: impl AsRef<Path>,
+    session: &Session,
+) -> Result<(), PersistenceError> {
     write_file_atomic(
         path,
-        body,
+        encode_jsonl(session)?,
         WriteFileAtomicOptions {
             mode: 0o600,
             dir_mode: Some(0o700),
@@ -104,6 +129,41 @@ pub async fn write_jsonl(
     )
     .await
     .map_err(atomic_error)
+}
+
+fn write_jsonl_sync(path: &Path, session: &Session) -> Result<(), PersistenceError> {
+    let body = encode_jsonl(session)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        set_mode(parent, 0o700)?;
+    }
+    let temp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("jsonl")
+    ));
+    let written = (|| {
+        std::fs::write(&temp, body.as_bytes())?;
+        set_mode(&temp, 0o600)?;
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Project one session header as its persisted first line (`type` first).
@@ -313,6 +373,29 @@ mod tests {
         install(&ctx, &dir).unwrap();
         assert!(ctx.has_service("sessionPersistence"));
         ctx.dispose();
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn dispose_drains_unflushed_events() {
+        let dir = tmp_dir("drain");
+        fs::create_dir_all(&dir).await.unwrap();
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(&ctx, &dir).unwrap();
+        let session = ctx.service::<SessionStore>().unwrap().create(session_id("drain"));
+        session
+            .append(
+                SessionEventData::Extension {
+                    type_name: "feedback/record".into(),
+                    data: serde_json::json!({ "text": "fixture feedback" }),
+                },
+                None,
+            )
+            .unwrap();
+        ctx.dispose();
+        let body = std::fs::read_to_string(dir.join("drain.jsonl")).unwrap();
+        assert!(body.contains("fixture feedback"));
         let _ = fs::remove_dir_all(&dir).await;
     }
 
