@@ -179,9 +179,10 @@ mod tests {
             .execute(session.as_ref(), "/feedback")
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
+        assert!(!outcome.success);
         assert_eq!(
-            outcome,
+            outcome.text,
             "Feedback text is required. Usage: /feedback <text>"
         );
         let types: Vec<_> = session
@@ -202,9 +203,10 @@ mod tests {
             .execute(session.as_ref(), "/feedback   \n\t ")
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
+        assert!(!outcome.success);
         assert_eq!(
-            outcome,
+            outcome.text,
             "Feedback text is required. Usage: /feedback <text>"
         );
         let types: Vec<_> = session
