@@ -4,12 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Default-off session telemetry backend that discloses sharing status."
+description = "Default-off session telemetry backend that exports OTLP/HTTP JSON logs."
 
 [dependencies]
-dsh-command-feedback.workspace = true
+dsh-anonymous-user-id.workspace = true
 dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+dsh-session-telemetry.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+dsh-command-feedback.workspace = true

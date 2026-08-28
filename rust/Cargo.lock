@@ -514,6 +514,7 @@ dependencies = [
  "dsh-commands",
  "dsh-cordis",
  "dsh-session",
+ "dsh-session-telemetry",
  "serde_json",
  "tokio",
 ]
@@ -848,6 +849,7 @@ dependencies = [
  "dsh-agent-loop",
  "dsh-app-boot",
  "dsh-bundle-headless",
+ "dsh-command-feedback",
  "dsh-commands",
  "dsh-cordis",
  "dsh-cordis-loader",
@@ -855,6 +857,7 @@ dependencies = [
  "dsh-sdk-protocol",
  "dsh-sdk-server",
  "dsh-session",
+ "dsh-session-telemetry",
  "dsh-settings-file",
  "dsh-subagent",
  "dsh-tools",
@@ -1039,13 +1042,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-session-telemetry"
+version = "0.1.1-rc.2"
+dependencies = [
+ "dsh-cordis",
+ "dsh-llm",
+ "dsh-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-session-telemetry-otel"
 version = "0.1.1-rc.2"
 dependencies = [
+ "dsh-anonymous-user-id",
  "dsh-command-feedback",
  "dsh-cordis",
+ "dsh-llm",
+ "dsh-session",
+ "dsh-session-telemetry",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

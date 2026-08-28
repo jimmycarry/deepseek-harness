@@ -74,15 +74,7 @@ impl SubagentProvider for InProcessProvider {
             parent.as_ref().map(|session| session.header()),
             request.parent_id.clone(),
         );
-        let child_id = header.id.clone();
         let child = store.publish(dsh_session::Session::with_header(header));
-        self.ctx.emit(
-            "session/created",
-            serde_json::json!({
-                "id": child_id.as_str(),
-                "parentSession": request.parent_id.as_str(),
-            }),
-        );
         let _ = child.append(
             SessionEventData::Extension {
                 type_name: "subagent/descriptor".into(),

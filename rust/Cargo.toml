@@ -84,6 +84,7 @@ members = [
   "crates/session/session-title-first-prompt-llm",
   "crates/session/session-persistence-sqlite",
   "crates/session/session-projection",
+  "crates/session/session-telemetry",
   "crates/session/session-telemetry-otel",
   "crates/settings/settings-file",
   "crates/session-query/session-query",
@@ -217,6 +218,7 @@ dsh-session-title-first-prompt-llm = { path = "crates/session/session-title-firs
 dsh-session-persistence-jsonl = { path = "crates/session/session-persistence-jsonl" }
 dsh-session-persistence-sqlite = { path = "crates/session/session-persistence-sqlite" }
 dsh-session-projection = { path = "crates/session/session-projection" }
+dsh-session-telemetry = { path = "crates/session/session-telemetry" }
 dsh-session-telemetry-otel = { path = "crates/session/session-telemetry-otel" }
 dsh-settings-file = { path = "crates/settings/settings-file" }
 dsh-session-query = { path = "crates/session-query/session-query" }

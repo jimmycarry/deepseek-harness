@@ -19,6 +19,24 @@ pub fn call_id(value: impl Into<String>) -> CallId {
     CallId::new(value)
 }
 
+/// Public product identity sent on provider requests and telemetry resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppIdentity {
+    /// `User-Agent` product token (lowercase, hyphenated).
+    pub product: &'static str,
+    /// Product version from package metadata.
+    pub version: &'static str,
+    /// Repository home URL used as the `User-Agent` comment.
+    pub url: &'static str,
+}
+
+/// Harness identity shared by adapters and the session-telemetry Resource.
+pub const APP_IDENTITY: AppIdentity = AppIdentity {
+    product: "deepseek-harness",
+    version: env!("CARGO_PKG_VERSION"),
+    url: "https://github.com/deepseek-ai/deepseek-harness",
+};
+
 /// Serializable provider or transport failure facts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmFailure {
@@ -1710,5 +1728,15 @@ mod tests {
         match err {
             LlmError::Failure(failure) => assert_eq!(failure.code, "INVALID_MODEL_CONTEXT"),
         }
+    }
+
+    #[test]
+    fn app_identity_matches_package_metadata() {
+        assert_eq!(APP_IDENTITY.product, "deepseek-harness");
+        assert_eq!(APP_IDENTITY.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            APP_IDENTITY.url,
+            "https://github.com/deepseek-ai/deepseek-harness"
+        );
     }
 }

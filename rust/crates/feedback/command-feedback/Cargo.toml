@@ -12,6 +12,7 @@ dsh-anonymous-user-id.workspace = true
 dsh-commands.workspace = true
 dsh-cordis.workspace = true
 dsh-session.workspace = true
+dsh-session-telemetry.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

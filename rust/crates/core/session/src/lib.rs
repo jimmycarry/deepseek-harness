@@ -1093,6 +1093,13 @@ impl SessionStore {
             .lock()
             .expect("sessions")
             .insert(session.id().as_str().to_string(), Arc::clone(&session));
+        if let Some(ctx) = self.emit.lock().expect("session emit").clone() {
+            let mut payload = serde_json::json!({ "id": session.id().as_str() });
+            if let Some(parent) = &session.header().parent_session {
+                payload["parentSession"] = serde_json::json!(parent.as_str());
+            }
+            ctx.emit("session/created", payload);
+        }
         session
     }
 
@@ -1120,7 +1127,20 @@ impl SessionStore {
 
     /// Remove a session from the store.
     pub fn remove(&self, id: &SessionId) {
-        self.sessions.lock().expect("sessions").remove(id.as_str());
+        let removed = self
+            .sessions
+            .lock()
+            .expect("sessions")
+            .remove(id.as_str())
+            .is_some();
+        if removed {
+            if let Some(ctx) = self.emit.lock().expect("session emit").clone() {
+                ctx.emit(
+                    "session/disposed",
+                    serde_json::json!({ "id": id.as_str() }),
+                );
+            }
+        }
     }
 
     /// Live sessions in arbitrary map order.
@@ -1503,7 +1523,38 @@ mod tests {
     }
 
     #[test]
-    fn detached_append_does_not_emit() {
+    fn publish_emits_session_created_and_remove_emits_disposed() {
+        let ctx = Context::new();
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let disposed = Arc::new(Mutex::new(Vec::new()));
+        let created_ids = Arc::clone(&created);
+        let disposed_ids = Arc::clone(&disposed);
+        ctx.on("session/created", move |payload| {
+            created_ids
+                .lock()
+                .expect("created")
+                .push(payload["id"].as_str().unwrap_or("").to_string());
+        })
+        .unwrap();
+        ctx.on("session/disposed", move |payload| {
+            disposed_ids
+                .lock()
+                .expect("disposed")
+                .push(payload["id"].as_str().unwrap_or("").to_string());
+        })
+        .unwrap();
+        let store = SessionStore::install(&ctx).unwrap();
+        let session = store.create(session_id("created-1"));
+        assert_eq!(*created.lock().expect("created"), vec!["created-1".to_string()]);
+        store.remove(session.id());
+        assert_eq!(
+            *disposed.lock().expect("disposed"),
+            vec!["created-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn detached_session_does_not_emit() {
         let ctx = Context::new();
         let heard = Arc::new(Mutex::new(0u32));
         let count = Arc::clone(&heard);

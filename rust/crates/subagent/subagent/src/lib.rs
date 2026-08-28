@@ -286,15 +286,6 @@ impl SubagentRuntime {
         let header = SessionHeader::for_subagent_child(Some(&parent_header), parent.id().clone());
         let child_id = header.id.clone();
         let child = sessions.publish(Session::with_header(header));
-        if let Some(ctx) = self.ctx.lock().ok().and_then(|guard| guard.clone()) {
-            ctx.emit(
-                "session/created",
-                serde_json::json!({
-                    "id": child_id.as_str(),
-                    "parentSession": parent.id().as_str(),
-                }),
-            );
-        }
         child
             .append(
                 SessionEventData::Extension {

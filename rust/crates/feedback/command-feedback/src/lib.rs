@@ -6,8 +6,9 @@
 use async_trait::async_trait;
 use dsh_anonymous_user_id::get_or_create_anonymous_user_id;
 use dsh_commands::{Command, CommandHandler, CommandInvocation, CommandRegistry, CommandResult};
-use dsh_cordis::{Context, Result, Service};
+use dsh_cordis::{Context, Result};
 use dsh_session::{Session, SessionEventData};
+use dsh_session_telemetry::{SessionTelemetry, SharingStatus};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -17,28 +18,6 @@ pub fn name() -> &'static str {
 }
 
 const USAGE: &str = "Usage: /feedback <text>";
-
-/// Disclosed session-sharing policy when `ctx.sessionTelemetry` is mounted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SharingStatus {
-    /// Full session sharing.
-    Full,
-    /// Sharing is gated on recorded feedback.
-    FeedbackOnly,
-    /// Sharing is off.
-    Disabled,
-}
-
-/// Optional `ctx.sessionTelemetry` used only for the acknowledgement sentence.
-#[derive(Debug, Clone)]
-pub struct SessionTelemetry {
-    /// Disclosed policy.
-    pub sharing: SharingStatus,
-}
-
-impl Service for SessionTelemetry {
-    const KEY: &'static str = "sessionTelemetry";
-}
 
 fn sharing_sentence(sharing: SharingStatus) -> &'static str {
     match sharing {
@@ -126,6 +105,7 @@ impl CommandHandler for FeedbackCommand {
 mod tests {
     use super::*;
     use dsh_session::{event_type_name, SessionStore};
+    use dsh_session_telemetry::{SessionTelemetry, SharingStatus};
 
     fn setup() -> (Context, Arc<Session>) {
         let ctx = Context::new();
@@ -239,7 +219,7 @@ mod tests {
         let ctx = Context::new();
         ctx.provide(Arc::new(CommandRegistry::new())).unwrap();
         ctx.provide(Arc::new(SessionStore::new())).unwrap();
-        ctx.provide(Arc::new(SessionTelemetry { sharing }))
+        ctx.provide(Arc::new(SessionTelemetry::sharing_only(sharing)))
             .unwrap();
         install(&ctx).unwrap();
         let session = ctx.service::<SessionStore>().unwrap().create_fresh();
