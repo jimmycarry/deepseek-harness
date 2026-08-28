@@ -8,8 +8,15 @@ use dsh_cordis::Service;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod classify;
 mod escalation;
 
+pub use classify::{
+    bwrap_runner_failure_rules, classify_denial, classify_runner_failure, is_usable_workdir,
+    landlock_runner_failure_rules, matches_signature, seatbelt_runner_failure_rules,
+    windows_acl_runner_failure_rules, RunnerFailureMatch, LANDLOCK_LAUNCHER_BIN,
+    LANDLOCK_LAUNCHER_FAILURE_EXIT, WINDOWS_ACL_RUNNER_FAILURE_EXIT,
+};
 pub use escalation::{
     approve_escalation, escalation_audit_reason, escalation_hint_marker, sandbox_denial_marker,
     validate_escalation_args, wider_modes, EscalationIngredients, EscalationRequest,
@@ -66,6 +73,21 @@ pub enum SandboxEnforcement {
     Partial,
 }
 
+/// Evidence that identifies a sandbox runner failing before it executes the
+/// wrapped command. A consumer first applies [`Self::allowed_exit_codes`] when
+/// present, removes [`Self::informational_lines`] by case-insensitive exact line
+/// equality, then matches [`Self::fatal_signatures`] case-insensitively within
+/// each remaining stderr line. Exit status alone never proves runner failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerFailureRule {
+    /// Nonzero process exit codes on which this rule may match; `None` permits any nonzero exit.
+    pub allowed_exit_codes: Option<Vec<i32>>,
+    /// Non-empty substrings identifying a fatal runner diagnostic on one stderr line.
+    pub fatal_signatures: Vec<String>,
+    /// Benign stderr lines excluded by exact full-line equality before fatal matching.
+    pub informational_lines: Vec<String>,
+}
+
 /// Argv to spawn instead of the caller's own, plus enforcement completeness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfinedArgv {
@@ -75,6 +97,8 @@ pub struct ConfinedArgv {
     pub enforcement: SandboxEnforcement,
     /// Case-insensitive stderr substrings this backend emits on a file-effect denial.
     pub denial_signatures: Vec<String>,
+    /// Structured runner-failure evidence rules for this wrap.
+    pub runner_failure_rules: Vec<RunnerFailureRule>,
 }
 
 /// Fail-closed code when a confined mode cannot be enforced.
@@ -226,6 +250,23 @@ mod tests {
                     message.contains(SANDBOX_UNAVAILABLE) || message.contains("refusing to run")
                 );
                 assert!(message.contains("danger-full-access"));
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_appends_runner_failure_detail() {
+        let err = SandboxError::unavailable(
+            "read-only",
+            Some("landlock-run: landlock is not enforced by this kernel"),
+        );
+        match err {
+            SandboxError::Unavailable { mode, message } => {
+                assert_eq!(mode, "read-only");
+                assert!(message.contains("refusing to run the command unconfined"));
+                assert!(message.contains(
+                    "Runner failure: landlock-run: landlock is not enforced by this kernel"
+                ));
             }
         }
     }

@@ -1,0 +1,20 @@
+[package]
+name = "dsh-pwsh-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sandbox-consuming PowerShell executor."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-pwsh-local.workspace = true
+dsh-sandbox.workspace = true
+dsh-shell.workspace = true
+dsh-subprocess.workspace = true
+
+[dev-dependencies]
+dsh-sandbox-local.workspace = true
+dsh-subprocess-local.workspace = true
+tokio.workspace = true

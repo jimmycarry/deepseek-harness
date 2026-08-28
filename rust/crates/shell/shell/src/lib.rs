@@ -2,9 +2,19 @@
 
 use async_trait::async_trait;
 use dsh_cordis::Service;
-use dsh_sandbox::{SandboxEnforcement, SandboxExecutionPolicy, SandboxMode};
+use dsh_sandbox::{is_usable_workdir, SandboxEnforcement, SandboxExecutionPolicy, SandboxMode};
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use thiserror::Error;
+
+mod confined;
+mod render;
+
+pub use confined::{map_spawn, stamp_foreground, unavailable_error, ConfinedChild};
+pub use render::{
+    canonical_foreground_json, parse_exit_status, render_process_read, render_shell_result,
+    shell_tool_output_schema, ParsedExitStatus, ShellToolOutput,
+};
 
 /// Prefix of every managed `DSH_*` environment key.
 pub const DSH_ENV_PREFIX: &str = "DSH_";
@@ -152,6 +162,46 @@ pub enum ShellError {
     /// A confined mode was requested and no sandbox backend is usable.
     #[error("{0}")]
     Unavailable(String),
+    /// Host spawn of argv[0] failed with a recorded I/O kind.
+    #[error("{message}")]
+    Spawn {
+        /// `std::io::ErrorKind` from `Command::spawn`.
+        kind: ErrorKind,
+        /// argv[0] that `Command::new` tried to execute.
+        program: String,
+        /// Display text of the original I/O error.
+        message: String,
+    },
+}
+
+impl ShellError {
+    /// Map a `Command::spawn` error, recording argv[0] and the I/O kind.
+    pub fn from_spawn(program: impl Into<String>, error: std::io::Error) -> Self {
+        Self::Spawn {
+            kind: error.kind(),
+            program: program.into(),
+            message: error.to_string(),
+        }
+    }
+
+    /// Attribute only NotFound/PermissionDenied spawn failures whose recorded
+    /// program equals the confinement argv[0], after independently ruling out
+    /// an unusable caller cwd.
+    pub fn is_runner_spawn_failure(&self, runner_program: Option<&str>, workdir: &str) -> bool {
+        let Self::Spawn { kind, program, .. } = self else {
+            return false;
+        };
+        let Some(runner) = runner_program else {
+            return false;
+        };
+        if program != runner {
+            return false;
+        }
+        if !matches!(kind, ErrorKind::NotFound | ErrorKind::PermissionDenied) {
+            return false;
+        }
+        is_usable_workdir(workdir)
+    }
 }
 
 /// Provider interface.
@@ -252,5 +302,22 @@ mod tests {
         assert_eq!(result.stdout.text, "hello\n");
         assert!(result.stderr.text.is_empty());
         assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn runner_spawn_failure_needs_usable_cwd_and_matching_program() {
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .to_string_lossy()
+            .into_owned();
+        let missing = ShellError::from_spawn(
+            "/no-such-dsh-runner",
+            std::io::Error::new(ErrorKind::NotFound, "not found"),
+        );
+        assert!(missing.is_runner_spawn_failure(Some("/no-such-dsh-runner"), &cwd));
+        assert!(!missing.is_runner_spawn_failure(Some("/other"), &cwd));
+        assert!(!missing.is_runner_spawn_failure(Some("/no-such-dsh-runner"), "/no/such/workdir"));
+        let other = ShellError::Failed("spawn failed".into());
+        assert!(!other.is_runner_spawn_failure(Some("/no-such-dsh-runner"), &cwd));
     }
 }

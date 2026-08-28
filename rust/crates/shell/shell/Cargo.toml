@@ -10,4 +10,5 @@ description = "Shell executor seam (ctx.shell)."
 async-trait.workspace = true
 dsh-cordis.workspace = true
 dsh-sandbox.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

@@ -8,6 +8,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+mod presentation;
+
+pub use presentation::{
+    GenericCallView, GenericResultView, TerminalCallView, TerminalResultView, ToolCallKind,
+    ToolCallView, ToolResultView,
+};
+
 /// One scheduled tool call, including the live agent when the loop invoked it.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -82,6 +89,24 @@ pub trait Tool: Send + Sync {
     /// default keeps the tool globally visible.
     fn enabled_for(&self, _agent_id: Option<&str>) -> bool {
         true
+    }
+
+    /// Canonical output schema for this tool, when it projects a structured value
+    /// before rendering model-visible text. Omitted tools have none.
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
+    /// UI render intent for a pending call. Malformed args return `None`
+    /// rather than failing: presentation may run on replay of logged args.
+    fn present_call(&self, _args: &Value) -> Option<ToolCallView> {
+        None
+    }
+
+    /// UI render intent for a completed call. Malformed args or a result that
+    /// is not a single text block return `None`.
+    fn present_result(&self, _args: &Value, _outcome: &ToolOutcome) -> Option<ToolResultView> {
+        None
     }
 }
 

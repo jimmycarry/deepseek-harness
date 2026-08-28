@@ -320,6 +320,7 @@ dependencies = [
  "dsh-llm-retry",
  "dsh-permission-presets",
  "dsh-plan-mode",
+ "dsh-pwsh-sandbox",
  "dsh-repeat-tool-reminder",
  "dsh-sandbox",
  "dsh-sandbox-local",
@@ -353,6 +354,7 @@ dependencies = [
  "dsh-tool-fs-search",
  "dsh-tool-goal",
  "dsh-tool-jobs",
+ "dsh-tool-pwsh",
  "dsh-tool-ralph",
  "dsh-tool-result-pruner",
  "dsh-tool-skill",
@@ -830,6 +832,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-pwsh-local"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-bash-local",
+ "dsh-shell",
+ "dsh-subprocess",
+ "dsh-subprocess-local",
+ "tokio",
+]
+
+[[package]]
+name = "dsh-pwsh-sandbox"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-pwsh-local",
+ "dsh-sandbox",
+ "dsh-sandbox-local",
+ "dsh-shell",
+ "dsh-subprocess",
+ "dsh-subprocess-local",
+ "tokio",
+]
+
+[[package]]
 name = "dsh-repeat-tool-reminder"
 version = "0.1.1-rc.2"
 dependencies = [
@@ -1110,6 +1139,7 @@ dependencies = [
  "async-trait",
  "dsh-cordis",
  "dsh-sandbox",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1378,6 +1408,21 @@ dependencies = [
  "dsh-tools",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dsh-tool-pwsh"
+version = "0.1.1-rc.2"
+dependencies = [
+ "async-trait",
+ "dsh-cordis",
+ "dsh-jobs",
+ "dsh-sandbox",
+ "dsh-shell",
+ "dsh-shell-env",
+ "dsh-tool-bash",
+ "dsh-tools",
+ "serde_json",
 ]
 
 [[package]]

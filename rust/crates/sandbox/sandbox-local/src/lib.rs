@@ -2,8 +2,9 @@
 
 use dsh_cordis::Context;
 use dsh_sandbox::{
-    ConfinedArgv, ProcessConfiner, SandboxEnforcement, SandboxError, SandboxExecutionPolicy,
-    SandboxMode, SandboxPolicy, SandboxRuntime,
+    bwrap_runner_failure_rules, landlock_runner_failure_rules, ConfinedArgv, ProcessConfiner,
+    SandboxEnforcement, SandboxError, SandboxExecutionPolicy, SandboxMode, SandboxPolicy,
+    SandboxRuntime,
 };
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -189,6 +190,7 @@ impl ProcessConfiner for LocalConfiner {
                 argv: argv.to_vec(),
                 enforcement: SandboxEnforcement::Full,
                 denial_signatures: Vec::new(),
+                runner_failure_rules: Vec::new(),
             });
         }
         match select_linux_runner() {
@@ -201,6 +203,7 @@ impl ProcessConfiner for LocalConfiner {
                     argv: wrapped,
                     enforcement: SandboxEnforcement::Full,
                     denial_signatures: vec!["read-only file system".into()],
+                    runner_failure_rules: bwrap_runner_failure_rules(),
                 })
             }
             Some(LinuxRunner::Landlock { path }) => {
@@ -212,6 +215,7 @@ impl ProcessConfiner for LocalConfiner {
                     argv: wrapped,
                     enforcement: SandboxEnforcement::Partial,
                     denial_signatures: vec!["permission denied".into()],
+                    runner_failure_rules: landlock_runner_failure_rules(),
                 })
             }
             None => Err(SandboxError::unavailable(policy.mode.as_str(), None)),
@@ -334,6 +338,7 @@ mod tests {
             )
             .unwrap();
         assert!(confined.denial_signatures.is_empty());
+        assert!(confined.runner_failure_rules.is_empty());
         assert_eq!(confined.argv, ["true"]);
     }
 
@@ -355,10 +360,18 @@ mod tests {
             LinuxRunner::Bwrap => {
                 assert_eq!(confined.denial_signatures, ["read-only file system"]);
                 assert_eq!(confined.enforcement, SandboxEnforcement::Full);
+                assert_eq!(
+                    confined.runner_failure_rules,
+                    dsh_sandbox::bwrap_runner_failure_rules()
+                );
             }
             LinuxRunner::Landlock { .. } => {
                 assert_eq!(confined.denial_signatures, ["permission denied"]);
                 assert_eq!(confined.enforcement, SandboxEnforcement::Partial);
+                assert_eq!(
+                    confined.runner_failure_rules,
+                    dsh_sandbox::landlock_runner_failure_rules()
+                );
             }
         }
     }

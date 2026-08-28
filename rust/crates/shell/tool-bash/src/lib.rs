@@ -6,17 +6,21 @@ use dsh_agent::AgentRegistry;
 use dsh_cordis::Context;
 use dsh_jobs::{JobHooks, JobOutcome, JobRegistry, JobStart, JobStatus};
 use dsh_sandbox::{
-    approve_escalation, escalation_audit_reason, escalation_hint_marker, sandbox_denial_marker,
-    validate_escalation_args, EscalationIngredients, EscalationRequest, ESCALATION_TARGETS,
+    approve_escalation, escalation_audit_reason, validate_escalation_args, EscalationIngredients,
+    EscalationRequest, ESCALATION_TARGETS,
 };
 use dsh_sandbox_policy::{resolve_from_context, SandboxPolicyService};
 use dsh_session::session_id;
 use dsh_shell::{
-    CollectedOutput, DSH_ENV_PREFIX, ShellChild, ShellChildExit, ShellRequest, ShellRunResult,
-    ShellRuntime, ShellSandboxInfo,
+    parse_exit_status, render_process_read, render_shell_result, shell_tool_output_schema,
+    DSH_ENV_PREFIX, ShellChild, ShellChildExit, ShellRequest, ShellRunResult, ShellRuntime,
+    ShellToolOutput,
 };
 use dsh_shell_env::ShellEnvRegistry;
-use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome};
+use dsh_tools::{
+    GenericCallView, GenericResultView, TerminalCallView, TerminalResultView, Tool, ToolCall,
+    ToolCallKind, ToolCallView, ToolError, ToolOutcome, ToolResultView,
+};
 use dsh_user_approval::{ApprovalRequest, ApprovalService};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -86,98 +90,111 @@ it — but it does not forbid attempting or escalating other commands later.",
 /// # Errors
 /// The TypeScript load-failure sentence.
 pub fn require_confining_policy(ctx: &Context, shell: &ShellRuntime) -> Result<(), String> {
+    require_confining_policy_named(
+        ctx,
+        shell,
+        "tool-bash: the mounted bash executor confines but ctx.sandboxPolicy is missing",
+    )
+}
+
+/// Fail loud when a confining executor is mounted without `ctx.sandboxPolicy`.
+///
+/// # Errors
+/// The TypeScript load-failure sentence for this tool package.
+pub fn require_confining_policy_named(
+    ctx: &Context,
+    shell: &ShellRuntime,
+    sentence: &str,
+) -> Result<(), String> {
     if shell.sandbox_mode().is_some() && ctx.get::<SandboxPolicyService>().is_none() {
-        return Err(
-            "tool-bash: the mounted bash executor confines but ctx.sandboxPolicy is missing".into(),
-        );
+        return Err(sentence.into());
     }
     Ok(())
 }
 
-fn stream_text(output: &CollectedOutput) -> String {
-    if !output.truncated {
-        return output.text.clone();
-    }
-    format!(
-        "{}\n[output truncated; full output: {}]",
-        output.text,
-        output.spill_path.as_deref().unwrap_or("(unavailable)")
-    )
+/// Names and schema copy that distinguish bash from its pwsh twin.
+#[derive(Debug, Clone, Copy)]
+pub struct ShellToolDialect {
+    /// Advertised tool name (`bash` / `pwsh`).
+    pub name: &'static str,
+    /// `ctx.jobs` kind (`bash` / `pwsh`).
+    pub job_kind: &'static str,
+    /// Load-failure sentence when a confining executor lacks `ctx.sandboxPolicy`.
+    pub missing_policy: &'static str,
+    /// `command` parameter description.
+    pub command_param: &'static str,
+    /// Examples inside the `description` parameter prose.
+    pub description_examples: &'static str,
+    /// Tool description builder.
+    pub describe: fn(bool, bool) -> String,
 }
+
+/// Bash dialect.
+pub const BASH_DIALECT: ShellToolDialect = ShellToolDialect {
+    name: "bash",
+    job_kind: "bash",
+    missing_policy: "tool-bash: the mounted bash executor confines but ctx.sandboxPolicy is missing",
+    command_param: "The bash command to execute.",
+    description_examples: "Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\".",
+    describe: bash_description,
+};
 
 /// Shape one finished run into the text the model sees.
 pub fn render_result(result: &ShellRunResult, advertises_escalation: bool) -> String {
-    let out = stream_text(&result.stdout);
-    let err = stream_text(&result.stderr);
-    let mut body = out;
-    if !err.is_empty() {
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push_str("[stderr]\n");
-        body.push_str(&err);
-    }
-    if body.is_empty() {
-        body = "(no output)".into();
-    }
-    let mut markers = Vec::new();
-    if result.sandbox.as_ref().is_some_and(|info| info.denied) {
-        let mode = result.sandbox.as_ref().expect("denied implies sandbox").mode;
-        markers.push(sandbox_denial_marker(mode));
-        if advertises_escalation {
-            markers.push(escalation_hint_marker("command"));
-        }
-    }
-    if result.timed_out {
-        markers.push(format!("[timed out after {}ms]", result.timeout_ms));
-    }
-    if let Some(signal) = &result.signal {
-        markers.push(format!("[killed by signal: {signal}]"));
-    } else if result.exit_code != Some(0) {
-        let code = result
-            .exit_code
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "null".into());
-        markers.push(format!("[exit code: {code}]"));
-    }
-    if markers.is_empty() {
-        return body;
-    }
-    if !body.ends_with('\n') {
-        body.push('\n');
-    }
-    body.push_str(&markers.join("\n"));
-    body
+    render_shell_result(result, advertises_escalation)
 }
 
-fn render_process_read(
-    delta: &str,
-    sandbox: Option<&ShellSandboxInfo>,
-    advertises_escalation: bool,
-) -> String {
-    let mut notices = Vec::new();
-    if sandbox.is_some_and(|info| info.runner_failed == Some(true)) {
-        let mode = sandbox.expect("runnerFailed implies sandbox").mode;
-        notices.push(format!(
-            "[sandbox: the sandbox runner itself failed under {} mode — the command did not run; this is a sandbox problem, not a command failure]",
-            mode.as_str()
-        ));
-    } else if sandbox.is_some_and(|info| info.denied) {
-        let mode = sandbox.expect("denied implies sandbox").mode;
-        notices.push(sandbox_denial_marker(mode));
-        if advertises_escalation {
-            notices.push(escalation_hint_marker("command"));
-        }
+fn present_bash_call(args: &Value) -> Option<ToolCallView> {
+    let command = args.get("command")?.as_str()?;
+    let description = args.get("description")?.as_str()?;
+    if args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
+        return Some(ToolCallView::Generic(GenericCallView {
+            title: command.to_string(),
+            kind: Some(ToolCallKind::Execute),
+            raw_input: Some(Value::String(command.to_string())),
+            content: Some(vec![dsh_llm::ContentBlock::text(description)]),
+        }));
     }
-    if notices.is_empty() {
-        return delta.to_string();
+    Some(ToolCallView::Terminal(TerminalCallView {
+        title: command.to_string(),
+        description: Some(description.to_string()),
+        cwd: args
+            .get("workdir")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }))
+}
+
+fn present_bash_result(args: &Value, outcome: &ToolOutcome) -> Option<ToolResultView> {
+    if args.get("command").and_then(Value::as_str).is_none()
+        || args.get("description").and_then(Value::as_str).is_none()
+    {
+        return None;
     }
-    let separator = if !delta.is_empty() && !delta.ends_with('\n') {
-        "\n"
-    } else {
-        ""
+    if outcome.content.len() != 1 {
+        return None;
+    }
+    let dsh_llm::ContentBlock::Text { text } = &outcome.content[0] else {
+        return None;
     };
-    format!("{delta}{separator}{}", notices.join("\n"))
+    let is_background =
+        args.get("run_in_background").and_then(Value::as_bool) == Some(true);
+    if is_background || outcome.is_error {
+        let trimmed = text.trim_end_matches('\n');
+        return Some(ToolResultView::Generic(GenericResultView {
+            title: None,
+            content: Some(vec![dsh_llm::ContentBlock::text(format!(
+                "```console\n{trimmed}\n```"
+            ))]),
+        }));
+    }
+    let parsed = parse_exit_status(text);
+    Some(ToolResultView::Terminal(TerminalResultView {
+        title: None,
+        output: Some(parsed.body),
+        exit_code: parsed.exit_code,
+        signal: parsed.signal,
+    }))
 }
 
 fn process_outcome(exit: &ShellChildExit) -> JobOutcome {
@@ -277,8 +294,9 @@ fn validate_bash_args(
     Ok((command.to_string(), timeout_ms, workdir))
 }
 
-/// `bash` tool.
+/// `bash` (or pwsh-twin) tool.
 pub struct BashTool {
+    dialect: ShellToolDialect,
     shell: Arc<ShellRuntime>,
     jobs: Option<Arc<JobRegistry>>,
     enable_run_in_background: bool,
@@ -290,15 +308,7 @@ pub struct BashTool {
 impl BashTool {
     /// Bind to `ctx.shell` without jobs (foreground only).
     pub fn new(shell: Arc<ShellRuntime>) -> Self {
-        let description = bash_description(true, shell.sandbox_mode().is_some());
-        Self {
-            shell,
-            jobs: None,
-            enable_run_in_background: true,
-            shell_env: None,
-            lookup: None,
-            description,
-        }
+        Self::with_jobs(shell, None, true)
     }
 
     /// Bind to shell and an optional job registry.
@@ -307,8 +317,19 @@ impl BashTool {
         jobs: Option<Arc<JobRegistry>>,
         enable_run_in_background: bool,
     ) -> Self {
-        let description = bash_description(enable_run_in_background, shell.sandbox_mode().is_some());
+        Self::with_dialect(shell, jobs, enable_run_in_background, BASH_DIALECT)
+    }
+
+    /// Bind a bash/pwsh dialect to shell and an optional job registry.
+    pub fn with_dialect(
+        shell: Arc<ShellRuntime>,
+        jobs: Option<Arc<JobRegistry>>,
+        enable_run_in_background: bool,
+        dialect: ShellToolDialect,
+    ) -> Self {
+        let description = (dialect.describe)(enable_run_in_background, shell.sandbox_mode().is_some());
         Self {
+            dialect,
             shell,
             jobs,
             enable_run_in_background,
@@ -328,7 +349,7 @@ impl BashTool {
     pub fn with_context(mut self, ctx: Context) -> Self {
         self.lookup = Some(ctx);
         self.description =
-            bash_description(self.enable_run_in_background, self.advertises_escalation());
+            (self.dialect.describe)(self.enable_run_in_background, self.advertises_escalation());
         self
     }
 
@@ -370,10 +391,7 @@ impl BashTool {
                     .into(),
             );
         }
-        let policy = standing.ok_or_else(|| {
-            "tool-bash: the mounted bash executor confines but ctx.sandboxPolicy is missing"
-                .to_string()
-        })?;
+        let policy = standing.ok_or_else(|| self.dialect.missing_policy.to_string())?;
         let Some(ctx) = &self.lookup else {
             return Err(format!(
                 "sandbox escalation to \"{}\" requires approval, but no approval service is composed",
@@ -415,7 +433,7 @@ impl BashTool {
                         &ctx,
                         agent.session().as_ref(),
                         ApprovalRequest {
-                            tool_name: "bash".into(),
+                            tool_name: self.dialect.name.into(),
                             call_id,
                             reason: Some(reason),
                         },
@@ -434,7 +452,7 @@ impl BashTool {
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str {
-        "bash"
+        self.dialect.name
     }
 
     fn description(&self) -> &str {
@@ -447,14 +465,17 @@ impl Tool for BashTool {
             "command".into(),
             json!({
                 "type": "string",
-                "description": "The bash command to execute."
+                "description": self.dialect.command_param
             }),
         );
         properties.insert(
             "description".into(),
             json!({
                 "type": "string",
-                "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\"."
+                "description": format!(
+                    "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). {}",
+                    self.dialect.description_examples
+                )
             }),
         );
         properties.insert(
@@ -508,6 +529,18 @@ impl Tool for BashTool {
         })
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        Some(shell_tool_output_schema())
+    }
+
+    fn present_call(&self, args: &Value) -> Option<ToolCallView> {
+        present_bash_call(args)
+    }
+
+    fn present_result(&self, args: &Value, outcome: &ToolOutcome) -> Option<ToolResultView> {
+        present_bash_result(args, outcome)
+    }
+
     async fn execute(&self, args: Value) -> Result<ToolOutcome, ToolError> {
         self.execute_call(&ToolCall::new(self.name(), args)).await
     }
@@ -553,7 +586,7 @@ impl Tool for BashTool {
             let spec = shell.resolve(request);
             let advertises = self.advertises_escalation();
             match jobs.start(JobStart {
-                kind: "bash".into(),
+                kind: self.dialect.job_kind.into(),
                 label: command,
                 output_limit_bytes: None,
                 owner_session: call.agent_id.clone(),
@@ -562,16 +595,19 @@ impl Tool for BashTool {
                     Ok(job_hooks_from_child(child, advertises))
                 }),
             }) {
-                Ok(id) => Ok(ToolOutcome::text(format!("started background job {id}"))),
+                Ok(id) => {
+                    let output = ShellToolOutput::Background { job_id: id };
+                    Ok(ToolOutcome::text(output.render(false)))
+                }
                 Err(error) => Ok(ToolOutcome::error(format!("Error: {error}"))),
             }
         } else {
             let spec = self.shell.resolve(request);
             match self.shell.run(spec).await {
-                Ok(result) => Ok(ToolOutcome::text(render_result(
-                    &result,
-                    self.advertises_escalation(),
-                ))),
+                Ok(result) => {
+                    let output = ShellToolOutput::Foreground { result };
+                    Ok(ToolOutcome::text(output.render(self.advertises_escalation())))
+                }
                 Err(error) => Ok(ToolOutcome::error(error.to_string())),
             }
         }
@@ -599,7 +635,7 @@ pub fn name() -> &'static str {
 mod tests {
     use super::*;
     use dsh_sandbox::{SandboxEnforcement, SandboxMode};
-    use dsh_shell::{ShellError, ShellExecutor, ShellSpec};
+    use dsh_shell::{ShellError, ShellExecutor, ShellSandboxInfo, ShellSpec};
     use std::sync::Mutex;
 
     #[test]
@@ -805,5 +841,158 @@ mod tests {
         assert!(text.contains("[sandbox: file access denied under read-only mode]"));
         assert!(text.contains("sandbox_permissions"));
         assert!(text.contains("[exit code: 1]"));
+    }
+
+    #[test]
+    fn output_schema_is_the_shared_shell_oneof() {
+        let tool = BashTool::new(Arc::new(ShellRuntime::new(Arc::new(RecordingBash {
+            modes: Mutex::new(Vec::new()),
+        }))));
+        let schema = tool.output_schema().expect("bash declares output schema");
+        assert_eq!(schema["oneOf"][0]["properties"]["kind"]["const"], "background");
+        assert_eq!(schema["oneOf"][1]["properties"]["kind"]["const"], "foreground");
+    }
+
+    #[test]
+    fn present_call_is_a_terminal_card_and_background_is_generic() {
+        let tool = BashTool::new(Arc::new(ShellRuntime::new(Arc::new(RecordingBash {
+            modes: Mutex::new(Vec::new()),
+        }))));
+        let fg = tool
+            .present_call(&json!({
+                "command": "ls -la src",
+                "description": "List files in src"
+            }))
+            .expect("foreground call");
+        match fg {
+            ToolCallView::Terminal(view) => {
+                assert_eq!(view.title, "ls -la src");
+                assert_eq!(view.description.as_deref(), Some("List files in src"));
+                assert!(view.cwd.is_none());
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        let with_cwd = tool
+            .present_call(&json!({
+                "command": "pwd",
+                "description": "Print dir",
+                "workdir": "/tmp/x"
+            }))
+            .expect("cwd");
+        match with_cwd {
+            ToolCallView::Terminal(view) => assert_eq!(view.cwd.as_deref(), Some("/tmp/x")),
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        let bg = tool
+            .present_call(&json!({
+                "command": "sleep 100",
+                "description": "wait",
+                "run_in_background": true
+            }))
+            .expect("background call");
+        match bg {
+            ToolCallView::Generic(view) => {
+                assert_eq!(view.title, "sleep 100");
+                assert_eq!(view.kind, Some(ToolCallKind::Execute));
+            }
+            other => panic!("expected generic, got {other:?}"),
+        }
+        assert!(tool.present_call(&json!({ "command": "ls" })).is_none());
+    }
+
+    #[test]
+    fn present_result_parses_exit_and_keeps_timeout_in_body() {
+        let tool = BashTool::new(Arc::new(ShellRuntime::new(Arc::new(RecordingBash {
+            modes: Mutex::new(Vec::new()),
+        }))));
+        let args = json!({ "command": "x", "description": "x" });
+        match tool
+            .present_result(
+                &args,
+                &ToolOutcome::text("hi\n\n"),
+            )
+            .expect("zero")
+        {
+            ToolResultView::Terminal(view) => {
+                assert_eq!(view.output.as_deref(), Some("hi\n\n"));
+                assert_eq!(view.exit_code, Some(0));
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        match tool
+            .present_result(
+                &args,
+                &ToolOutcome::text("oops\n[exit code: 3]"),
+            )
+            .expect("nonzero")
+        {
+            ToolResultView::Terminal(view) => {
+                assert_eq!(view.output.as_deref(), Some("oops"));
+                assert_eq!(view.exit_code, Some(3));
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        match tool
+            .present_result(
+                &args,
+                &ToolOutcome::text("slow\n[timed out after 100ms]\n[exit code: 143]"),
+            )
+            .expect("timeout")
+        {
+            ToolResultView::Terminal(view) => {
+                assert_eq!(
+                    view.output.as_deref(),
+                    Some("slow\n[timed out after 100ms]")
+                );
+                assert_eq!(view.exit_code, Some(143));
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        match tool
+            .present_result(
+                &args,
+                &ToolOutcome::error("invalid command: expected a non-empty string"),
+            )
+            .expect("error")
+        {
+            ToolResultView::Generic(_) => {}
+            other => panic!("expected generic, got {other:?}"),
+        }
+        match tool
+            .present_result(
+                &json!({
+                    "command": "sleep 100",
+                    "description": "wait",
+                    "run_in_background": true
+                }),
+                &ToolOutcome::text("started background job abc"),
+            )
+            .expect("background ack")
+        {
+            ToolResultView::Generic(view) => {
+                let text = match &view.content.as_ref().unwrap()[0] {
+                    dsh_llm::ContentBlock::Text { text } => text.clone(),
+                    _ => String::new(),
+                };
+                assert_eq!(text, "```console\nstarted background job abc\n```");
+            }
+            other => panic!("expected generic, got {other:?}"),
+        }
+        match tool
+            .present_result(&args, &ToolOutcome::text("[exit code: 5]"))
+            .expect("marker-like body")
+        {
+            ToolResultView::Terminal(view) => {
+                assert_eq!(view.output.as_deref(), Some("[exit code: 5]"));
+                assert_eq!(view.exit_code, Some(0));
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        assert!(tool
+            .present_result(&args, &ToolOutcome {
+                content: vec![],
+                is_error: false,
+            })
+            .is_none());
     }
 }

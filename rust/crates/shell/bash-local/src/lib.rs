@@ -107,7 +107,8 @@ fn bash_login_argv(command: &str) -> Vec<String> {
     vec!["/bin/bash".into(), "-lc".into(), command.to_string()]
 }
 
-fn result_from_exit(
+/// Project a settled local child into a foreground run result.
+pub fn result_from_exit(
     child: &LocalShellChild,
     exit: ShellChildExit,
     timeout_ms: u64,
@@ -133,12 +134,22 @@ fn result_from_exit(
     }
 }
 
-/// Spawn `argv` under `spec`'s cwd and managed environment.
+/// Spawn `argv` under `spec`'s cwd and the bash model-friendly environment.
 pub fn spawn_argv(argv: &[String], spec: &ShellSpec) -> Result<LocalShellChild, ShellError> {
+    spawn_argv_with_env(argv, spec, ENV_OVERRIDES)
+}
+
+/// Spawn `argv` with an explicit environment-override table (pwsh omits `TERM=dumb`).
+pub fn spawn_argv_with_env(
+    argv: &[String],
+    spec: &ShellSpec,
+    extra_env: &[(&str, &str)],
+) -> Result<LocalShellChild, ShellError> {
     let program = argv
         .first()
-        .ok_or_else(|| ShellError::Failed("sandbox confine returned an empty argv".into()))?;
-    let mut cmd = Command::new(program);
+        .ok_or_else(|| ShellError::Failed("sandbox confine returned an empty argv".into()))?
+        .clone();
+    let mut cmd = Command::new(&program);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -146,10 +157,8 @@ pub fn spawn_argv(argv: &[String], spec: &ShellSpec) -> Result<LocalShellChild, 
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
-    apply_env(&mut cmd, spec);
-    let mut child = cmd
-        .spawn()
-        .map_err(|error| ShellError::Failed(error.to_string()))?;
+    apply_env_overrides(&mut cmd, spec, extra_env);
+    let mut child = cmd.spawn().map_err(|error| ShellError::from_spawn(program, error))?;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let stdout = Arc::new(Mutex::new(String::new()));
@@ -190,8 +199,13 @@ fn spawn_reader(mut pipe: impl Read + Send + 'static, dest: Arc<Mutex<String>>) 
     })
 }
 
-fn apply_env(command: &mut Command, spec: &ShellSpec) {
-    for (key, value) in ENV_OVERRIDES {
+/// Apply model-friendly environment overrides plus an optional trusted overlay.
+pub fn apply_env_overrides(
+    command: &mut Command,
+    spec: &ShellSpec,
+    extra_env: &[(&str, &str)],
+) {
+    for (key, value) in extra_env {
         command.env(key, value);
     }
     let Some(overlay) = &spec.dsh_env else {
@@ -200,7 +214,7 @@ fn apply_env(command: &mut Command, spec: &ShellSpec) {
     let mut env: BTreeMap<String, String> = std::env::vars()
         .filter(|(key, _)| !key.to_ascii_uppercase().starts_with("DSH_"))
         .collect();
-    for (key, value) in ENV_OVERRIDES {
+    for (key, value) in extra_env {
         env.insert((*key).into(), (*value).into());
     }
     env.extend(overlay.iter().map(|(key, value)| (key.clone(), value.clone())));

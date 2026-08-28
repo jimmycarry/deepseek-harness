@@ -28,6 +28,9 @@ members = [
   "crates/shell/bash-local",
   "crates/shell/bash-sandbox",
   "crates/shell/tool-bash",
+  "crates/shell/pwsh-local",
+  "crates/shell/pwsh-sandbox",
+  "crates/shell/tool-pwsh",
   "crates/fs/fs",
   "crates/fs/fs-local",
   "crates/fs/fs-sandbox",
@@ -165,6 +168,9 @@ dsh-shell-env = { path = "crates/shell/shell-env" }
 dsh-bash-local = { path = "crates/shell/bash-local" }
 dsh-bash-sandbox = { path = "crates/shell/bash-sandbox" }
 dsh-tool-bash = { path = "crates/shell/tool-bash" }
+dsh-pwsh-local = { path = "crates/shell/pwsh-local" }
+dsh-pwsh-sandbox = { path = "crates/shell/pwsh-sandbox" }
+dsh-tool-pwsh = { path = "crates/shell/tool-pwsh" }
 dsh-fs = { path = "crates/fs/fs" }
 dsh-fs-local = { path = "crates/fs/fs-local" }
 dsh-fs-sandbox = { path = "crates/fs/fs-sandbox" }

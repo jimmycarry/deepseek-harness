@@ -18,7 +18,7 @@ use dsh_session::SessionStore;
 use dsh_shell::ShellRuntime;
 use dsh_subprocess::SubprocessRuntime;
 use dsh_subprocess_local::LocalSubprocess;
-use dsh_system_prompt::SystemPrompt;
+use dsh_system_prompt::{PromptSection, SystemPrompt};
 use dsh_tool_bash::BashTool;
 use dsh_settings_file::SettingsRuntime;
 use dsh_tool_fs::{EditTool, ReadTool, WriteTool};
@@ -70,10 +70,12 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-sandbox-local" => apply_sandbox(ctx, config),
         "@deepseek-ai/dsh-sandbox-policy" => apply_sandbox_policy(ctx, config),
         "@deepseek-ai/dsh-bash-sandbox" => apply_bash_sandbox(ctx),
+        "@deepseek-ai/dsh-pwsh-sandbox" => apply_pwsh_sandbox(ctx, config),
         "@deepseek-ai/dsh-user-approval" => apply_approval(ctx, config),
         "@deepseek-ai/dsh-permission-presets" => apply_permission(ctx, config),
         "@deepseek-ai/dsh-shell-env" => dsh_shell_env::install(ctx, config.as_ref()),
         "@deepseek-ai/dsh-tool-bash" => apply_tool_bash(ctx, config),
+        "@deepseek-ai/dsh-tool-pwsh" => apply_tool_pwsh(ctx, config),
         "@deepseek-ai/dsh-tool-jobs" => apply_tool_jobs(ctx, config),
         "@deepseek-ai/dsh-tool-fs" => apply_tool_fs(ctx),
         "@deepseek-ai/dsh-fs-observation-policy" => dsh_fs_observation_policy::install(ctx),
@@ -391,6 +393,46 @@ fn apply_bash_sandbox(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+fn apply_pwsh_sandbox(ctx: &Context, config: Option<Value>) -> Result<()> {
+    apply_subprocess(ctx)?;
+    if !ctx.has_service(SandboxRuntime::KEY) {
+        apply_sandbox(ctx, None)?;
+    }
+    if ctx.has_service(ShellRuntime::KEY) {
+        return Ok(());
+    }
+    let (mode, workspace_root) = ctx
+        .get::<dsh_sandbox_policy::SandboxPolicyService>()
+        .map(|policy| {
+            (
+                policy.default_mode().as_str().to_string(),
+                policy.workspace_root().to_string(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                "workspace-write".into(),
+                std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| ".".into()),
+            )
+        });
+    let pwsh_path = config
+        .as_ref()
+        .and_then(|value| value.get("pwshPath"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    dsh_pwsh_sandbox::install(
+        ctx,
+        dsh_pwsh_sandbox::Config {
+            mode,
+            workspace_root,
+            pwsh_path,
+        },
+    )?;
+    Ok(())
+}
+
 fn apply_shell(ctx: &Context) -> Result<()> {
     if ctx.has_service(ShellRuntime::KEY) {
         return Ok(());
@@ -429,6 +471,27 @@ fn apply_tool_bash(ctx: &Context, config: Option<Value>) -> Result<()> {
         tool = tool.with_shell_env(shell_env);
     }
     tools.insert(Arc::new(tool));
+    if let Some(prompt) = ctx.get::<SystemPrompt>() {
+        prompt.register_section(PromptSection {
+            id: "tool:bash".into(),
+            order: 105,
+            text: "Check the [exit code: N] marker on every bash result; investigate failures before moving on.".into(),
+        });
+    }
+    Ok(())
+}
+
+fn apply_tool_pwsh(ctx: &Context, config: Option<Value>) -> Result<()> {
+    apply_shell(ctx)?;
+    ensure_tools(ctx)?;
+    dsh_tool_pwsh::install(ctx, config.as_ref())?;
+    if let Some(prompt) = ctx.get::<SystemPrompt>() {
+        prompt.register_section(PromptSection {
+            id: "tool:pwsh".into(),
+            order: 105,
+            text: "Non-zero exits are reported as `[exit code: N]` markers; investigate failures before moving on. On Windows a killed process settles as `[exit code: 1]` without a signal marker; treat a bare exit 1 after an interruption as a termination, not a command failure.".into(),
+        });
+    }
     Ok(())
 }
 
