@@ -82,10 +82,20 @@ impl SessionHeader {
     }
 
     /// Header for a child session created by a subagent provider.
+    /// Allocates a UUID identity; use [`Self::for_subagent_child_id`] to reserve one.
     pub fn for_subagent_child(parent: Option<&SessionHeader>, parent_id: SessionId) -> Self {
+        Self::for_subagent_child_id(parent, parent_id, session_id(Uuid::new_v4().to_string()))
+    }
+
+    /// Header for a child session with a caller-reserved durable id.
+    pub fn for_subagent_child_id(
+        parent: Option<&SessionHeader>,
+        parent_id: SessionId,
+        id: SessionId,
+    ) -> Self {
         Self {
             version: SESSION_FORMAT_VERSION,
-            id: session_id(Uuid::new_v4().to_string()),
+            id,
             created_at: now_ms(),
             cwd: parent.and_then(|header| header.cwd.clone()).or_else(|| {
                 std::env::current_dir()
@@ -843,9 +853,7 @@ impl Session {
             session.append_logged(event)?;
         }
         let first_live = session.events().len() as u64;
-        session
-            .first_live_seq
-            .store(first_live, Ordering::SeqCst);
+        session.first_live_seq.store(first_live, Ordering::SeqCst);
         let needs_marker = match session.events().last() {
             Some(event) if is_end_seed(&event.data) => false,
             _ => true,
@@ -1135,10 +1143,7 @@ impl SessionStore {
             .is_some();
         if removed {
             if let Some(ctx) = self.emit.lock().expect("session emit").clone() {
-                ctx.emit(
-                    "session/disposed",
-                    serde_json::json!({ "id": id.as_str() }),
-                );
+                ctx.emit("session/disposed", serde_json::json!({ "id": id.as_str() }));
             }
         }
     }
@@ -1342,12 +1347,11 @@ mod tests {
             approval["data"],
             serde_json::json!({ "policy": "never", "source": "delegation" })
         );
-        let restored: SessionEventData =
-            serde_json::from_value(serde_json::json!({
-                "type": "sandbox/mode",
-                "data": { "mode": "workspace-write", "source": "other" }
-            }))
-            .unwrap();
+        let restored: SessionEventData = serde_json::from_value(serde_json::json!({
+            "type": "sandbox/mode",
+            "data": { "mode": "workspace-write", "source": "other" }
+        }))
+        .unwrap();
         match restored {
             SessionEventData::SandboxMode { mode, source } => {
                 assert_eq!(mode, "workspace-write");
@@ -1456,6 +1460,22 @@ mod tests {
     }
 
     #[test]
+    fn for_subagent_child_id_reserves_the_caller_identity() {
+        let parent = SessionHeader::new(session_id("parent"), Some("/tmp".into()));
+        let reserved = session_id("00000000-0000-4000-8000-000000000123");
+        let header = SessionHeader::for_subagent_child_id(
+            Some(&parent),
+            parent.id.clone(),
+            reserved.clone(),
+        );
+        assert_eq!(header.id, reserved);
+        assert_eq!(header.parent_session.as_ref(), Some(&parent.id));
+        assert_eq!(header.origin.as_deref(), Some("subagent"));
+        assert_eq!(header.delegation_depth, 1);
+        assert_eq!(header.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
     fn from_seed_appends_end_seed_once_and_keeps_first_live_seq() {
         let source = Session::new(session_id("src"));
         source
@@ -1482,8 +1502,8 @@ mod tests {
 
     #[test]
     fn empty_seed_appends_end_seed_at_seq_zero() {
-        let seeded = Session::from_seed(Session::new(session_id("empty")).header().clone(), [])
-            .unwrap();
+        let seeded =
+            Session::from_seed(Session::new(session_id("empty")).header().clone(), []).unwrap();
         assert_eq!(seeded.first_live_seq(), 0);
         assert_eq!(seeded.events().len(), 1);
         let wire = serde_json::to_value(&seeded.events()[0]).unwrap();
@@ -1545,7 +1565,10 @@ mod tests {
         .unwrap();
         let store = SessionStore::install(&ctx).unwrap();
         let session = store.create(session_id("created-1"));
-        assert_eq!(*created.lock().expect("created"), vec!["created-1".to_string()]);
+        assert_eq!(
+            *created.lock().expect("created"),
+            vec!["created-1".to_string()]
+        );
         store.remove(session.id());
         assert_eq!(
             *disposed.lock().expect("disposed"),
@@ -1602,15 +1625,16 @@ mod tests {
         seed.append(SessionEventData::TurnStart { turn: 1 }, None)
             .unwrap();
         let store = SessionStore::install(&ctx).unwrap();
-        let session = store.publish(
-            Session::replay(session_id("replay"), seed.events()).unwrap(),
-        );
+        let session = store.publish(Session::replay(session_id("replay"), seed.events()).unwrap());
         assert_eq!(*heard.lock().expect("heard"), 0);
         session
-            .append(SessionEventData::TurnEnd {
-                turn: 1,
-                reason: TurnEndReason::Completed,
-            }, None)
+            .append(
+                SessionEventData::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Completed,
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(*heard.lock().expect("heard"), 1);
     }
@@ -1624,10 +1648,8 @@ mod tests {
         let result = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&result);
         ctx.on("session/event", move |_| {
-            *slot.lock().expect("inner") = Some(inner.append(
-                SessionEventData::TurnStart { turn: 2 },
-                None,
-            ));
+            *slot.lock().expect("inner") =
+                Some(inner.append(SessionEventData::TurnStart { turn: 2 }, None));
         })
         .unwrap();
         session

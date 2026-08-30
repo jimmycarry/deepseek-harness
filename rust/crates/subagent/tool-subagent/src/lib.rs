@@ -291,12 +291,17 @@ impl Tool for DelegateTool {
                         "subagent tool requires a calling agent (exec.agent was undefined)".into(),
                     )
                 })?;
-            return match self.subagents.start_continuable(
-                &self.config.provider,
-                description,
-                vec![ContentBlock::text(prompt)],
-                &parent,
-            ) {
+            return match self
+                .subagents
+                .start_continuable(
+                    &self.config.provider,
+                    description,
+                    vec![ContentBlock::text(prompt)],
+                    &parent,
+                    None,
+                )
+                .await
+            {
                 Ok(started) => Ok(ToolOutcome::text(format!(
                     "started subagent {}",
                     started.child_id

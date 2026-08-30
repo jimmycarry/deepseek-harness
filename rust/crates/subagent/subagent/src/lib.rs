@@ -278,13 +278,16 @@ impl SubagentRuntime {
     /// later drives the accepted turn.
     ///
     /// Requires `ctx.sessionPersistence`. Absence fails with the TypeScript
-    /// persistence sentence before any child session is published.
-    pub fn start_continuable(
+    /// persistence sentence before any child session is published. A
+    /// caller-reserved `child_id` is rejected when the live registries or
+    /// configured persistence already own it.
+    pub async fn start_continuable(
         &self,
         provider: &str,
         label: &str,
         prompt: Vec<ContentBlock>,
         parent: &Arc<dyn Agent>,
+        child_id: Option<SessionId>,
     ) -> std::result::Result<ContinuableStart, String> {
         let registered = self
             .get_provider(provider)
@@ -309,9 +312,27 @@ impl SubagentRuntime {
             capture_delegated_policy_overrides(&ctx, Some(parent.session().as_ref()))
         };
         let (sessions, agents) = self.host()?;
+        let reserved = child_id.is_some();
         let parent_header = parent.session().header().clone();
-        let header = SessionHeader::for_subagent_child(Some(&parent_header), parent.id().clone());
+        let header = match child_id {
+            Some(id) => {
+                SessionHeader::for_subagent_child_id(Some(&parent_header), parent.id().clone(), id)
+            }
+            None => SessionHeader::for_subagent_child(Some(&parent_header), parent.id().clone()),
+        };
         let child_id = header.id.clone();
+        assert_child_id_available(&sessions, &agents, &child_id)?;
+        if reserved {
+            let ids = self
+                .require_persistence()?
+                .list_ids()
+                .await
+                .map_err(|error| error.to_string())?;
+            if ids.iter().any(|id| id == &child_id) {
+                return Err(already_exists(&child_id));
+            }
+        }
+        assert_child_id_available(&sessions, &agents, &child_id)?;
         let child = sessions.publish(Session::with_header(header));
         child
             .append(
@@ -770,6 +791,22 @@ do not retry send_message with this id"
 
 fn other_parent(child_id: &SessionId) -> String {
     format!("subagent \"{child_id}\" belongs to another parent session")
+}
+
+fn already_exists(child_id: &SessionId) -> String {
+    format!("subagent \"{child_id}\" already exists")
+}
+
+/// Reject a child identity already owned by a live Agent or Session.
+fn assert_child_id_available(
+    sessions: &SessionStore,
+    agents: &AgentRegistry,
+    child_id: &SessionId,
+) -> std::result::Result<(), String> {
+    if agents.get(child_id).is_some() || sessions.get(child_id).is_some() {
+        return Err(already_exists(child_id));
+    }
+    Ok(())
 }
 
 /// Authorize parent lineage and a continuable own-suffix descriptor.
@@ -1378,8 +1415,8 @@ mod tests {
         assert_eq!(runtime.results(), vec!["ping".to_string()]);
     }
 
-    #[test]
-    fn start_continuable_rejects_when_persistence_is_absent() {
+    #[tokio::test]
+    async fn start_continuable_rejects_when_persistence_is_absent() {
         let (_ctx, runtime, parent, store) = continuable_host(true);
         let error = runtime
             .start_continuable(
@@ -1387,15 +1424,143 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap_err();
         assert_eq!(error, PERSISTENCE_REQUIRED);
         assert!(store.get(&session_id("parent")).is_some());
         assert_eq!(store.live().len(), 1);
     }
 
-    #[test]
-    fn start_continuable_seeds_parent_sandbox_and_pins_approval() {
+    #[tokio::test]
+    async fn start_continuable_uses_a_reserved_child_id() {
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
+        let reserved = session_id("00000000-0000-4000-8000-000000000123");
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.child_id, reserved);
+        assert!(store.get(&reserved).is_some());
+    }
+
+    #[tokio::test]
+    async fn start_continuable_rejects_a_duplicate_reserved_id_while_live() {
+        let (_ctx, runtime, parent, _store, _persistence) = continuable_host_persisted();
+        let reserved = session_id("00000000-0000-4000-8000-000000000123");
+        runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap();
+        let error = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("again")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, already_exists(&reserved));
+    }
+
+    #[tokio::test]
+    async fn start_continuable_rejects_a_reserved_id_after_settlement() {
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
+        let reserved = session_id("00000000-0000-4000-8000-000000000123");
+        runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap();
+        runtime.run_pending().await;
+        assert!(store.get(&reserved).is_some());
+        let error = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("again")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, already_exists(&reserved));
+    }
+
+    #[tokio::test]
+    async fn start_continuable_rejects_a_reserved_id_owned_by_persistence() {
+        let (_ctx, runtime, parent, store, persistence) = continuable_host_persisted();
+        let reserved = session_id("00000000-0000-4000-8000-000000000123");
+        runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap();
+        runtime.run_pending().await;
+        persist_and_evict(&persistence, &store, &reserved).await;
+        let error = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("again")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, already_exists(&reserved));
+        assert!(store.get(&reserved).is_none());
+    }
+
+    #[tokio::test]
+    async fn start_continuable_rejects_a_reserved_id_already_in_the_session_store() {
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
+        let reserved = session_id("00000000-0000-4000-8000-000000000123");
+        store.create(reserved.clone());
+        let error = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+                Some(reserved.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, already_exists(&reserved));
+        assert_eq!(
+            store.get(&reserved).unwrap().header().origin.as_deref(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn start_continuable_seeds_parent_sandbox_and_pins_approval() {
         let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
         set_sandbox_mode(
             parent.agent.session().as_ref(),
@@ -1408,7 +1573,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         let child = store.get(&started.child_id).unwrap();
         let events = child.events();
@@ -1442,8 +1609,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn start_continuable_skips_unswitched_sandbox_and_still_pins_approval() {
+    #[tokio::test]
+    async fn start_continuable_skips_unswitched_sandbox_and_still_pins_approval() {
         let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
         let started = runtime
             .start_continuable(
@@ -1451,7 +1618,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         let child = store.get(&started.child_id).unwrap();
         let events = child.events();
@@ -1472,8 +1641,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn start_continuable_omits_approval_when_the_service_is_absent() {
+    #[tokio::test]
+    async fn start_continuable_omits_approval_when_the_service_is_absent() {
         let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted_with(false);
         let started = runtime
             .start_continuable(
@@ -1481,7 +1650,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         let child = store.get(&started.child_id).unwrap();
         assert!(child.events().iter().all(|event| {
@@ -1492,8 +1663,8 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn start_continuable_keeps_the_captured_mode_after_a_later_parent_switch() {
+    #[tokio::test]
+    async fn start_continuable_keeps_the_captured_mode_after_a_later_parent_switch() {
         let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
         set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::ReadOnly).unwrap();
         let started = runtime
@@ -1502,7 +1673,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         set_sandbox_mode(
             parent.agent.session().as_ref(),
@@ -1530,7 +1703,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         runtime.run_pending().await;
         runtime
@@ -1588,7 +1763,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         runtime.run_pending().await;
         persist_and_evict(&persistence, &store, &started.child_id).await;
@@ -1673,7 +1850,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         persist_and_evict(&persistence, &store, &started.child_id).await;
         let other = store.create(session_id("other-parent"));
@@ -1754,7 +1933,9 @@ mod tests {
                 "child task",
                 vec![ContentBlock::text("ping")],
                 &parent.agent,
+                None,
             )
+            .await
             .unwrap();
         runtime.run_pending().await;
         persist_and_evict(&persistence, &store, &started.child_id).await;
