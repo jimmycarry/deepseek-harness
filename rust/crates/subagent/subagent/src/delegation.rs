@@ -42,9 +42,7 @@ pub fn capture_delegated_policy_overrides(
         ctx.get::<SandboxPolicyService>()
             .and_then(|policy| policy.override_of(session))
     });
-    let approval_policy = ctx
-        .get::<ApprovalService>()
-        .map(|_| ApprovalPolicy::Never);
+    let approval_policy = ctx.get::<ApprovalService>().map(|_| ApprovalPolicy::Never);
     DelegatedPolicyOverrides {
         sandbox_mode,
         approval_policy,
@@ -112,8 +110,7 @@ pub fn bind_prompt(ctx: &Context) -> Result<()> {
 }
 
 fn is_delegated_session(session: &Session) -> bool {
-    session.header().origin.as_deref() == Some("subagent")
-        || session.header().delegation_depth > 0
+    session.header().origin.as_deref() == Some("subagent") || session.header().delegation_depth > 0
 }
 
 #[cfg(test)]

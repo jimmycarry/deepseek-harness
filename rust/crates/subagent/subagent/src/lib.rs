@@ -254,6 +254,9 @@ impl SubagentRuntime {
     /// persist the descriptor, materialize the child agent, and submit the
     /// initial prompt. Returns at inbox acceptance; [`Self::run_pending`]
     /// later drives the accepted turn.
+    ///
+    /// Requires `ctx.sessionPersistence`. Absence fails with the TypeScript
+    /// persistence sentence before any child session is published.
     pub fn start_continuable(
         &self,
         provider: &str,
@@ -269,6 +272,7 @@ impl SubagentRuntime {
                 "tool-subagent: provider \"{provider}\" does not support `backgroundMode: continuable`"
             ));
         }
+        self.require_persistence()?;
         // Snapshot before any child session exists: a later parent switch
         // belongs to the parent's future, not to this child.
         let inherited = {
@@ -1059,7 +1063,19 @@ mod tests {
         Arc<SessionStore>,
         Arc<PersistenceRuntime>,
     ) {
-        let (ctx, runtime, parent, store) = continuable_host(true);
+        continuable_host_persisted_with(true)
+    }
+
+    fn continuable_host_persisted_with(
+        with_approval: bool,
+    ) -> (
+        Context,
+        Arc<SubagentRuntime>,
+        dsh_agent::AgentHandle,
+        Arc<SessionStore>,
+        Arc<PersistenceRuntime>,
+    ) {
+        let (ctx, runtime, parent, store) = continuable_host(with_approval);
         let persistence = Arc::new(PersistenceRuntime::new(MemoryBackend::new()));
         ctx.provide(Arc::clone(&persistence)).unwrap();
         (ctx, runtime, parent, store, persistence)
@@ -1135,8 +1151,24 @@ mod tests {
     }
 
     #[test]
-    fn start_continuable_seeds_parent_sandbox_and_pins_approval() {
+    fn start_continuable_rejects_when_persistence_is_absent() {
         let (_ctx, runtime, parent, store) = continuable_host(true);
+        let error = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap_err();
+        assert_eq!(error, PERSISTENCE_REQUIRED);
+        assert!(store.get(&session_id("parent")).is_some());
+        assert_eq!(store.live().len(), 1);
+    }
+
+    #[test]
+    fn start_continuable_seeds_parent_sandbox_and_pins_approval() {
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
         set_sandbox_mode(
             parent.agent.session().as_ref(),
             SandboxMode::DangerFullAccess,
@@ -1184,7 +1216,7 @@ mod tests {
 
     #[test]
     fn start_continuable_skips_unswitched_sandbox_and_still_pins_approval() {
-        let (_ctx, runtime, parent, store) = continuable_host(true);
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
         let started = runtime
             .start_continuable(
                 "spawn",
@@ -1214,7 +1246,7 @@ mod tests {
 
     #[test]
     fn start_continuable_omits_approval_when_the_service_is_absent() {
-        let (_ctx, runtime, parent, store) = continuable_host(false);
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted_with(false);
         let started = runtime
             .start_continuable(
                 "spawn",
@@ -1234,7 +1266,7 @@ mod tests {
 
     #[test]
     fn start_continuable_keeps_the_captured_mode_after_a_later_parent_switch() {
-        let (_ctx, runtime, parent, store) = continuable_host(true);
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
         set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::ReadOnly).unwrap();
         let started = runtime
             .start_continuable(
@@ -1262,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn followup_resume_does_not_reseed_delegation_policy() {
-        let (_ctx, runtime, parent, store) = continuable_host(true);
+        let (_ctx, runtime, parent, store, _persistence) = continuable_host_persisted();
         set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::ReadOnly).unwrap();
         let started = runtime
             .start_continuable(
@@ -1305,20 +1337,11 @@ mod tests {
 
     #[tokio::test]
     async fn followup_without_persistence_is_unavailable_when_catalog_misses() {
-        let (_ctx, runtime, parent, store) = continuable_host(true);
-        let started = runtime
-            .start_continuable(
-                "spawn",
-                "child task",
-                vec![ContentBlock::text("ping")],
-                &parent.agent,
-            )
-            .unwrap();
-        store.remove(&started.child_id);
+        let (_ctx, runtime, parent, _store) = continuable_host(true);
         let error = runtime
             .followup(
                 &parent.agent,
-                &started.child_id,
+                &session_id("22222222-2222-4222-8222-222222222222"),
                 vec![ContentBlock::text("continue")],
                 MessageSource::User,
             )
@@ -1518,15 +1541,30 @@ mod tests {
     #[tokio::test]
     async fn list_children_without_persistence_stays_live_only() {
         let (_ctx, runtime, parent, store) = continuable_host(true);
-        let started = runtime
-            .start_continuable(
-                "spawn",
-                "child task",
-                vec![ContentBlock::text("ping")],
-                &parent.agent,
+        let header = SessionHeader::for_subagent_child(
+            Some(parent.agent.session().header()),
+            parent.agent.id().clone(),
+        );
+        let child_id = header.id.clone();
+        let child = store.publish(Session::with_header(header));
+        child
+            .append(
+                SessionEventData::Extension {
+                    type_name: "subagent/descriptor".into(),
+                    data: serde_json::json!({
+                        "version": SUBAGENT_DESCRIPTOR_VERSION,
+                        "mode": "continuable",
+                        "provider": "spawn",
+                        "label": "live-only",
+                    }),
+                },
+                None,
             )
             .unwrap();
-        store.remove(&started.child_id);
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, child_id);
+        store.remove(&child_id);
         let entries = runtime.list_children(parent.agent.id()).await.unwrap();
         assert!(entries.is_empty());
     }
