@@ -68,8 +68,12 @@ fn configure(db: &Connection) -> std::result::Result<(), PersistenceError> {
             "schema version {version} is not supported {SCHEMA_VERSION}; no migration is provided pre-release"
         )));
     }
-    db.pragma_update(None, "application_id", SESSION_PERSISTENCE_SQLITE_APPLICATION_ID)
-        .map_err(sqlite_error)?;
+    db.pragma_update(
+        None,
+        "application_id",
+        SESSION_PERSISTENCE_SQLITE_APPLICATION_ID,
+    )
+    .map_err(sqlite_error)?;
     db.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(sqlite_error)?;
     db.execute_batch(
@@ -199,8 +203,8 @@ impl SessionStoreBackend for SqliteBackend {
         }
         let mut events = Vec::new();
         for payload in rows {
-            let value: Value =
-                serde_json::from_str(&payload).map_err(|error| PersistenceError::Format(error.to_string()))?;
+            let value: Value = serde_json::from_str(&payload)
+                .map_err(|error| PersistenceError::Format(error.to_string()))?;
             let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");
             let ignorable = value
                 .get("ignorable")
@@ -231,12 +235,32 @@ impl SessionStoreBackend for SqliteBackend {
         }
         Ok(ids)
     }
+
+    async fn list_headers(&self) -> std::result::Result<Vec<SessionHeader>, PersistenceError> {
+        let db = self.db.lock().expect("sqlite");
+        let mut stmt = db
+            .prepare("SELECT header FROM sessions ORDER BY id")
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_error)?;
+        let mut headers = Vec::new();
+        for row in rows {
+            let raw = row.map_err(sqlite_error)?;
+            headers.push(
+                serde_json::from_str(&raw)
+                    .map_err(|error| PersistenceError::Format(error.to_string()))?,
+            );
+        }
+        Ok(headers)
+    }
 }
 
 /// Provide [`PersistenceRuntime`] over a SQLite file.
 pub fn install(ctx: &Context, path: impl Into<PathBuf>) -> Result<Arc<PersistenceRuntime>> {
     let backend = Arc::new(
-        SqliteBackend::open(path).map_err(|error| dsh_cordis::CordisError::plugin(error.to_string()))?,
+        SqliteBackend::open(path)
+            .map_err(|error| dsh_cordis::CordisError::plugin(error.to_string()))?,
     );
     let runtime = Arc::new(PersistenceRuntime::new(backend));
     ctx.provide(Arc::clone(&runtime))?;
@@ -286,12 +310,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["s".to_string()]
         );
+        let headers = backend.list_headers().await.unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].id.as_str(), "s");
+        assert_eq!(headers[0].parent_session, None);
 
         let newer = tmp_path("newer");
         {
             let db = Connection::open(&newer).unwrap();
-            db.pragma_update(None, "application_id", SESSION_PERSISTENCE_SQLITE_APPLICATION_ID)
-                .unwrap();
+            db.pragma_update(
+                None,
+                "application_id",
+                SESSION_PERSISTENCE_SQLITE_APPLICATION_ID,
+            )
+            .unwrap();
             db.pragma_update(None, "user_version", 99).unwrap();
         }
         let err = match SqliteBackend::open(&newer) {

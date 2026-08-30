@@ -7,6 +7,7 @@ use dsh_llm::{ContentBlock, MessageSource, UserMessage};
 use dsh_session::{
     Session, SessionEventData, SessionHeader, SessionId, SessionStore, TurnEndReason,
 };
+use dsh_session_persistence::PersistenceRuntime;
 use dsh_session_projection::{subagent_identity_unit, SessionProjectionRegistry};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -323,9 +324,10 @@ impl SubagentRuntime {
     }
 
     /// Deliver one later message to a known continuable child as its next
-    /// turn. A resident child is woken directly; an absent one is resumed
-    /// from the session catalog after its descriptor authorizes continuation.
-    pub fn followup(
+    /// turn. A resident child is woken directly; an absent Activation is
+    /// resumed from the live catalog, or cold-loaded from
+    /// `ctx.sessionPersistence` when the catalog misses.
+    pub async fn followup(
         &self,
         parent: &Arc<dyn Agent>,
         child_id: &SessionId,
@@ -341,20 +343,14 @@ impl SubagentRuntime {
                 "subagent \"{child_id}\" delivery requires the exact live parent agent"
             ));
         }
-        let Some(child) = sessions.get(child_id) else {
-            return Err(format!("subagent \"{child_id}\" is unavailable"));
+        let child = if let Some(live) = sessions.get(child_id) {
+            live
+        } else {
+            let loaded = self.cold_load_child(child_id).await?;
+            authorize_followup(parent, child_id, loaded.header(), &loaded)?;
+            sessions.publish(loaded)
         };
-        if child.header().parent_session.as_ref() != Some(parent.id()) {
-            return Err(format!(
-                "subagent \"{child_id}\" belongs to another parent session"
-            ));
-        }
-        if fold_descriptor(&child).map(|descriptor| descriptor.mode) != Some("continuable".into()) {
-            return Err(format!(
-                "subagent \"{child_id}\" has no supported continuation state and cannot be resumed; \
-do not retry send_message with this id"
-            ));
-        }
+        authorize_followup(parent, child_id, child.header(), child.as_ref())?;
         let message = UserMessage::from_parts(content, source);
         let message_id = message.id.clone();
         let resident = {
@@ -369,7 +365,7 @@ do not retry send_message with this id"
             None => {
                 let handle = agents
                     .resume(Arc::clone(&child))
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|_| unavailable(child_id))?;
                 handle.agent.followup(message);
                 self.activations
                     .lock()
@@ -382,6 +378,26 @@ do not retry send_message with this id"
             }
         }
         Ok(message_id)
+    }
+
+    /// Load one persisted child. Catalog misses require a persistence backend.
+    async fn cold_load_child(&self, child_id: &SessionId) -> std::result::Result<Session, String> {
+        let persistence = self.require_persistence()?;
+        persistence
+            .load(child_id)
+            .await
+            .map_err(|_| unavailable(child_id))
+    }
+
+    /// Resolve `ctx.sessionPersistence`, or the TypeScript persistence sentence.
+    fn require_persistence(&self) -> std::result::Result<Arc<PersistenceRuntime>, String> {
+        self.persistence()
+            .ok_or_else(|| PERSISTENCE_REQUIRED.to_string())
+    }
+
+    /// Optional persistence captured on the install context.
+    fn persistence(&self) -> Option<Arc<PersistenceRuntime>> {
+        self.ctx.lock().ok().and_then(|guard| guard.as_ref()?.get())
     }
 
     /// Interrupt one live continuable child's current turn. Authorization
@@ -482,31 +498,32 @@ do not retry send_message with this id"
             .any(|activation| activation.child_id.as_str() == agent_id)
     }
 
-    /// Direct children of `parent_id` from the durable session catalog, in
-    /// creation order, each carrying its descriptor mode and label.
+    /// Direct children of `parent_id` from the live catalog plus persisted
+    /// `origin: "subagent"` headers, in creation order, each carrying its
+    /// descriptor mode and label.
     ///
     /// # Errors
-    /// `sessionProjections` is not mounted.
-    pub fn list_children(
+    /// `sessionProjections` is not mounted, or persistence listing fails.
+    pub async fn list_children(
         &self,
         parent_id: &SessionId,
     ) -> std::result::Result<Vec<SubagentListEntry>, String> {
         let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
-        children_of(self, &sessions, parent_id, 1)
+        children_of(self, &sessions, parent_id, 1).await
     }
 
     /// The complete tree below `parent_id` in stable pre-order, each entry
     /// annotated with its durable direct parent and depth.
     ///
     /// # Errors
-    /// `sessionProjections` is not mounted.
-    pub fn list_descendants(
+    /// `sessionProjections` is not mounted, or persistence listing fails.
+    pub async fn list_descendants(
         &self,
         parent_id: &SessionId,
     ) -> std::result::Result<Vec<SubagentListEntry>, String> {
         let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
         let mut entries = Vec::new();
-        collect_descendants(self, &sessions, parent_id, 1, &mut entries)?;
+        collect_descendants(self, &sessions, parent_id, 1, &mut entries).await?;
         Ok(entries)
     }
 
@@ -628,10 +645,12 @@ struct Descriptor {
     provider: String,
 }
 
-/// Fold a child log to its first `subagent/descriptor` payload, requiring the
-/// current [`SUBAGENT_DESCRIPTOR_VERSION`].
+/// Fold a child log to its first own-suffix `subagent/descriptor` payload,
+/// skipping the `seedLength` prefix so a fork seed's ancestor descriptor
+/// cannot classify the child.
 fn fold_descriptor(session: &Session) -> Option<Descriptor> {
-    session.events().into_iter().find_map(|event| {
+    let skip = session.header().seed_length.unwrap_or(0) as usize;
+    session.events().into_iter().skip(skip).find_map(|event| {
         let SessionEventData::Extension { type_name, data } = &event.data else {
             return None;
         };
@@ -662,9 +681,43 @@ fn fold_descriptor(session: &Session) -> Option<Descriptor> {
 }
 
 const PROJECTIONS_UNAVAILABLE: &str = "listing subagents requires the sessionProjections registry (load @deepseek-ai/dsh-session-projection)";
+const PERSISTENCE_REQUIRED: &str =
+    "continuable subagents require session persistence (load a dsh-session-persistence backend)";
 
-/// Direct catalog children of `parent_id`, sorted by creation time then id.
-fn children_of(
+fn unavailable(child_id: &SessionId) -> String {
+    format!("subagent \"{child_id}\" is unavailable")
+}
+
+fn no_continuation(child_id: &SessionId) -> String {
+    format!(
+        "subagent \"{child_id}\" has no supported continuation state and cannot be resumed; \
+do not retry send_message with this id"
+    )
+}
+
+fn other_parent(child_id: &SessionId) -> String {
+    format!("subagent \"{child_id}\" belongs to another parent session")
+}
+
+/// Authorize parent lineage and a continuable own-suffix descriptor.
+fn authorize_followup(
+    parent: &Arc<dyn Agent>,
+    child_id: &SessionId,
+    header: &SessionHeader,
+    session: &Session,
+) -> std::result::Result<(), String> {
+    if header.parent_session.as_ref() != Some(parent.id()) {
+        return Err(other_parent(child_id));
+    }
+    if fold_descriptor(session).map(|descriptor| descriptor.mode) != Some("continuable".into()) {
+        return Err(no_continuation(child_id));
+    }
+    Ok(())
+}
+
+/// Direct children of `parent_id` from the live catalog plus persisted
+/// `origin: "subagent"` sessions, sorted by creation time then id.
+async fn children_of(
     runtime: &SubagentRuntime,
     sessions: &SessionStore,
     parent_id: &SessionId,
@@ -677,11 +730,36 @@ fn children_of(
         .as_ref()
         .and_then(|ctx| ctx.get::<SessionProjectionRegistry>())
         .ok_or_else(|| PROJECTIONS_UNAVAILABLE.to_string())?;
-    let mut children: Vec<Arc<Session>> = sessions
-        .live()
-        .into_iter()
-        .filter(|session| session.header().parent_session.as_ref() == Some(parent_id))
-        .collect();
+    let mut by_id: HashMap<String, Arc<Session>> = HashMap::new();
+    for session in sessions.live() {
+        if session.header().parent_session.as_ref() == Some(parent_id) {
+            by_id.insert(session.id().as_str().to_string(), session);
+        }
+    }
+    if let Some(persistence) = runtime.persistence() {
+        let headers = persistence
+            .list_headers()
+            .await
+            .map_err(|error| error.to_string())?;
+        for header in headers {
+            if header.origin.as_deref() != Some("subagent") {
+                continue;
+            }
+            if header.parent_session.as_ref() != Some(parent_id) {
+                continue;
+            }
+            if by_id.contains_key(header.id.as_str()) {
+                continue;
+            }
+            match persistence.load(&header.id).await {
+                Ok(loaded) => {
+                    by_id.insert(loaded.id().as_str().to_string(), Arc::new(loaded));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+    let mut children: Vec<Arc<Session>> = by_id.into_values().collect();
     children.sort_by(|a, b| {
         (a.header().created_at, a.id().as_str()).cmp(&(b.header().created_at, b.id().as_str()))
     });
@@ -716,17 +794,24 @@ fn children_of(
 }
 
 /// Append the subtree below `parent_id` in stable pre-order.
-fn collect_descendants(
+async fn collect_descendants(
     runtime: &SubagentRuntime,
     sessions: &SessionStore,
     parent_id: &SessionId,
     depth: u32,
     entries: &mut Vec<SubagentListEntry>,
 ) -> std::result::Result<(), String> {
-    for child in children_of(runtime, sessions, parent_id, depth)? {
-        let child_id = child.id.clone();
-        entries.push(child);
-        collect_descendants(runtime, sessions, &child_id, depth + 1, entries)?;
+    let mut pending = vec![(parent_id.clone(), depth)];
+    while let Some((current, current_depth)) = pending.pop() {
+        let children = children_of(runtime, sessions, &current, current_depth).await?;
+        let mut next = Vec::new();
+        for child in children {
+            next.push((child.id.clone(), current_depth + 1));
+            entries.push(child);
+        }
+        for item in next.into_iter().rev() {
+            pending.push(item);
+        }
     }
     Ok(())
 }
@@ -820,8 +905,12 @@ mod tests {
     };
     use dsh_sandbox::SandboxMode;
     use dsh_sandbox_policy::set_sandbox_mode;
-    use dsh_session::session_id;
+    use dsh_session::{session_id, SessionEvent};
+    use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
+    use dsh_session_projection::SessionProjectionRegistry;
     use dsh_user_approval::{effective_approval_policy, ApprovalPolicy};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     struct Fake;
 
@@ -908,6 +997,84 @@ mod tests {
         }
     }
 
+    struct MemoryBackend {
+        sessions: Mutex<HashMap<String, (SessionHeader, Vec<SessionEvent>)>>,
+    }
+
+    impl MemoryBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                sessions: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SessionStoreBackend for MemoryBackend {
+        async fn save(&self, session: &Session) -> std::result::Result<(), PersistenceError> {
+            self.sessions.lock().expect("memory persist").insert(
+                session.id().as_str().to_string(),
+                (session.header().clone(), session.events()),
+            );
+            Ok(())
+        }
+
+        async fn load(&self, id: &SessionId) -> std::result::Result<Session, PersistenceError> {
+            let guard = self.sessions.lock().expect("memory persist");
+            let (header, events) = guard
+                .get(id.as_str())
+                .ok_or_else(|| PersistenceError::NotFound(id.as_str().to_string()))?;
+            let session = Session::with_header(header.clone());
+            for event in events {
+                session.append_logged(event.clone())?;
+            }
+            Ok(session)
+        }
+
+        async fn list_ids(&self) -> std::result::Result<Vec<SessionId>, PersistenceError> {
+            Ok(self
+                .sessions
+                .lock()
+                .expect("memory persist")
+                .keys()
+                .map(|id| session_id(id.as_str()))
+                .collect())
+        }
+
+        async fn list_headers(&self) -> std::result::Result<Vec<SessionHeader>, PersistenceError> {
+            Ok(self
+                .sessions
+                .lock()
+                .expect("memory persist")
+                .values()
+                .map(|(header, _)| header.clone())
+                .collect())
+        }
+    }
+
+    fn continuable_host_persisted() -> (
+        Context,
+        Arc<SubagentRuntime>,
+        dsh_agent::AgentHandle,
+        Arc<SessionStore>,
+        Arc<PersistenceRuntime>,
+    ) {
+        let (ctx, runtime, parent, store) = continuable_host(true);
+        let persistence = Arc::new(PersistenceRuntime::new(MemoryBackend::new()));
+        ctx.provide(Arc::clone(&persistence)).unwrap();
+        (ctx, runtime, parent, store, persistence)
+    }
+
+    async fn persist_and_evict(
+        persistence: &PersistenceRuntime,
+        store: &SessionStore,
+        child_id: &SessionId,
+    ) {
+        let child = store.get(child_id).expect("child in catalog");
+        persistence.save(child.as_ref()).await.unwrap();
+        store.remove(child_id);
+    }
+
     fn continuable_host(
         with_approval: bool,
     ) -> (
@@ -919,6 +1086,7 @@ mod tests {
         let ctx = Context::new();
         let store = Arc::new(SessionStore::new());
         ctx.provide(Arc::clone(&store)).unwrap();
+        SessionProjectionRegistry::install(&ctx).unwrap();
         let agents = AgentRegistry::new();
         agents.set_factory(Arc::new(StubFactory));
         ctx.provide(Arc::new(agents)).unwrap();
@@ -969,8 +1137,11 @@ mod tests {
     #[test]
     fn start_continuable_seeds_parent_sandbox_and_pins_approval() {
         let (_ctx, runtime, parent, store) = continuable_host(true);
-        set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::DangerFullAccess)
-            .unwrap();
+        set_sandbox_mode(
+            parent.agent.session().as_ref(),
+            SandboxMode::DangerFullAccess,
+        )
+        .unwrap();
         let started = runtime
             .start_continuable(
                 "spawn",
@@ -1109,6 +1280,7 @@ mod tests {
                 vec![ContentBlock::text("continue")],
                 MessageSource::User,
             )
+            .await
             .unwrap();
         let child = store.get(&started.child_id).unwrap();
         let sandbox: Vec<_> = child
@@ -1129,5 +1301,233 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn followup_without_persistence_is_unavailable_when_catalog_misses() {
+        let (_ctx, runtime, parent, store) = continuable_host(true);
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        store.remove(&started.child_id);
+        let error = runtime
+            .followup(
+                &parent.agent,
+                &started.child_id,
+                vec![ContentBlock::text("continue")],
+                MessageSource::User,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, PERSISTENCE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn followup_cold_loads_a_persisted_child_after_catalog_eviction() {
+        let (_ctx, runtime, parent, store, persistence) = continuable_host_persisted();
+        set_sandbox_mode(parent.agent.session().as_ref(), SandboxMode::ReadOnly).unwrap();
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        runtime.run_pending().await;
+        persist_and_evict(&persistence, &store, &started.child_id).await;
+        runtime
+            .followup(
+                &parent.agent,
+                &started.child_id,
+                vec![ContentBlock::text("continue")],
+                MessageSource::User,
+            )
+            .await
+            .unwrap();
+        let child = store.get(&started.child_id).expect("republished");
+        let sandbox: Vec<_> = child
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event.data, SessionEventData::SandboxMode { .. }))
+            .collect();
+        assert_eq!(sandbox.len(), 1);
+        assert_eq!(runtime.status_of(&started.child_id), "idle");
+    }
+
+    #[tokio::test]
+    async fn followup_maps_a_missing_persisted_child_to_unavailable() {
+        let (_ctx, runtime, parent, _store, _persistence) = continuable_host_persisted();
+        let error = runtime
+            .followup(
+                &parent.agent,
+                &session_id("22222222-2222-4222-8222-222222222222"),
+                vec![ContentBlock::text("continue")],
+                MessageSource::User,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "subagent \"22222222-2222-4222-8222-222222222222\" is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_rejects_a_persisted_non_continuable_child() {
+        let (_ctx, runtime, parent, _store, persistence) = continuable_host_persisted();
+        let header = SessionHeader::for_subagent_child(
+            Some(parent.agent.session().header()),
+            parent.agent.id().clone(),
+        );
+        let child_id = header.id.clone();
+        let child = Session::with_header(header);
+        child
+            .append(
+                SessionEventData::Extension {
+                    type_name: "subagent/descriptor".into(),
+                    data: serde_json::json!({
+                        "version": SUBAGENT_DESCRIPTOR_VERSION,
+                        "mode": "one-shot",
+                        "provider": "spawn",
+                    }),
+                },
+                None,
+            )
+            .unwrap();
+        persistence.save(&child).await.unwrap();
+        let error = runtime
+            .followup(
+                &parent.agent,
+                &child_id,
+                vec![ContentBlock::text("continue")],
+                MessageSource::User,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, no_continuation(&child_id));
+    }
+
+    #[tokio::test]
+    async fn followup_rejects_a_persisted_child_owned_by_another_parent() {
+        let (ctx, runtime, parent, store, persistence) = continuable_host_persisted();
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        persist_and_evict(&persistence, &store, &started.child_id).await;
+        let other = store.create(session_id("other-parent"));
+        let other_handle = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(other)
+            .unwrap();
+        let error = runtime
+            .followup(
+                &other_handle.agent,
+                &started.child_id,
+                vec![ContentBlock::text("continue")],
+                MessageSource::User,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, other_parent(&started.child_id));
+    }
+
+    #[tokio::test]
+    async fn followup_folds_only_the_own_suffix_after_seed_length() {
+        let (_ctx, runtime, parent, store, persistence) = continuable_host_persisted();
+        let mut header = SessionHeader::for_subagent_child(
+            Some(parent.agent.session().header()),
+            parent.agent.id().clone(),
+        );
+        header.seed_length = Some(1);
+        let child_id = header.id.clone();
+        let child = Session::with_header(header);
+        child
+            .append(
+                SessionEventData::Extension {
+                    type_name: "subagent/descriptor".into(),
+                    data: serde_json::json!({
+                        "version": SUBAGENT_DESCRIPTOR_VERSION,
+                        "mode": "one-shot",
+                        "provider": "spawn",
+                        "label": "ancestor",
+                    }),
+                },
+                None,
+            )
+            .unwrap();
+        child
+            .append(
+                SessionEventData::Extension {
+                    type_name: "subagent/descriptor".into(),
+                    data: serde_json::json!({
+                        "version": SUBAGENT_DESCRIPTOR_VERSION,
+                        "mode": "continuable",
+                        "provider": "spawn",
+                        "label": "own child",
+                    }),
+                },
+                None,
+            )
+            .unwrap();
+        persistence.save(&child).await.unwrap();
+        runtime
+            .followup(
+                &parent.agent,
+                &child_id,
+                vec![ContentBlock::text("continue")],
+                MessageSource::User,
+            )
+            .await
+            .unwrap();
+        assert!(store.get(&child_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn list_children_includes_a_persisted_child_after_catalog_eviction() {
+        let (_ctx, runtime, parent, store, persistence) = continuable_host_persisted();
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        runtime.run_pending().await;
+        persist_and_evict(&persistence, &store, &started.child_id).await;
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, started.child_id);
+        assert_eq!(entries[0].label, "child task");
+        assert_eq!(entries[0].mode, "continuable");
+        assert_eq!(runtime.status_of(&started.child_id), "ready");
+    }
+
+    #[tokio::test]
+    async fn list_children_without_persistence_stays_live_only() {
+        let (_ctx, runtime, parent, store) = continuable_host(true);
+        let started = runtime
+            .start_continuable(
+                "spawn",
+                "child task",
+                vec![ContentBlock::text("ping")],
+                &parent.agent,
+            )
+            .unwrap();
+        store.remove(&started.child_id);
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert!(entries.is_empty());
     }
 }

@@ -30,6 +30,26 @@ impl JsonlBackend {
     pub fn path_for(&self, id: &SessionId) -> PathBuf {
         self.dir.join(format!("{}.jsonl", id.as_str()))
     }
+
+    async fn list_jsonl_paths(&self) -> Result<Vec<(SessionId, PathBuf)>, PersistenceError> {
+        let mut paths = Vec::new();
+        let mut entries = match fs::read_dir(&self.dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                paths.push((dsh_session::session_id(stem), path));
+            }
+        }
+        paths.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        Ok(paths)
+    }
 }
 
 #[async_trait]
@@ -43,23 +63,20 @@ impl SessionStoreBackend for JsonlBackend {
     }
 
     async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
-        let mut ids = Vec::new();
-        let mut entries = match fs::read_dir(&self.dir).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
-            Err(error) => return Err(error.into()),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-                ids.push(dsh_session::session_id(stem));
-            }
+        Ok(self
+            .list_jsonl_paths()
+            .await?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    async fn list_headers(&self) -> Result<Vec<SessionHeader>, PersistenceError> {
+        let mut headers = Vec::new();
+        for (id, path) in self.list_jsonl_paths().await? {
+            headers.push(read_jsonl_header(&path, &id).await?);
         }
-        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        Ok(ids)
+        Ok(headers)
     }
 
     fn locate(&self, id: &SessionId) -> Option<SessionLocation> {
@@ -106,9 +123,10 @@ fn encode_jsonl(session: &Session) -> Result<String, PersistenceError> {
         .map_err(|error| PersistenceError::Format(error.to_string()))?;
     body.push('\n');
     for event in session.events() {
-        body.push_str(&serde_json::to_string(&event).map_err(|error| {
-            PersistenceError::Format(error.to_string())
-        })?);
+        body.push_str(
+            &serde_json::to_string(&event)
+                .map_err(|error| PersistenceError::Format(error.to_string()))?,
+        );
         body.push('\n');
     }
     Ok(body)
@@ -178,8 +196,8 @@ fn header_line(header: &SessionHeader) -> Value {
 
 /// Parse and validate one persisted header line against the requested id.
 fn parse_header_line(line: &str, id: &SessionId) -> Result<SessionHeader, PersistenceError> {
-    let mut value: Value = serde_json::from_str(line)
-        .map_err(|error| PersistenceError::Format(error.to_string()))?;
+    let mut value: Value =
+        serde_json::from_str(line).map_err(|error| PersistenceError::Format(error.to_string()))?;
     if value.get("type").and_then(Value::as_str) != Some("session") {
         return Err(PersistenceError::Format(
             "header line is not a session record".into(),
@@ -204,6 +222,25 @@ fn parse_header_line(line: &str, id: &SessionId) -> Result<SessionHeader, Persis
         )));
     }
     Ok(header)
+}
+
+/// Read only the persisted header line.
+pub async fn read_jsonl_header(
+    path: impl AsRef<Path>,
+    id: &SessionId,
+) -> Result<SessionHeader, PersistenceError> {
+    let body = match fs::read_to_string(&path).await {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PersistenceError::NotFound(id.as_str().to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let header_text = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| PersistenceError::Format("missing session header line".into()))?;
+    parse_header_line(header_text, id)
 }
 
 /// Load a log, refusing unknown required-on-read types and repairing a trailing open turn.
@@ -346,23 +383,51 @@ mod tests {
         let loaded = read_jsonl(&path, &session_id("s")).await.unwrap();
         assert_eq!(loaded.events().len(), 2);
         assert_eq!(loaded.header().version, SESSION_FORMAT_VERSION);
+        let header_only = read_jsonl_header(&path, &session_id("s")).await.unwrap();
+        assert_eq!(header_only.id.as_str(), "s");
+        assert_eq!(header_only.parent_session, None);
 
         let header = first_line.to_string();
-        fs::write(&path, format!("{header}\n{{\"seq\":0,\"type\":\"future/event\"}}\n"))
-            .await
-            .unwrap();
+        fs::write(
+            &path,
+            format!("{header}\n{{\"seq\":0,\"type\":\"future/event\"}}\n"),
+        )
+        .await
+        .unwrap();
         let err = match read_jsonl(&path, &session_id("s")).await {
             Ok(_) => panic!("unknown required event must be refused"),
             Err(error) => error,
         };
         assert!(matches!(err, PersistenceError::Session(_)));
 
-        fs::write(&path, "{\"sessionFormatVersion\":0}\n").await.unwrap();
+        fs::write(&path, "{\"sessionFormatVersion\":0}\n")
+            .await
+            .unwrap();
         let err = match read_jsonl(&path, &session_id("s")).await {
             Ok(_) => panic!("legacy header must be refused"),
             Err(error) => error,
         };
         assert!(matches!(err, PersistenceError::Format(_)));
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn list_headers_reads_parent_session_without_events() {
+        let dir = tmp_dir("headers");
+        fs::create_dir_all(&dir).await.unwrap();
+        let backend = JsonlBackend::new(&dir);
+        let header = SessionHeader::for_subagent_child(None, session_id("parent"));
+        let child_id = header.id.clone();
+        let session = Session::with_header(header);
+        backend.save(&session).await.unwrap();
+        let headers = backend.list_headers().await.unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].id, child_id);
+        assert_eq!(
+            headers[0].parent_session.as_ref().map(|id| id.as_str()),
+            Some("parent")
+        );
+        assert_eq!(headers[0].origin.as_deref(), Some("subagent"));
         let _ = fs::remove_dir_all(&dir).await;
     }
 
@@ -383,7 +448,10 @@ mod tests {
         let ctx = Context::new();
         SessionStore::install(&ctx).unwrap();
         install(&ctx, &dir).unwrap();
-        let session = ctx.service::<SessionStore>().unwrap().create(session_id("drain"));
+        let session = ctx
+            .service::<SessionStore>()
+            .unwrap()
+            .create(session_id("drain"));
         session
             .append(
                 SessionEventData::Extension {

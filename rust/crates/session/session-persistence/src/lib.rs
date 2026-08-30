@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use dsh_cordis::Service;
-use dsh_session::{Session, SessionError, SessionId};
+use dsh_session::{Session, SessionError, SessionHeader, SessionId};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
@@ -43,6 +43,15 @@ pub trait SessionStoreBackend: Send + Sync {
     async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError>;
     /// Session ids currently stored by this backend.
     async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError>;
+    /// Stored headers without requiring a full event-log parse when the
+    /// backend can supply metadata alone. The default loads each id.
+    async fn list_headers(&self) -> Result<Vec<SessionHeader>, PersistenceError> {
+        let mut headers = Vec::new();
+        for id in self.list_ids().await? {
+            headers.push(self.load(&id).await?.header().clone());
+        }
+        Ok(headers)
+    }
     /// Resolve an absolute per-session artifact without I/O. Backends without
     /// an independent local artifact return `None`.
     fn locate(&self, id: &SessionId) -> Option<SessionLocation> {
@@ -75,6 +84,11 @@ impl PersistenceRuntime {
     /// Session ids currently stored by the backend.
     pub async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
         self.backend.list_ids().await
+    }
+
+    /// Stored headers. Backends may return metadata without parsing events.
+    pub async fn list_headers(&self) -> Result<Vec<SessionHeader>, PersistenceError> {
+        self.backend.list_headers().await
     }
 
     /// Resolve an absolute per-session artifact without I/O.
@@ -127,5 +141,8 @@ mod tests {
         let session = runtime.load(&session_id("s")).await.unwrap();
         assert_eq!(session.id().as_str(), "s");
         assert!(session.events().is_empty());
+        let headers = runtime.list_headers().await.unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].id.as_str(), "s");
     }
 }

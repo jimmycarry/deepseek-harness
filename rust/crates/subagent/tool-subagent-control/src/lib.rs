@@ -116,12 +116,16 @@ failure means the message was NOT delivered."
             .get("message")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::Body("message required".into()))?;
-        match self.subagents.followup(
-            &parent,
-            &session_id(subagent_id),
-            vec![ContentBlock::text(message)],
-            MessageSource::coordinator(parent.id().as_str()),
-        ) {
+        match self
+            .subagents
+            .followup(
+                &parent,
+                &session_id(subagent_id),
+                vec![ContentBlock::text(message)],
+                MessageSource::coordinator(parent.id().as_str()),
+            )
+            .await
+        {
             Ok(_message_id) => Ok(ToolOutcome::text(format!(
                 "message queued as the next turn for subagent {subagent_id}"
             ))),
@@ -246,8 +250,8 @@ candidates for `interrupt_agent` only."
             .and_then(Value::as_str)
             .unwrap_or("children");
         let entries = match scope {
-            "descendants" => self.subagents.list_descendants(parent.id()),
-            _ => self.subagents.list_children(parent.id()),
+            "descendants" => self.subagents.list_descendants(parent.id()).await,
+            _ => self.subagents.list_children(parent.id()).await,
         }
         .map_err(|error| ToolError::Body(format!("Error: {error}")))?;
         // One-shot children cannot be continued by send_message, so the model

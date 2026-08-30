@@ -20,6 +20,7 @@ dsh-cordis.workspace = true
 dsh-cordis-loader.workspace = true
 dsh-llm.workspace = true
 dsh-session.workspace = true
+dsh-session-persistence.workspace = true
 dsh-session-telemetry.workspace = true
 dsh-command-feedback.workspace = true
 dsh-settings-file.workspace = true

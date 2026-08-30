@@ -12,7 +12,10 @@ use dsh_llm::{
     call_id, AssistantMessage, ContentBlock, FinishReason, StreamChunk, ToolResultMessage,
     UserMessage,
 };
-use dsh_session::{event_type_name, session_id, Session, SessionEventData, SessionStore, SurfaceOp};
+use dsh_session::{
+    event_type_name, session_id, Session, SessionEventData, SessionStore, SurfaceOp,
+};
+use dsh_session_persistence::PersistenceRuntime;
 use dsh_settings_file::SettingsRuntime;
 use dsh_subagent::SubagentRuntime;
 use dsh_tools::ToolRuntime;
@@ -1108,6 +1111,127 @@ async fn send_message_resumes_settled_child() {
     assert_eq!(sandbox[0]["data"]["source"], "delegation");
 }
 
+async fn persist_and_evict_child(ctx: &Context, child_id: &str) {
+    let store = ctx.get::<SessionStore>().expect("session store");
+    let persistence = ctx
+        .get::<PersistenceRuntime>()
+        .expect("session persistence");
+    let id = session_id(child_id);
+    let child = store.get(&id).expect("child session");
+    persistence
+        .save(child.as_ref())
+        .await
+        .expect("persist child before eviction");
+    store.remove(&id);
+}
+
+#[tokio::test]
+async fn send_message_cold_resumes_after_catalog_eviction() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "subagent",
+                "arguments": "{\"description\":\"child task\",\"prompt\":\"Reply with exactly CHILD_RESULT\"}"
+            }
+        },
+        { "text": "waiting" },
+        { "text": "CHILD_RESULT" },
+        { "text": "SECOND_OK" }
+    ]);
+    let (ctx, session) =
+        run_profile_host("delegate then cold continue", replay_turns_overlay(turns)).await;
+    let child_id = started_child_id(&events_of(&session));
+    persist_and_evict_child(&ctx, &child_id).await;
+    let tools = ctx.get::<ToolRuntime>().expect("tool runtime");
+    let delivered = tools
+        .execute_for(
+            &ctx,
+            "send_message",
+            serde_json::json!({
+                "subagent_id": child_id,
+                "message": "Now reply with exactly SECOND_OK."
+            }),
+            Some(session.id().as_str()),
+        )
+        .await
+        .expect("send_message execution");
+    assert!(!delivered.outcome.is_error);
+    let ContentBlock::Text { text } = &delivered.outcome.content[0] else {
+        panic!("send_message outcome must be text");
+    };
+    assert_eq!(
+        text,
+        &format!("message queued as the next turn for subagent {child_id}")
+    );
+    let subagents = ctx.get::<SubagentRuntime>().expect("subagent runtime");
+    assert!(subagents.run_pending().await, "cold-resumed child must run");
+    let store = ctx.get::<SessionStore>().expect("session store");
+    let child = store
+        .get(&session_id(&child_id))
+        .expect("child republished");
+    let child_events = events_of(&child);
+    let followup = child_events
+        .iter()
+        .find(|event| {
+            event["type"] == "user/message" && event["data"]["source"]["kind"] == "coordinator"
+        })
+        .expect("coordinator follow-up");
+    assert_eq!(followup["data"]["source"]["form"], "relay");
+    assert_eq!(
+        followup["data"]["source"]["senderSessionId"],
+        Value::String(session.id().as_str().to_string())
+    );
+    assert_eq!(
+        followup["data"]["content"][0]["text"],
+        "Now reply with exactly SECOND_OK."
+    );
+    assert_eq!(turn_numbers(&child_events), vec![1, 2]);
+    assert_eq!(child.last_assistant_text().as_deref(), Some("SECOND_OK"));
+    let approval: Vec<_> = child_events
+        .iter()
+        .filter(|event| event["type"] == "approval/policy")
+        .collect();
+    assert_eq!(approval.len(), 1);
+    assert_eq!(approval[0]["data"]["source"], "delegation");
+}
+
+#[tokio::test]
+async fn list_agents_sees_persisted_child_after_catalog_eviction() {
+    let turns = serde_json::json!([
+        {
+            "text": "",
+            "tool": {
+                "id": "c1",
+                "name": "subagent",
+                "arguments": "{\"description\":\"child task\",\"prompt\":\"Reply with exactly CHILD_OK\"}"
+            }
+        },
+        { "text": "waiting" },
+        { "text": "CHILD_OK" }
+    ]);
+    let (ctx, session) =
+        run_profile_host("delegate then list cold", replay_turns_overlay(turns)).await;
+    let child_id = started_child_id(&events_of(&session));
+    persist_and_evict_child(&ctx, &child_id).await;
+    let tools = ctx.get::<ToolRuntime>().expect("tool runtime");
+    let listed = tools
+        .execute_for(
+            &ctx,
+            "list_agents",
+            serde_json::json!({}),
+            Some(session.id().as_str()),
+        )
+        .await
+        .expect("list_agents execution");
+    assert!(!listed.outcome.is_error);
+    let ContentBlock::Text { text } = &listed.outcome.content[0] else {
+        panic!("list_agents outcome must be text");
+    };
+    assert_eq!(text, &format!("{child_id} [ready] — child task"));
+}
+
 #[tokio::test]
 async fn spill_policy_turn_profile() {
     let turns = serde_json::json!([
@@ -1580,11 +1704,7 @@ async fn sandbox_escalation_grants_a_read_only_write() {
         )
         .await
         .unwrap();
-    assert!(
-        !granted.outcome.is_error,
-        "{:?}",
-        granted.outcome.content
-    );
+    assert!(!granted.outcome.is_error, "{:?}", granted.outcome.content);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
     drop(handle);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1607,26 +1727,16 @@ async fn headless_runner_executes_slash_feedback() {
         "01234567-89ab-4cde-8f01-23456789abcd\n",
     )
     .unwrap();
-    let (_ctx, session) = run_profile_host_in(
-        &dir,
-        "/feedback the runner intercepted this",
-        vec![],
-    )
-    .await;
+    let (_ctx, session) =
+        run_profile_host_in(&dir, "/feedback the runner intercepted this", vec![]).await;
     let events = events_of(&session);
     let types = types_of(&events);
-    assert!(
-        types.iter().any(|name| name == "command/run"),
-        "{types:?}"
-    );
+    assert!(types.iter().any(|name| name == "command/run"), "{types:?}");
     assert!(
         types.iter().any(|name| name == "feedback/record"),
         "{types:?}"
     );
-    assert!(
-        types.iter().any(|name| name == "command/done"),
-        "{types:?}"
-    );
+    assert!(types.iter().any(|name| name == "command/done"), "{types:?}");
     assert!(!types.iter().any(|name| name == "user/message"));
     assert!(!types.iter().any(|name| name == "assistant/message"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1666,7 +1776,8 @@ async fn agent_instructions_update_after_write() {
         },
         { "text": "done" }
     ]);
-    let (_ctx, session) = run_profile_host_in(&dir, "update the instructions", replay_turns_overlay(turns)).await;
+    let (_ctx, session) =
+        run_profile_host_in(&dir, "update the instructions", replay_turns_overlay(turns)).await;
     let events = events_of(&session);
     let instructions: Vec<&Value> = events
         .iter()
@@ -1984,19 +2095,18 @@ async fn compact_command_profile() {
             "text": "## Primary Request and Intent\n- keep the four notes"
         }])
     );
-    assert_eq!(
-        summary["data"]["rawOutput"],
-        summary["data"]["summary"]
-    );
+    assert_eq!(summary["data"]["rawOutput"], summary["data"]["summary"]);
     let checkpoint = session
         .derive_messages()
         .into_iter()
         .find_map(|message| match message {
             dsh_llm::Message::User(user)
-                if user.content.iter().any(|block| matches!(
-                    block,
-                    ContentBlock::Text { text } if text.contains("<compacted-summary>")
-                )) =>
+                if user.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains("<compacted-summary>")
+                    )
+                }) =>
             {
                 Some(
                     user.content
@@ -2016,10 +2126,7 @@ async fn compact_command_profile() {
         checkpoint.contains("Continue the task directly from the messages that follow"),
         "{checkpoint}"
     );
-    assert!(
-        checkpoint.contains("keep the four notes"),
-        "{checkpoint}"
-    );
+    assert!(checkpoint.contains("keep the four notes"), "{checkpoint}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
