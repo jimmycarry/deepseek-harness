@@ -10,7 +10,7 @@ use dsh_agent::{Agent, AgentRegistry};
 use dsh_cordis::{Context, Result};
 use dsh_llm::{ContentBlock, MessageSource};
 use dsh_session::session_id;
-use dsh_subagent::SubagentRuntime;
+use dsh_subagent::{SubagentListEntry, SubagentRuntime};
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome, ToolRuntime};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -232,6 +232,43 @@ candidates for `interrupt_agent` only."
         })
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        Some(json!({
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "kind": { "type": "string", "required": true, "enum": ["child"] },
+                            "id": { "type": "string", "required": true },
+                            "label": { "type": "string", "required": true },
+                            "status": { "type": "string", "required": true, "enum": ["running", "idle", "ready"] },
+                            "parent": { "type": "string" },
+                            "depth": { "type": "number" },
+                        },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "kind": { "type": "string", "required": true, "enum": ["diagnostic"] },
+                            "id": { "type": "string", "required": true },
+                            "reason": {
+                                "type": "string",
+                                "required": true,
+                                "enum": ["corrupt", "unsupported", "unavailable"],
+                            },
+                            "parent": { "type": "string" },
+                            "depth": { "type": "number" },
+                        },
+                    },
+                ],
+            },
+        }))
+    }
+
     async fn execute(&self, args: Value) -> std::result::Result<ToolOutcome, ToolError> {
         self.execute_call(&ToolCall {
             name: self.name().to_string(),
@@ -256,22 +293,45 @@ candidates for `interrupt_agent` only."
         .map_err(|error| ToolError::Body(format!("Error: {error}")))?;
         // One-shot children cannot be continued by send_message, so the model
         // never selects them; discovery still traversed them for descendants.
+        // Diagnostics always pass through.
         let lines: Vec<String> = entries
             .into_iter()
-            .filter(|entry| entry.mode == "continuable")
-            .map(|entry| {
-                let at = if scope == "descendants" {
-                    format!(" parent={} depth={}", entry.parent, entry.depth)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "{} [{}]{} — {}",
-                    entry.id,
-                    self.subagents.status_of(&entry.id),
-                    at,
-                    entry.label
-                )
+            .filter_map(|entry| match entry {
+                SubagentListEntry::Child {
+                    id,
+                    label,
+                    mode,
+                    parent,
+                    depth,
+                    ..
+                } if mode == "continuable" => {
+                    let at = if scope == "descendants" {
+                        format!(" parent={parent} depth={depth}")
+                    } else {
+                        String::new()
+                    };
+                    Some(format!(
+                        "{} [{}]{} — {}",
+                        id,
+                        self.subagents.status_of(&id),
+                        at,
+                        label
+                    ))
+                }
+                SubagentListEntry::Diagnostic {
+                    id,
+                    reason,
+                    parent,
+                    depth,
+                } => {
+                    let at = if scope == "descendants" {
+                        format!(" parent={parent} depth={depth}")
+                    } else {
+                        String::new()
+                    };
+                    Some(format!("{id} [diagnostic: {reason}]{at}"))
+                }
+                _ => None,
             })
             .collect();
         Ok(ToolOutcome::text(if lines.is_empty() {
@@ -299,5 +359,18 @@ mod tests {
             error.to_string(),
             "send_message requires a calling agent (exec.agent was undefined)"
         );
+    }
+
+    #[test]
+    fn list_agents_output_schema_includes_diagnostic_rows() {
+        let tool = ListAgentsTool {
+            subagents: Arc::new(SubagentRuntime::new()),
+            agents: Arc::new(AgentRegistry::new()),
+        };
+        let schema = tool.output_schema().expect("list_agents output schema");
+        let encoded = schema.to_string();
+        assert!(encoded.contains("diagnostic"));
+        assert!(encoded.contains("corrupt"));
+        assert!(encoded.contains("unavailable"));
     }
 }

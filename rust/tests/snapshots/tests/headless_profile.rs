@@ -13,7 +13,8 @@ use dsh_llm::{
     UserMessage,
 };
 use dsh_session::{
-    event_type_name, session_id, Session, SessionEventData, SessionStore, SurfaceOp,
+    event_type_name, session_id, Session, SessionEventData, SessionHeader, SessionStore, SurfaceOp,
+    TurnEndReason, SESSION_FORMAT_VERSION,
 };
 use dsh_session_persistence::PersistenceRuntime;
 use dsh_settings_file::SettingsRuntime;
@@ -1230,6 +1231,53 @@ async fn list_agents_sees_persisted_child_after_catalog_eviction() {
         panic!("list_agents outcome must be text");
     };
     assert_eq!(text, &format!("{child_id} [ready] — child task"));
+}
+
+#[tokio::test]
+async fn list_agents_reports_descriptorless_cold_child_as_corrupt() {
+    let (ctx, session) = run_profile_host("ping", replay_text_overlay("ok")).await;
+    let persistence = ctx
+        .get::<PersistenceRuntime>()
+        .expect("session persistence");
+    let child_id = session_id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    let child = Session::with_header(SessionHeader {
+        version: SESSION_FORMAT_VERSION,
+        id: child_id.clone(),
+        created_at: 2,
+        cwd: session.header().cwd.clone(),
+        parent_session: Some(session.id().clone()),
+        seed_length: None,
+        origin: Some("subagent".into()),
+        delegation_depth: 1,
+    });
+    child
+        .append(SessionEventData::TurnStart { turn: 1 }, None)
+        .unwrap();
+    child
+        .append(
+            SessionEventData::TurnEnd {
+                turn: 1,
+                reason: TurnEndReason::Interrupted,
+            },
+            None,
+        )
+        .unwrap();
+    persistence.save(&child).await.expect("persist child");
+    let tools = ctx.get::<ToolRuntime>().expect("tool runtime");
+    let listed = tools
+        .execute_for(
+            &ctx,
+            "list_agents",
+            serde_json::json!({}),
+            Some(session.id().as_str()),
+        )
+        .await
+        .expect("list_agents execution");
+    assert!(!listed.outcome.is_error);
+    let ContentBlock::Text { text } = &listed.outcome.content[0] else {
+        panic!("list_agents outcome must be text");
+    };
+    assert_eq!(text, &format!("{child_id} [diagnostic: corrupt]"));
 }
 
 #[tokio::test]

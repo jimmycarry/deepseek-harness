@@ -10,7 +10,8 @@ use dsh_session::{
 use dsh_session_persistence::PersistenceRuntime;
 use dsh_session_projection::{subagent_identity_unit, SessionProjectionRegistry};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -94,19 +95,40 @@ pub struct ContinuableStart {
     pub message_id: String,
 }
 
-/// One durable child row projected from the session catalog.
-#[derive(Debug, Clone)]
-pub struct SubagentListEntry {
-    /// Durable child session id.
-    pub id: SessionId,
-    /// Creation label from the descriptor.
-    pub label: String,
-    /// Descriptor mode (`one-shot` or `continuable`).
-    pub mode: String,
-    /// Durable direct-parent session id.
-    pub parent: SessionId,
-    /// Depth below the listing agent (1 for a direct child).
-    pub depth: u32,
+/// One listing row: a classified child, or a per-child diagnostic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubagentListEntry {
+    /// A child whose `subagent` projection served an identity.
+    Child {
+        /// Durable child session id.
+        id: SessionId,
+        /// Creation label from the descriptor.
+        label: String,
+        /// Descriptor mode (`one-shot` or `continuable`).
+        mode: String,
+        /// `running` when the record is live in `ctx.sessions`; `inactive` when
+        /// it exists only in persistence.
+        activity: String,
+        /// Whether a direct descendant has durable `origin: "subagent"`.
+        has_children: bool,
+        /// Durable direct-parent session id.
+        parent: SessionId,
+        /// Depth below the listing agent (1 for a direct child).
+        depth: u32,
+    },
+    /// A settled candidate the projection fold could not classify, or a
+    /// failed cold read.
+    Diagnostic {
+        /// The candidate's session id.
+        id: SessionId,
+        /// `corrupt` for a settled fold with no identity or a lifecycle
+        /// mismatch; `unavailable` for a failed cold load.
+        reason: String,
+        /// Durable direct-parent session id.
+        parent: SessionId,
+        /// Depth below the listing agent (1 for a direct child).
+        depth: u32,
+    },
 }
 
 /// One resident continuable child epoch: the retained live handle plus the
@@ -502,33 +524,76 @@ impl SubagentRuntime {
             .any(|activation| activation.child_id.as_str() == agent_id)
     }
 
-    /// Direct children of `parent_id` from the live catalog plus persisted
-    /// `origin: "subagent"` headers, in creation order, each carrying its
-    /// descriptor mode and label.
+    /// Direct children of `parent_id` from the live-preferred merge of the
+    /// session store and optional persistence. Unreadable settled children
+    /// become diagnostics; a live child without an identity yet is omitted.
     ///
     /// # Errors
-    /// `sessionProjections` is not mounted, or persistence listing fails.
+    /// `sessionProjections` or `sessions` is not mounted, or persistence
+    /// listing fails.
     pub async fn list_children(
         &self,
         parent_id: &SessionId,
     ) -> std::result::Result<Vec<SubagentListEntry>, String> {
-        let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
-        children_of(self, &sessions, parent_id, 1).await
+        let (sessions, projections) = self.listing_host()?;
+        let corpus = listing_corpus(self, &sessions).await?;
+        let mut candidates: Vec<CorpusRecord> = corpus
+            .values()
+            .filter(|record| {
+                record.header.origin.as_deref() == Some("subagent")
+                    && record.header.parent_session.as_ref() == Some(parent_id)
+            })
+            .cloned()
+            .collect();
+        candidates.sort_by(compare_corpus_records);
+        resolve_rows(self, &projections, &corpus, candidates, parent_id, 1).await
     }
 
-    /// The complete tree below `parent_id` in stable pre-order, each entry
-    /// annotated with its durable direct parent and depth.
+    /// The complete tree below `parent_id` in stable pre-order. Ordinary
+    /// sessions remain traversal nodes so a continuable child below one is
+    /// still discovered. Each entry carries its durable direct parent and
+    /// depth.
     ///
     /// # Errors
-    /// `sessionProjections` is not mounted, or persistence listing fails.
+    /// `sessionProjections` or `sessions` is not mounted, or persistence
+    /// listing fails.
     pub async fn list_descendants(
         &self,
         parent_id: &SessionId,
     ) -> std::result::Result<Vec<SubagentListEntry>, String> {
-        let (sessions, _agents) = self.host().map_err(|error| error.to_string())?;
+        let (sessions, projections) = self.listing_host()?;
+        let corpus = listing_corpus(self, &sessions).await?;
+        let parents = subagent_parent_ids(&corpus);
         let mut entries = Vec::new();
-        collect_descendants(self, &sessions, parent_id, 1, &mut entries).await?;
+        for (record, parent, depth) in descendant_candidates(&corpus, parent_id) {
+            let has_children = parents.contains(record.header.id.as_str());
+            if let Some(row) =
+                resolve_candidate(self, &projections, &record, parent, depth, has_children).await
+            {
+                entries.push(row);
+            }
+        }
         Ok(entries)
+    }
+
+    /// Session store and projection registry listing requires, or the
+    /// TypeScript configuration sentences.
+    fn listing_host(
+        &self,
+    ) -> std::result::Result<(Arc<SessionStore>, Arc<SessionProjectionRegistry>), String> {
+        let ctx = self
+            .ctx
+            .lock()
+            .expect("subagents ctx")
+            .clone()
+            .ok_or_else(|| PROJECTIONS_UNAVAILABLE.to_string())?;
+        let projections = ctx
+            .get::<SessionProjectionRegistry>()
+            .ok_or_else(|| PROJECTIONS_UNAVAILABLE.to_string())?;
+        let sessions = ctx
+            .get::<SessionStore>()
+            .ok_or_else(|| SESSION_STORE_UNAVAILABLE.to_string())?;
+        Ok((sessions, projections))
     }
 
     /// Live status of one durable child: `running` for an active driver,
@@ -685,8 +750,12 @@ fn fold_descriptor(session: &Session) -> Option<Descriptor> {
 }
 
 const PROJECTIONS_UNAVAILABLE: &str = "listing subagents requires the sessionProjections registry (load @deepseek-ai/dsh-session-projection)";
+const SESSION_STORE_UNAVAILABLE: &str =
+    "listing subagents requires the session store (load @deepseek-ai/dsh-session)";
 const PERSISTENCE_REQUIRED: &str =
     "continuable subagents require session persistence (load a dsh-session-persistence backend)";
+const DIAGNOSTIC_CORRUPT: &str = "corrupt";
+const DIAGNOSTIC_UNAVAILABLE: &str = "unavailable";
 
 fn unavailable(child_id: &SessionId) -> String {
     format!("subagent \"{child_id}\" is unavailable")
@@ -719,105 +788,254 @@ fn authorize_followup(
     Ok(())
 }
 
-/// Direct children of `parent_id` from the live catalog plus persisted
-/// `origin: "subagent"` sessions, sorted by creation time then id.
-async fn children_of(
+/// One live-preferred corpus record: a persisted header, overwritten by the
+/// live session when the same id is in the catalog.
+#[derive(Clone)]
+struct CorpusRecord {
+    header: SessionHeader,
+    live: Option<Arc<Session>>,
+}
+
+/// Live-preferred merge of persisted headers and the live session store.
+async fn listing_corpus(
     runtime: &SubagentRuntime,
     sessions: &SessionStore,
-    parent_id: &SessionId,
-    depth: u32,
-) -> std::result::Result<Vec<SubagentListEntry>, String> {
-    let projections = runtime
-        .ctx
-        .lock()
-        .expect("subagents ctx")
-        .as_ref()
-        .and_then(|ctx| ctx.get::<SessionProjectionRegistry>())
-        .ok_or_else(|| PROJECTIONS_UNAVAILABLE.to_string())?;
-    let mut by_id: HashMap<String, Arc<Session>> = HashMap::new();
-    for session in sessions.live() {
-        if session.header().parent_session.as_ref() == Some(parent_id) {
-            by_id.insert(session.id().as_str().to_string(), session);
-        }
-    }
+) -> std::result::Result<HashMap<String, CorpusRecord>, String> {
+    let mut corpus = HashMap::new();
     if let Some(persistence) = runtime.persistence() {
         let headers = persistence
             .list_headers()
             .await
             .map_err(|error| error.to_string())?;
         for header in headers {
-            if header.origin.as_deref() != Some("subagent") {
-                continue;
-            }
-            if header.parent_session.as_ref() != Some(parent_id) {
-                continue;
-            }
-            if by_id.contains_key(header.id.as_str()) {
-                continue;
-            }
-            match persistence.load(&header.id).await {
-                Ok(loaded) => {
-                    by_id.insert(loaded.id().as_str().to_string(), Arc::new(loaded));
-                }
-                Err(_) => continue,
-            }
+            corpus.insert(
+                header.id.as_str().to_string(),
+                CorpusRecord { header, live: None },
+            );
         }
     }
-    let mut children: Vec<Arc<Session>> = by_id.into_values().collect();
-    children.sort_by(|a, b| {
-        (a.header().created_at, a.id().as_str()).cmp(&(b.header().created_at, b.id().as_str()))
-    });
-    Ok(children
-        .into_iter()
-        .filter_map(|session| {
-            let identity = projections
-                .snapshot(&session)
-                .values
-                .get("subagent")
-                .cloned()?;
-            if identity.is_null() {
-                return None;
-            }
-            Some(SubagentListEntry {
-                id: session.id().clone(),
-                label: identity
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                mode: identity
-                    .get("mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                parent: parent_id.clone(),
-                depth,
-            })
-        })
-        .collect())
+    for session in sessions.live() {
+        corpus.insert(
+            session.id().as_str().to_string(),
+            CorpusRecord {
+                header: session.header().clone(),
+                live: Some(session),
+            },
+        );
+    }
+    Ok(corpus)
 }
 
-/// Append the subtree below `parent_id` in stable pre-order.
-async fn collect_descendants(
+/// Session ids that appear as `parentSession` of an `origin: "subagent"` record.
+fn subagent_parent_ids(corpus: &HashMap<String, CorpusRecord>) -> HashSet<String> {
+    corpus
+        .values()
+        .filter(|record| record.header.origin.as_deref() == Some("subagent"))
+        .filter_map(|record| {
+            record
+                .header
+                .parent_session
+                .as_ref()
+                .map(|parent| parent.as_str().to_string())
+        })
+        .collect()
+}
+
+/// Compare siblings by durable creation time, then id.
+fn compare_corpus_records(a: &CorpusRecord, b: &CorpusRecord) -> std::cmp::Ordering {
+    (a.header.created_at, a.header.id.as_str()).cmp(&(b.header.created_at, b.header.id.as_str()))
+}
+
+/// Immutable header fields that distinguish one lifecycle from another
+/// under the same id.
+fn same_lifecycle(meta: &SessionHeader, expected: &SessionHeader) -> bool {
+    meta.version == expected.version
+        && meta.id == expected.id
+        && meta.created_at == expected.created_at
+        && meta.cwd == expected.cwd
+        && meta.parent_session == expected.parent_session
+        && meta.seed_length == expected.seed_length
+        && meta.delegation_depth == expected.delegation_depth
+}
+
+/// Fold every registered unit over `session`. A panic in any unit is
+/// contained as a failed identity read.
+fn projected_identity(
+    projections: &SessionProjectionRegistry,
+    session: &Session,
+) -> std::result::Result<Option<Value>, ()> {
+    match catch_unwind(AssertUnwindSafe(|| projections.snapshot(session))) {
+        Ok(snapshot) => Ok(snapshot
+            .values
+            .get("subagent")
+            .cloned()
+            .filter(|value| !value.is_null())),
+        Err(_) => Err(()),
+    }
+}
+
+fn child_row(
+    id: SessionId,
+    identity: &Value,
+    activity: &str,
+    has_children: bool,
+    parent: SessionId,
+    depth: u32,
+) -> SubagentListEntry {
+    SubagentListEntry::Child {
+        id,
+        label: identity
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        mode: identity
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        activity: activity.to_string(),
+        has_children,
+        parent,
+        depth,
+    }
+}
+
+fn diagnostic_row(id: SessionId, reason: &str, parent: SessionId, depth: u32) -> SubagentListEntry {
+    SubagentListEntry::Diagnostic {
+        id,
+        reason: reason.to_string(),
+        parent,
+        depth,
+    }
+}
+
+/// Classify one corpus candidate. Live null identity is omitted (creation
+/// window); cold null identity, a lifecycle mismatch, or a fold panic is
+/// `corrupt`; a failed cold load is `unavailable`.
+async fn resolve_candidate(
     runtime: &SubagentRuntime,
-    sessions: &SessionStore,
+    projections: &SessionProjectionRegistry,
+    record: &CorpusRecord,
+    parent: SessionId,
+    depth: u32,
+    has_children: bool,
+) -> Option<SubagentListEntry> {
+    let child_id = record.header.id.clone();
+    if let Some(live) = &record.live {
+        return match projected_identity(projections, live) {
+            Err(()) => Some(diagnostic_row(child_id, DIAGNOSTIC_CORRUPT, parent, depth)),
+            Ok(None) => None,
+            Ok(Some(identity)) => Some(child_row(
+                child_id,
+                &identity,
+                "running",
+                has_children,
+                parent,
+                depth,
+            )),
+        };
+    }
+    let persistence = runtime.persistence()?;
+    let loaded = match persistence.load(&child_id).await {
+        Ok(session) => session,
+        Err(_) => {
+            return Some(diagnostic_row(
+                child_id,
+                DIAGNOSTIC_UNAVAILABLE,
+                parent,
+                depth,
+            ));
+        }
+    };
+    if !same_lifecycle(loaded.header(), &record.header) {
+        return Some(diagnostic_row(child_id, DIAGNOSTIC_CORRUPT, parent, depth));
+    }
+    match projected_identity(projections, &loaded) {
+        Err(()) | Ok(None) => Some(diagnostic_row(child_id, DIAGNOSTIC_CORRUPT, parent, depth)),
+        Ok(Some(identity)) => Some(child_row(
+            child_id,
+            &identity,
+            "inactive",
+            has_children,
+            parent,
+            depth,
+        )),
+    }
+}
+
+/// Classify origin-filtered siblings of one parent, in creation order.
+async fn resolve_rows(
+    runtime: &SubagentRuntime,
+    projections: &SessionProjectionRegistry,
+    corpus: &HashMap<String, CorpusRecord>,
+    candidates: Vec<CorpusRecord>,
     parent_id: &SessionId,
     depth: u32,
-    entries: &mut Vec<SubagentListEntry>,
-) -> std::result::Result<(), String> {
-    let mut pending = vec![(parent_id.clone(), depth)];
-    while let Some((current, current_depth)) = pending.pop() {
-        let children = children_of(runtime, sessions, &current, current_depth).await?;
-        let mut next = Vec::new();
-        for child in children {
-            next.push((child.id.clone(), current_depth + 1));
-            entries.push(child);
-        }
-        for item in next.into_iter().rev() {
-            pending.push(item);
+) -> std::result::Result<Vec<SubagentListEntry>, String> {
+    let parents = subagent_parent_ids(corpus);
+    let mut rows = Vec::new();
+    for record in candidates {
+        let has_children = parents.contains(record.header.id.as_str());
+        if let Some(row) = resolve_candidate(
+            runtime,
+            projections,
+            &record,
+            parent_id.clone(),
+            depth,
+            has_children,
+        )
+        .await
+        {
+            rows.push(row);
         }
     }
-    Ok(())
+    Ok(rows)
+}
+
+/// Origin-classified descendants in stable pre-order. Non-subagent sessions
+/// stay traversal nodes so a child below one is still discovered.
+fn descendant_candidates(
+    corpus: &HashMap<String, CorpusRecord>,
+    root: &SessionId,
+) -> Vec<(CorpusRecord, SessionId, u32)> {
+    let mut children: HashMap<String, Vec<CorpusRecord>> = HashMap::new();
+    for record in corpus.values() {
+        if let Some(parent) = &record.header.parent_session {
+            children
+                .entry(parent.as_str().to_string())
+                .or_default()
+                .push(record.clone());
+        }
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by(compare_corpus_records);
+    }
+    let mut stack: Vec<(CorpusRecord, SessionId, u32)> = children
+        .get(root.as_str())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .map(|record| (record, root.clone(), 1))
+        .collect();
+    let mut visited = HashSet::from([root.as_str().to_string()]);
+    let mut positioned = Vec::new();
+    while let Some((record, parent, depth)) = stack.pop() {
+        let id = record.header.id.as_str().to_string();
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        if record.header.origin.as_deref() == Some("subagent") {
+            positioned.push((record.clone(), parent, depth));
+        }
+        if let Some(descendants) = children.get(&id) {
+            for child in descendants.iter().rev() {
+                stack.push((child.clone(), record.header.id.clone(), depth + 1));
+            }
+        }
+    }
+    positioned
 }
 
 /// Whether `target`'s durable parent chain contains `ancestor`.
@@ -913,7 +1131,7 @@ mod tests {
     use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
     use dsh_session_projection::SessionProjectionRegistry;
     use dsh_user_approval::{effective_approval_policy, ApprovalPolicy};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     struct Fake;
@@ -1003,12 +1221,14 @@ mod tests {
 
     struct MemoryBackend {
         sessions: Mutex<HashMap<String, (SessionHeader, Vec<SessionEvent>)>>,
+        fail_load: Mutex<HashSet<String>>,
     }
 
     impl MemoryBackend {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 sessions: Mutex::new(HashMap::new()),
+                fail_load: Mutex::new(HashSet::new()),
             })
         }
     }
@@ -1024,6 +1244,14 @@ mod tests {
         }
 
         async fn load(&self, id: &SessionId) -> std::result::Result<Session, PersistenceError> {
+            if self
+                .fail_load
+                .lock()
+                .expect("memory persist fail")
+                .contains(id.as_str())
+            {
+                return Err(PersistenceError::NotFound(id.as_str().to_string()));
+            }
             let guard = self.sessions.lock().expect("memory persist");
             let (header, events) = guard
                 .get(id.as_str())
@@ -1532,9 +1760,20 @@ mod tests {
         persist_and_evict(&persistence, &store, &started.child_id).await;
         let entries = runtime.list_children(parent.agent.id()).await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, started.child_id);
-        assert_eq!(entries[0].label, "child task");
-        assert_eq!(entries[0].mode, "continuable");
+        let SubagentListEntry::Child {
+            id,
+            label,
+            mode,
+            activity,
+            ..
+        } = &entries[0]
+        else {
+            panic!("expected child row, got {:?}", entries[0]);
+        };
+        assert_eq!(id, &started.child_id);
+        assert_eq!(label, "child task");
+        assert_eq!(mode, "continuable");
+        assert_eq!(activity, "inactive");
         assert_eq!(runtime.status_of(&started.child_id), "ready");
     }
 
@@ -1563,9 +1802,359 @@ mod tests {
             .unwrap();
         let entries = runtime.list_children(parent.agent.id()).await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, child_id);
+        let SubagentListEntry::Child { id, activity, .. } = &entries[0] else {
+            panic!("expected child row, got {:?}", entries[0]);
+        };
+        assert_eq!(id, &child_id);
+        assert_eq!(activity, "running");
         store.remove(&child_id);
         let entries = runtime.list_children(parent.agent.id()).await.unwrap();
         assert!(entries.is_empty());
+    }
+
+    fn authored_header(
+        parent: &SessionHeader,
+        parent_id: SessionId,
+        id: &str,
+        created_at: u64,
+    ) -> SessionHeader {
+        let mut header = SessionHeader::for_subagent_child(Some(parent), parent_id);
+        header.id = session_id(id);
+        header.created_at = created_at;
+        header
+    }
+
+    fn append_descriptor(session: &Session, mode: &str, label: &str, version: u64) {
+        session
+            .append(
+                SessionEventData::Extension {
+                    type_name: "subagent/descriptor".into(),
+                    data: serde_json::json!({
+                        "version": version,
+                        "mode": mode,
+                        "provider": "spawn",
+                        "label": label,
+                    }),
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    fn append_bare_turns(session: &Session) {
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        session
+            .append(
+                SessionEventData::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Interrupted,
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    fn hostile_unit() -> dsh_session_projection::ProjectionUnit {
+        dsh_session_projection::ProjectionUnit {
+            key: "subagentListHostileProbe".into(),
+            state_version: 1,
+            init: Arc::new(|| serde_json::json!({})),
+            apply: Arc::new(|state, event| {
+                let SessionEventData::Extension { type_name, data } = &event.data else {
+                    return state.clone();
+                };
+                if type_name == "subagent/descriptor"
+                    && data.get("label").and_then(Value::as_str) == Some("poison me")
+                {
+                    return serde_json::json!({ "poisoned": true });
+                }
+                state.clone()
+            }),
+            view: Arc::new(|state| {
+                if state.get("poisoned") == Some(&serde_json::json!(true)) {
+                    panic!("hostile unit rejects the poisoned log");
+                }
+                Value::Null
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_children_requires_the_session_store() {
+        let ctx = Context::new();
+        SessionProjectionRegistry::install(&ctx).unwrap();
+        let runtime = SubagentRuntime::install(&ctx).unwrap();
+        let error = runtime
+            .list_children(&session_id("parent"))
+            .await
+            .unwrap_err();
+        assert_eq!(error, SESSION_STORE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn list_children_omits_a_live_child_without_a_descriptor() {
+        let (_ctx, runtime, parent, store) = continuable_host(true);
+        let header = authored_header(
+            parent.agent.session().header(),
+            parent.agent.id().clone(),
+            "11111111-1111-4111-8111-111111111111",
+            2,
+        );
+        store.publish(Session::with_header(header));
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_children_reports_a_descriptorless_cold_child_as_corrupt() {
+        let (_ctx, runtime, parent, _store, persistence) = continuable_host_persisted();
+        let header = authored_header(
+            parent.agent.session().header(),
+            parent.agent.id().clone(),
+            "22222222-2222-4222-8222-222222222222",
+            2,
+        );
+        let child_id = header.id.clone();
+        let child = Session::with_header(header);
+        append_bare_turns(&child);
+        persistence.save(&child).await.unwrap();
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![SubagentListEntry::Diagnostic {
+                id: child_id,
+                reason: DIAGNOSTIC_CORRUPT.to_string(),
+                parent: parent.agent.id().clone(),
+                depth: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_children_reports_an_unknown_descriptor_version_as_corrupt() {
+        let (_ctx, runtime, parent, _store, persistence) = continuable_host_persisted();
+        let header = authored_header(
+            parent.agent.session().header(),
+            parent.agent.id().clone(),
+            "33333333-3333-4333-8333-333333333333",
+            2,
+        );
+        let child_id = header.id.clone();
+        let child = Session::with_header(header);
+        append_descriptor(&child, "continuable", "future", 99);
+        persistence.save(&child).await.unwrap();
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![SubagentListEntry::Diagnostic {
+                id: child_id,
+                reason: DIAGNOSTIC_CORRUPT.to_string(),
+                parent: parent.agent.id().clone(),
+                depth: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_children_maps_a_failed_cold_load_to_unavailable() {
+        let ctx = Context::new();
+        let store = Arc::new(SessionStore::new());
+        ctx.provide(Arc::clone(&store)).unwrap();
+        SessionProjectionRegistry::install(&ctx).unwrap();
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        ctx.provide(Arc::new(agents)).unwrap();
+        let backend = MemoryBackend::new();
+        let header = authored_header(
+            &SessionHeader::new(session_id("parent"), None),
+            session_id("parent"),
+            "44444444-4444-4444-8444-444444444444",
+            2,
+        );
+        let child_id = header.id.clone();
+        backend
+            .sessions
+            .lock()
+            .expect("memory persist")
+            .insert(child_id.as_str().to_string(), (header.clone(), Vec::new()));
+        backend
+            .fail_load
+            .lock()
+            .expect("memory persist fail")
+            .insert(child_id.as_str().to_string());
+        ctx.provide(Arc::new(PersistenceRuntime::new(backend)))
+            .unwrap();
+        let runtime = SubagentRuntime::install(&ctx).unwrap();
+        let parent_session = store.create(session_id("parent"));
+        let parent = ctx
+            .service::<AgentRegistry>()
+            .unwrap()
+            .create(parent_session)
+            .unwrap();
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![SubagentListEntry::Diagnostic {
+                id: child_id,
+                reason: DIAGNOSTIC_UNAVAILABLE.to_string(),
+                parent: parent.agent.id().clone(),
+                depth: 1,
+            }]
+        );
+    }
+
+    struct LifecycleMismatchBackend {
+        listed: SessionHeader,
+        loaded_header: SessionHeader,
+        events: Vec<SessionEvent>,
+    }
+
+    #[async_trait]
+    impl SessionStoreBackend for LifecycleMismatchBackend {
+        async fn save(&self, _: &Session) -> std::result::Result<(), PersistenceError> {
+            Ok(())
+        }
+
+        async fn load(&self, _: &SessionId) -> std::result::Result<Session, PersistenceError> {
+            let session = Session::with_header(self.loaded_header.clone());
+            for event in &self.events {
+                session.append_logged(event.clone())?;
+            }
+            Ok(session)
+        }
+
+        async fn list_ids(&self) -> std::result::Result<Vec<SessionId>, PersistenceError> {
+            Ok(vec![self.listed.id.clone()])
+        }
+
+        async fn list_headers(&self) -> std::result::Result<Vec<SessionHeader>, PersistenceError> {
+            Ok(vec![self.listed.clone()])
+        }
+    }
+
+    #[tokio::test]
+    async fn list_children_reports_a_lifecycle_mismatch_as_corrupt() {
+        let (ctx, runtime, parent, _store) = continuable_host(true);
+        let listed = authored_header(
+            parent.agent.session().header(),
+            parent.agent.id().clone(),
+            "55555555-5555-4555-8555-555555555555",
+            2,
+        );
+        let child_id = listed.id.clone();
+        let mut loaded_header = listed.clone();
+        loaded_header.created_at = 99;
+        let loaded = Session::with_header(loaded_header.clone());
+        append_descriptor(
+            &loaded,
+            "continuable",
+            "reborn",
+            SUBAGENT_DESCRIPTOR_VERSION,
+        );
+        ctx.provide(Arc::new(PersistenceRuntime::new(Arc::new(
+            LifecycleMismatchBackend {
+                listed,
+                loaded_header,
+                events: loaded.events(),
+            },
+        ))))
+        .unwrap();
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![SubagentListEntry::Diagnostic {
+                id: child_id,
+                reason: DIAGNOSTIC_CORRUPT.to_string(),
+                parent: parent.agent.id().clone(),
+                depth: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_children_contains_a_hostile_cold_fold_as_corrupt() {
+        let (ctx, runtime, parent, _store, persistence) = continuable_host_persisted();
+        ctx.service::<SessionProjectionRegistry>()
+            .unwrap()
+            .register(hostile_unit())
+            .unwrap();
+        let header = authored_header(
+            parent.agent.session().header(),
+            parent.agent.id().clone(),
+            "66666666-6666-4666-8666-666666666666",
+            2,
+        );
+        let child_id = header.id.clone();
+        let child = Session::with_header(header);
+        append_descriptor(
+            &child,
+            "continuable",
+            "poison me",
+            SUBAGENT_DESCRIPTOR_VERSION,
+        );
+        persistence.save(&child).await.unwrap();
+        let entries = runtime.list_children(parent.agent.id()).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![SubagentListEntry::Diagnostic {
+                id: child_id,
+                reason: DIAGNOSTIC_CORRUPT.to_string(),
+                parent: parent.agent.id().clone(),
+                depth: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_descendants_positions_a_corrupt_intermediate() {
+        let (_ctx, runtime, parent, _store, persistence) = continuable_host_persisted();
+        let bare = authored_header(
+            parent.agent.session().header(),
+            parent.agent.id().clone(),
+            "77777777-7777-4777-8777-777777777777",
+            2,
+        );
+        let below = authored_header(
+            &bare,
+            bare.id.clone(),
+            "88888888-8888-4888-8888-888888888888",
+            3,
+        );
+        let bare_id = bare.id.clone();
+        let below_id = below.id.clone();
+        let bare_session = Session::with_header(bare);
+        append_bare_turns(&bare_session);
+        persistence.save(&bare_session).await.unwrap();
+        let below_session = Session::with_header(below);
+        append_descriptor(
+            &below_session,
+            "continuable",
+            "below the corrupt node",
+            SUBAGENT_DESCRIPTOR_VERSION,
+        );
+        persistence.save(&below_session).await.unwrap();
+        let entries = runtime.list_descendants(parent.agent.id()).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                SubagentListEntry::Diagnostic {
+                    id: bare_id.clone(),
+                    reason: DIAGNOSTIC_CORRUPT.to_string(),
+                    parent: parent.agent.id().clone(),
+                    depth: 1,
+                },
+                SubagentListEntry::Child {
+                    id: below_id,
+                    label: "below the corrupt node".into(),
+                    mode: "continuable".into(),
+                    activity: "inactive".into(),
+                    has_children: false,
+                    parent: bare_id,
+                    depth: 2,
+                },
+            ]
+        );
     }
 }
