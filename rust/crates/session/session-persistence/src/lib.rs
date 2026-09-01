@@ -239,6 +239,7 @@ impl PersistenceRuntime {
     }
 
     /// Hold a ready inspection so a later stale inspect borrows it.
+    #[cfg(test)]
     pub(crate) fn hold_prepared(&self, id: &SessionId) -> bool {
         self.preparations.hold(id)
     }

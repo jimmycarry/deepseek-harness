@@ -1511,6 +1511,22 @@ mod tests {
             .unwrap();
     }
 
+    fn emit_named(ctx: &Context, name: &str) {
+        ctx.service::<SessionTelemetry>()
+            .unwrap()
+            .emit(SessionTelemetryRecord {
+                channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
+                time: 1,
+                severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
+                attributes: {
+                    let mut map = Map::new();
+                    map.insert("event.type".into(), json!(name));
+                    map
+                },
+                body: Value::Null,
+            });
+    }
+
     #[test]
     fn reuses_an_http_socket_when_keepalive_is_enabled() {
         pin_home();
@@ -1529,8 +1545,8 @@ mod tests {
             })),
         )
         .unwrap();
-        emit_turn(&ctx, "ka-1");
-        emit_turn(&ctx, "ka-2");
+        emit_named(&ctx, "ka-1");
+        emit_named(&ctx, "ka-2");
         ctx.dispose();
         let captures = snapshot(&collector);
         assert_eq!(captures.len(), 2);
@@ -1556,8 +1572,8 @@ mod tests {
             })),
         )
         .unwrap();
-        emit_turn(&ctx, "close-1");
-        emit_turn(&ctx, "close-2");
+        emit_named(&ctx, "close-1");
+        emit_named(&ctx, "close-2");
         ctx.dispose();
         let captures = snapshot(&collector);
         assert_eq!(captures.len(), 2);
