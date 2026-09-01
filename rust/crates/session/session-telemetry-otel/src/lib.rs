@@ -1,7 +1,8 @@
 //! Session telemetry backend. The shipped default is `DISABLED`: no records
 //! leave the process, and `ctx.sessionTelemetry.sharing` discloses `disabled`
 //! so `/feedback` can report the standing policy. `FULL` and `FEEDBACK_ONLY`
-//! construct an OTLP/HTTP JSON log pipeline.
+//! construct an OTLP/HTTP JSON log pipeline. Transient collector failures
+//! (429/502/503/504 or a transport error) retry inside `exporter.timeoutMillis`.
 
 mod export;
 
@@ -199,8 +200,7 @@ fn parse_pipeline_spec(config: &Value) -> Result<PipelineSpec> {
         .unwrap_or("");
     if url.is_empty() {
         return Err(CordisError::Validation(
-            "session-telemetry-otel: exporter.url is required (the full OTLP logs endpoint)"
-                .into(),
+            "session-telemetry-otel: exporter.url is required (the full OTLP logs endpoint)".into(),
         ));
     }
     let Some(protocol) = url_protocol(url) else {
@@ -229,10 +229,7 @@ fn parse_pipeline_spec(config: &Value) -> Result<PipelineSpec> {
         .cloned()
         .unwrap_or(Value::from(DEFAULT_SHUTDOWN_TIMEOUT_MILLIS));
     let shutdown_ms = shutdown_ms.as_f64().unwrap_or(f64::NAN);
-    if !shutdown_ms.is_finite()
-        || shutdown_ms <= 0.0
-        || shutdown_ms > MAX_TIMER_DELAY_MILLIS
-    {
+    if !shutdown_ms.is_finite() || shutdown_ms <= 0.0 || shutdown_ms > MAX_TIMER_DELAY_MILLIS {
         return Err(CordisError::Validation(format!(
             "session-telemetry-otel: shutdownTimeoutMillis must be a positive finite number no greater than {}, got {shutdown_ms}",
             MAX_TIMER_DELAY_MILLIS as u64
@@ -276,11 +273,7 @@ fn header_list(exporter: Option<&Value>) -> Vec<(String, String)> {
         return Vec::new();
     };
     map.iter()
-        .filter_map(|(key, value)| {
-            value
-                .as_str()
-                .map(|text| (key.clone(), text.to_string()))
-        })
+        .filter_map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_string())))
         .collect()
 }
 
@@ -305,7 +298,10 @@ fn url_protocol(raw: &str) -> Option<String> {
         return None;
     }
     if !chars.all(|character| {
-        character.is_ascii_alphanumeric() || character == '+' || character == '-' || character == '.'
+        character.is_ascii_alphanumeric()
+            || character == '+'
+            || character == '-'
+            || character == '.'
     }) {
         return None;
     }
@@ -332,6 +328,13 @@ mod tests {
     struct Capture {
         headers: HashMap<String, String>,
         body: Value,
+        status: u16,
+    }
+
+    struct ReplyScript {
+        fail_first: usize,
+        fail_status: u16,
+        retry_after: Option<&'static str>,
     }
 
     struct HoldGate {
@@ -386,10 +389,12 @@ mod tests {
 
     impl MockCollector {
         fn start(hold: Option<Arc<HoldGate>>) -> Self {
+            Self::start_with(hold, None)
+        }
+
+        fn start_with(hold: Option<Arc<HoldGate>>, reply: Option<ReplyScript>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("collector bind");
-            listener
-                .set_nonblocking(false)
-                .expect("collector blocking");
+            listener.set_nonblocking(false).expect("collector blocking");
             let addr = listener.local_addr().expect("collector addr");
             let url = format!("http://127.0.0.1:{}/v1/logs", addr.port());
             let captures = Arc::new(Mutex::new(Vec::new()));
@@ -410,14 +415,19 @@ mod tests {
                                 if let Some(gate) = &hold {
                                     gate.hold_first(n);
                                 }
+                                let (status, retry_after) = match &reply {
+                                    Some(script) if n < script.fail_first => {
+                                        (script.fail_status, script.retry_after)
+                                    }
+                                    _ => (200, None),
+                                };
                                 let body = decode_body(&headers, &raw);
                                 thread_captures.lock().expect("captures").push(Capture {
                                     headers,
                                     body,
+                                    status,
                                 });
-                                let _ = stream.write_all(
-                                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                                );
+                                let _ = stream.write_all(&collector_reply(status, retry_after));
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -435,6 +445,27 @@ mod tests {
                 thread: Some(thread),
             }
         }
+    }
+
+    fn collector_reply(status: u16, retry_after: Option<&str>) -> Vec<u8> {
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            _ => "Error",
+        };
+        let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
+        if let Some(retry_after) = retry_after {
+            response.push_str(&format!("Retry-After: {retry_after}\r\n"));
+        }
+        response.push_str(
+            "Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        response.into_bytes()
     }
 
     impl Drop for MockCollector {
@@ -481,8 +512,7 @@ mod tests {
     }
 
     fn decode_body(headers: &HashMap<String, String>, raw: &[u8]) -> Value {
-        let bytes = if headers.get("content-encoding").map(String::as_str) == Some("gzip")
-        {
+        let bytes = if headers.get("content-encoding").map(String::as_str) == Some("gzip") {
             gunzip(raw).unwrap_or_else(|_| raw.to_vec())
         } else {
             raw.to_vec()
@@ -502,7 +532,9 @@ mod tests {
             let mut stdin = child.stdin.take().ok_or("gzip stdin")?;
             stdin.write_all(raw).map_err(|error| error.to_string())?;
         }
-        let output = child.wait_with_output().map_err(|error| error.to_string())?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
@@ -512,10 +544,7 @@ mod tests {
     fn pin_home() {
         static HOME: OnceLock<PathBuf> = OnceLock::new();
         let home = HOME.get_or_init(|| {
-            let path = std::env::temp_dir().join(format!(
-                "dsh-otel-home-{}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir().join(format!("dsh-otel-home-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&path);
             path
         });
@@ -659,19 +688,21 @@ mod tests {
                 None,
             )
             .unwrap();
-        ctx.service::<SessionTelemetry>().unwrap().emit(SessionTelemetryRecord {
-            channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
-            time: 1,
-            severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
-            attributes: {
-                let mut map = Map::new();
-                map.insert("session.id".into(), json!("wire"));
-                map.insert("event.type".into(), json!("manual"));
-                map.insert("event.seq".into(), json!(99));
-                map
-            },
-            body: json!({ "direct": true }),
-        });
+        ctx.service::<SessionTelemetry>()
+            .unwrap()
+            .emit(SessionTelemetryRecord {
+                channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
+                time: 1,
+                severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
+                attributes: {
+                    let mut map = Map::new();
+                    map.insert("session.id".into(), json!("wire"));
+                    map.insert("event.type".into(), json!("manual"));
+                    map.insert("event.seq".into(), json!(99));
+                    map
+                },
+                body: json!({ "direct": true }),
+            });
         ctx.dispose();
         let captures = snapshot(&collector);
         assert!(!captures.is_empty());
@@ -685,13 +716,18 @@ mod tests {
             .unwrap_or_default();
         assert!(resource.iter().any(|attribute| {
             attribute.get("key").and_then(Value::as_str) == Some("service.name")
-                && attribute.pointer("/value/stringValue").and_then(Value::as_str)
+                && attribute
+                    .pointer("/value/stringValue")
+                    .and_then(Value::as_str)
                     == Some("deepseek-harness")
         }));
         let user = dsh_anonymous_user_id::get_or_create_anonymous_user_id();
         assert!(resource.iter().any(|attribute| {
             attribute.get("key").and_then(Value::as_str) == Some("user.id")
-                && attribute.pointer("/value/stringValue").and_then(Value::as_str) == Some(user.as_str())
+                && attribute
+                    .pointer("/value/stringValue")
+                    .and_then(Value::as_str)
+                    == Some(user.as_str())
         }));
         let records = all_records(&captures);
         let ledger: Vec<_> = records
@@ -710,7 +746,9 @@ mod tests {
                 .flatten()
                 .any(|attribute| {
                     attribute.get("key").and_then(Value::as_str) == Some("event.type")
-                        && attribute.pointer("/value/stringValue").and_then(Value::as_str)
+                        && attribute
+                            .pointer("/value/stringValue")
+                            .and_then(Value::as_str)
                             == Some("turn/start")
                 })
         });
@@ -721,10 +759,20 @@ mod tests {
             start.unwrap().1.get("timeUnixNano").and_then(Value::as_str),
             Some(expected_nanos.as_str())
         );
-        assert!(start.unwrap().1.get("attributes").and_then(Value::as_array).into_iter().flatten().any(|attribute| {
-            attribute.get("key").and_then(Value::as_str) == Some("session.cwd")
-                && attribute.pointer("/value/stringValue").and_then(Value::as_str) == Some("/tmp/w")
-        }));
+        assert!(start
+            .unwrap()
+            .1
+            .get("attributes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|attribute| {
+                attribute.get("key").and_then(Value::as_str) == Some("session.cwd")
+                    && attribute
+                        .pointer("/value/stringValue")
+                        .and_then(Value::as_str)
+                        == Some("/tmp/w")
+            }));
         let end = ledger.iter().find(|(_, record)| {
             record
                 .get("attributes")
@@ -733,18 +781,32 @@ mod tests {
                 .flatten()
                 .any(|attribute| {
                     attribute.get("key").and_then(Value::as_str) == Some("event.type")
-                        && attribute.pointer("/value/stringValue").and_then(Value::as_str)
+                        && attribute
+                            .pointer("/value/stringValue")
+                            .and_then(Value::as_str)
                             == Some("turn/end")
                 })
         });
         assert_eq!(end.unwrap().1.get("severityNumber"), Some(&json!(17)));
-        assert_eq!(end.unwrap().1.get("severityText").and_then(Value::as_str), Some("ERROR"));
+        assert_eq!(
+            end.unwrap().1.get("severityText").and_then(Value::as_str),
+            Some("ERROR")
+        );
         assert!(event_types(&captures).iter().any(|name| name == "manual"));
         assert_eq!(ops.len(), 1);
-        assert!(ops[0].1.get("attributes").and_then(Value::as_array).into_iter().flatten().any(|attribute| {
-            attribute.get("key").and_then(Value::as_str) == Some("telemetry.op")
-                && attribute.pointer("/value/stringValue").and_then(Value::as_str) == Some("shutdown")
-        }));
+        assert!(ops[0]
+            .1
+            .get("attributes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|attribute| {
+                attribute.get("key").and_then(Value::as_str) == Some("telemetry.op")
+                    && attribute
+                        .pointer("/value/stringValue")
+                        .and_then(Value::as_str)
+                        == Some("shutdown")
+            }));
     }
 
     #[test]
@@ -783,10 +845,19 @@ mod tests {
             .filter(|(scope, _)| scope.ends_with("/ops"))
             .collect();
         assert_eq!(ops.len(), 1);
-        assert!(ops[0].1.get("attributes").and_then(Value::as_array).into_iter().flatten().any(|attribute| {
-            attribute.get("key").and_then(Value::as_str) == Some("telemetry.op")
-                && attribute.pointer("/value/stringValue").and_then(Value::as_str) == Some("shutdown")
-        }));
+        assert!(ops[0]
+            .1
+            .get("attributes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|attribute| {
+                attribute.get("key").and_then(Value::as_str) == Some("telemetry.op")
+                    && attribute
+                        .pointer("/value/stringValue")
+                        .and_then(Value::as_str)
+                        == Some("shutdown")
+            }));
     }
 
     #[test]
@@ -855,10 +926,15 @@ mod tests {
         let captures = snapshot(&collector);
         assert!(!captures.is_empty());
         assert_eq!(
-            captures[0].headers.get("content-encoding").map(String::as_str),
+            captures[0]
+                .headers
+                .get("content-encoding")
+                .map(String::as_str),
             Some("gzip")
         );
-        assert!(event_types(&captures).iter().any(|name| name == "turn/start"));
+        assert!(event_types(&captures)
+            .iter()
+            .any(|name| name == "turn/start"));
     }
 
     #[test]
@@ -891,7 +967,9 @@ mod tests {
                 .flatten()
                 .any(|attribute| {
                     attribute.get("key").and_then(Value::as_str) == Some("event.type")
-                        && attribute.pointer("/value/stringValue").and_then(Value::as_str)
+                        && attribute
+                            .pointer("/value/stringValue")
+                            .and_then(Value::as_str)
                             == Some("turn/start")
                 })
         });
@@ -915,17 +993,20 @@ mod tests {
         .unwrap();
         let telemetry = ctx.clone();
         ctx.on_waterfall(RECORD_WATERFALL, move |payload, next| {
-            telemetry.service::<SessionTelemetry>().unwrap().emit(SessionTelemetryRecord {
-                channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
-                time: 1,
-                severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
-                attributes: {
-                    let mut map = Map::new();
-                    map.insert("event.type".into(), json!("direct-bypass"));
-                    map
-                },
-                body: json!({ "mustStayLocal": true }),
-            });
+            telemetry
+                .service::<SessionTelemetry>()
+                .unwrap()
+                .emit(SessionTelemetryRecord {
+                    channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
+                    time: 1,
+                    severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
+                    attributes: {
+                        let mut map = Map::new();
+                        map.insert("event.type".into(), json!("direct-bypass"));
+                        map
+                    },
+                    body: json!({ "mustStayLocal": true }),
+                });
             next.call(payload)
         })
         .unwrap();
@@ -962,10 +1043,18 @@ mod tests {
                 "feedback/record".to_string(),
             ]
         );
-        let wire = serde_json::to_string(&captures.iter().map(|capture| &capture.body).collect::<Vec<_>>()).unwrap();
+        let wire = serde_json::to_string(
+            &captures
+                .iter()
+                .map(|capture| &capture.body)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         assert!(wire.contains("first report"));
         assert!(wire.contains("second report"));
-        assert!(!all_records(&captures).iter().any(|(scope, _)| scope.ends_with("/ops")));
+        assert!(!all_records(&captures)
+            .iter()
+            .any(|(scope, _)| scope.ends_with("/ops")));
         assert!(!wire.contains("direct-bypass"));
     }
 
@@ -991,13 +1080,15 @@ mod tests {
         session
             .append(SessionEventData::TurnStart { turn: 1 }, None)
             .unwrap();
-        ctx.service::<SessionTelemetry>().unwrap().emit(SessionTelemetryRecord {
-            channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
-            time: 1,
-            severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
-            attributes: Map::new(),
-            body: json!({ "mustStayLocal": true }),
-        });
+        ctx.service::<SessionTelemetry>()
+            .unwrap()
+            .emit(SessionTelemetryRecord {
+                channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
+                time: 1,
+                severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
+                attributes: Map::new(),
+                body: json!({ "mustStayLocal": true }),
+            });
         ctx.emit(
             "session/event",
             json!({
@@ -1012,7 +1103,9 @@ mod tests {
         );
         let warnings = ctx.service::<SessionTelemetry>().unwrap().warnings();
         ctx.dispose();
-        assert!(warnings.iter().any(|warning| warning == non_canonical_feedback_warning()));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning == non_canonical_feedback_warning()));
         assert!(snapshot(&collector).is_empty());
     }
 
@@ -1040,15 +1133,22 @@ mod tests {
             .unwrap();
         record_feedback(&session, "local report").unwrap();
         let warnings = ctx.service::<SessionTelemetry>().unwrap().warnings();
-        assert!(warnings.iter().any(|warning| warning == disabled_feedback_warning()));
-        ctx.service::<SessionTelemetry>().unwrap().emit(SessionTelemetryRecord {
-            channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
-            time: 0,
-            severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
-            attributes: Map::new(),
-            body: Value::Null,
-        });
-        ctx.service::<SessionTelemetry>().unwrap().shutdown().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning == disabled_feedback_warning()));
+        ctx.service::<SessionTelemetry>()
+            .unwrap()
+            .emit(SessionTelemetryRecord {
+                channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
+                time: 0,
+                severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
+                attributes: Map::new(),
+                body: Value::Null,
+            });
+        ctx.service::<SessionTelemetry>()
+            .unwrap()
+            .shutdown()
+            .unwrap();
         ctx.dispose();
         record_feedback(&session, "after disposal").unwrap();
         assert_eq!(
@@ -1112,11 +1212,131 @@ mod tests {
     }
 
     #[test]
+    fn retries_a_transient_collector_rejection_inside_timeout() {
+        // Retry-After: 0 keeps the retry inside the crate-test budget; without
+        // the header the exporter uses jittered exponential backoff.
+        pin_home();
+        let collector = MockCollector::start_with(
+            None,
+            Some(ReplyScript {
+                fail_first: 1,
+                fail_status: 503,
+                retry_after: Some("0"),
+            }),
+        );
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 2_000 },
+                "processor": { "scheduledDelayMillis": 60_000, "maxExportBatchSize": 8 },
+            })),
+        )
+        .unwrap();
+        let session = ctx
+            .service::<SessionStore>()
+            .unwrap()
+            .create(session_id("retry-503"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        ctx.dispose();
+        let captures = snapshot(&collector);
+        assert!(captures.iter().any(|capture| capture.status == 503));
+        let accepted: Vec<Capture> = captures
+            .into_iter()
+            .filter(|capture| capture.status == 200)
+            .collect();
+        assert!(!accepted.is_empty());
+        assert!(event_types(&accepted)
+            .iter()
+            .any(|name| name == "turn/start"));
+    }
+
+    #[test]
+    fn does_not_retry_a_permanent_collector_rejection() {
+        pin_home();
+        let collector = MockCollector::start_with(
+            None,
+            Some(ReplyScript {
+                fail_first: usize::MAX,
+                fail_status: 400,
+                retry_after: None,
+            }),
+        );
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 2_000 },
+                "processor": { "scheduledDelayMillis": 60_000, "maxExportBatchSize": 8 },
+            })),
+        )
+        .unwrap();
+        let session = ctx
+            .service::<SessionStore>()
+            .unwrap()
+            .create(session_id("reject-400"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        ctx.dispose();
+        let captures = snapshot(&collector);
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].status, 400);
+    }
+
+    #[test]
+    fn abandons_retry_when_retry_after_exceeds_remaining_timeout() {
+        pin_home();
+        let collector = MockCollector::start_with(
+            None,
+            Some(ReplyScript {
+                fail_first: usize::MAX,
+                fail_status: 503,
+                retry_after: Some("5"),
+            }),
+        );
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 80 },
+                "processor": { "scheduledDelayMillis": 60_000, "maxExportBatchSize": 8 },
+                "shutdownTimeoutMillis": 2_000,
+            })),
+        )
+        .unwrap();
+        let session = ctx
+            .service::<SessionStore>()
+            .unwrap()
+            .create(session_id("retry-budget"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        let started = Instant::now();
+        ctx.dispose();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let captures = snapshot(&collector);
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].status, 503);
+    }
+
+    #[test]
     fn config_fails_loud() {
         pin_home();
         let cases: Vec<(Value, &str)> = vec![
             (json!({ "mode": "FULL" }), "exporter.url is required"),
-            (json!({ "mode": "FULL", "exporter": { "url": "" } }), "exporter.url is required"),
+            (
+                json!({ "mode": "FULL", "exporter": { "url": "" } }),
+                "exporter.url is required",
+            ),
             (
                 json!({ "mode": "FULL", "exporter": { "url": "not a url" } }),
                 "not a valid URL",
@@ -1125,7 +1345,10 @@ mod tests {
                 json!({ "mode": "FULL", "exporter": { "url": "ftp://collector" } }),
                 "must be http(s)",
             ),
-            (json!({ "mode": "FEEDBACK_ONLY" }), "exporter.url is required"),
+            (
+                json!({ "mode": "FEEDBACK_ONLY" }),
+                "exporter.url is required",
+            ),
             (json!({ "mode": "INVALID" }), "INVALID"),
             (
                 json!({ "mode": "FULL", "exporter": { "url": "http://c/v1/logs" }, "processor": { "maxExportBatchSize": 0 } }),
@@ -1157,7 +1380,11 @@ mod tests {
         pin_home();
         let ctx = Context::new();
         SessionStore::install(&ctx).unwrap();
-        let err = install(&ctx, Some(&json!({ "mode": "INVALID", "exporter": { "url": "http://c/v1/logs" } }))).unwrap_err();
+        let err = install(
+            &ctx,
+            Some(&json!({ "mode": "INVALID", "exporter": { "url": "http://c/v1/logs" } })),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("INVALID"));
     }
 }

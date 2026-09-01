@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-22-rust-harness-port.md
-2026-08-22-rust-harness-port.md: 269e863f7345eabec1a85ad4225c7d34585ef88d
-2026-08-22-rust-harness-port.zh.md: 1cab9b8dde9b5ad965cbbaa5a4a76ff0bb4d851f
+2026-08-22-rust-harness-port.md: 3368026373cf9ff08db58aede758df67e1229b42
+2026-08-22-rust-harness-port.zh.md: d754fa5ac5aa19c31487434ea46af3108e35df34
