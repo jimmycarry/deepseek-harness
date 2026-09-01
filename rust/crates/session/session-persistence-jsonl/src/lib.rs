@@ -8,7 +8,7 @@ use dsh_session::{
     SessionHeader, SessionId, SessionStore, TurnEndReason, SESSION_FORMAT_VERSION,
 };
 use dsh_session_persistence::{
-    PersistenceError, PersistenceRuntime, SessionLocation, SessionStoreBackend,
+    PersistenceError, PersistenceRuntime, SessionInspection, SessionLocation, SessionStoreBackend,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -59,7 +59,11 @@ impl SessionStoreBackend for JsonlBackend {
     }
 
     async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
-        read_jsonl(self.path_for(id), id).await
+        inspect_jsonl(self.path_for(id), id).await?.into_session()
+    }
+
+    async fn inspect(&self, id: &SessionId) -> Result<SessionInspection, PersistenceError> {
+        inspect_jsonl(self.path_for(id), id).await
     }
 
     async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
@@ -248,6 +252,15 @@ pub async fn read_jsonl(
     path: impl AsRef<Path>,
     id: &SessionId,
 ) -> Result<Session, PersistenceError> {
+    inspect_jsonl(path, id).await?.into_session()
+}
+
+/// Read-only logical view. An interrupted trailing turn receives an
+/// in-memory closer; the file is not rewritten.
+pub async fn inspect_jsonl(
+    path: impl AsRef<Path>,
+    id: &SessionId,
+) -> Result<SessionInspection, PersistenceError> {
     let body = match fs::read_to_string(&path).await {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -260,7 +273,6 @@ pub async fn read_jsonl(
         .next()
         .ok_or_else(|| PersistenceError::Format("missing session header line".into()))?;
     let header = parse_header_line(header_text, id)?;
-    let session = Session::with_header(header);
     let mut events: Vec<SessionEvent> = Vec::new();
     for line in lines {
         let value: Value = serde_json::from_str(line)
@@ -274,10 +286,10 @@ pub async fn read_jsonl(
         events.push(session_event_from_value(value)?);
     }
     repair_open_turn(&mut events);
-    for event in events {
-        session.append_logged(event)?;
-    }
-    Ok(session)
+    Ok(SessionInspection {
+        meta: header,
+        events,
+    })
 }
 
 /// Close a dangling `turn/start` with `interrupted`.
@@ -464,6 +476,32 @@ mod tests {
         ctx.dispose();
         let body = std::fs::read_to_string(dir.join("drain.jsonl")).unwrap();
         assert!(body.contains("fixture feedback"));
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn inspect_repairs_an_open_turn_without_rewriting_the_file() {
+        let dir = tmp_dir("inspect");
+        fs::create_dir_all(&dir).await.unwrap();
+        let backend = JsonlBackend::new(&dir);
+        let session = Session::new(session_id("open"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        backend.save(&session).await.unwrap();
+        let path = backend.path_for(&session_id("open"));
+        let before = fs::read_to_string(&path).await.unwrap();
+        let inspected = backend.inspect(&session_id("open")).await.unwrap();
+        assert!(matches!(
+            inspected.events.last().unwrap().data,
+            SessionEventData::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
+        let after = fs::read_to_string(&path).await.unwrap();
+        assert_eq!(before, after);
+        assert!(!after.contains("interrupted"));
         let _ = fs::remove_dir_all(&dir).await;
     }
 

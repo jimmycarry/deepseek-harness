@@ -122,7 +122,7 @@ pub enum SubagentListEntry {
         /// The candidate's session id.
         id: SessionId,
         /// `corrupt` for a settled fold with no identity or a lifecycle
-        /// mismatch; `unavailable` for a failed cold load.
+        /// mismatch; `unavailable` for a failed cold inspect.
         reason: String,
         /// Durable direct-parent session id.
         parent: SessionId,
@@ -949,7 +949,7 @@ fn diagnostic_row(id: SessionId, reason: &str, parent: SessionId, depth: u32) ->
 
 /// Classify one corpus candidate. Live null identity is omitted (creation
 /// window); cold null identity, a lifecycle mismatch, or a fold panic is
-/// `corrupt`; a failed cold load is `unavailable`.
+/// `corrupt`; a failed cold inspect is `unavailable`.
 async fn resolve_candidate(
     runtime: &SubagentRuntime,
     projections: &SessionProjectionRegistry,
@@ -974,8 +974,8 @@ async fn resolve_candidate(
         };
     }
     let persistence = runtime.persistence()?;
-    let loaded = match persistence.load(&child_id).await {
-        Ok(session) => session,
+    let inspected = match persistence.inspect(&child_id).await {
+        Ok(view) => view,
         Err(_) => {
             return Some(diagnostic_row(
                 child_id,
@@ -985,10 +985,13 @@ async fn resolve_candidate(
             ));
         }
     };
-    if !same_lifecycle(loaded.header(), &record.header) {
+    if !same_lifecycle(&inspected.meta, &record.header) {
         return Some(diagnostic_row(child_id, DIAGNOSTIC_CORRUPT, parent, depth));
     }
-    match projected_identity(projections, &loaded) {
+    let Ok(session) = inspected.into_session() else {
+        return Some(diagnostic_row(child_id, DIAGNOSTIC_CORRUPT, parent, depth));
+    };
+    match projected_identity(projections, &session) {
         Err(()) | Ok(None) => Some(diagnostic_row(child_id, DIAGNOSTIC_CORRUPT, parent, depth)),
         Ok(Some(identity)) => Some(child_row(
             child_id,
@@ -1165,7 +1168,9 @@ mod tests {
     use dsh_sandbox::SandboxMode;
     use dsh_sandbox_policy::set_sandbox_mode;
     use dsh_session::{session_id, SessionEvent};
-    use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
+    use dsh_session_persistence::{
+        PersistenceError, PersistenceRuntime, SessionInspection, SessionStoreBackend,
+    };
     use dsh_session_projection::SessionProjectionRegistry;
     use dsh_user_approval::{effective_approval_policy, ApprovalPolicy};
     use std::collections::{HashMap, HashSet};
@@ -1281,6 +1286,13 @@ mod tests {
         }
 
         async fn load(&self, id: &SessionId) -> std::result::Result<Session, PersistenceError> {
+            self.inspect(id).await?.into_session()
+        }
+
+        async fn inspect(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<SessionInspection, PersistenceError> {
             if self
                 .fail_load
                 .lock()
@@ -1293,11 +1305,10 @@ mod tests {
             let (header, events) = guard
                 .get(id.as_str())
                 .ok_or_else(|| PersistenceError::NotFound(id.as_str().to_string()))?;
-            let session = Session::with_header(header.clone());
-            for event in events {
-                session.append_logged(event.clone())?;
-            }
-            Ok(session)
+            Ok(SessionInspection {
+                meta: header.clone(),
+                events: events.clone(),
+            })
         }
 
         async fn list_ids(&self) -> std::result::Result<Vec<SessionId>, PersistenceError> {
@@ -2139,7 +2150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_children_maps_a_failed_cold_load_to_unavailable() {
+    async fn list_children_maps_a_failed_cold_inspect_to_unavailable() {
         let ctx = Context::new();
         let store = Arc::new(SessionStore::new());
         ctx.provide(Arc::clone(&store)).unwrap();

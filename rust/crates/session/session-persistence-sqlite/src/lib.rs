@@ -10,7 +10,9 @@ use dsh_session::{
     now_ms, refuse_unknown, session_event_from_value, session_id, Session, SessionEvent,
     SessionEventData, SessionHeader, SessionId, TurnEndReason,
 };
-use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
+use dsh_session_persistence::{
+    PersistenceError, PersistenceRuntime, SessionInspection, SessionStoreBackend,
+};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -163,6 +165,13 @@ impl SessionStoreBackend for SqliteBackend {
     }
 
     async fn load(&self, id: &SessionId) -> std::result::Result<Session, PersistenceError> {
+        self.inspect(id).await?.into_session()
+    }
+
+    async fn inspect(
+        &self,
+        id: &SessionId,
+    ) -> std::result::Result<SessionInspection, PersistenceError> {
         let key = id.as_str().to_string();
         let (header, rows) = {
             let db = self.db.lock().expect("sqlite");
@@ -214,11 +223,10 @@ impl SessionStoreBackend for SqliteBackend {
             events.push(session_event_from_value(value)?);
         }
         repair_open_turn(&mut events);
-        let session = Session::with_header(header);
-        for event in events {
-            session.append_logged(event)?;
-        }
-        Ok(session)
+        Ok(SessionInspection {
+            meta: header,
+            events,
+        })
     }
 
     async fn list_ids(&self) -> std::result::Result<Vec<SessionId>, PersistenceError> {
@@ -367,6 +375,38 @@ mod tests {
                 ..
             }
         ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn inspect_repairs_an_open_turn_without_rewriting_rows() {
+        let path = tmp_path("inspect");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let session = Session::new(session_id("open"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        backend.save(&session).await.unwrap();
+        let inspected = backend.inspect(&session_id("open")).await.unwrap();
+        assert!(matches!(
+            inspected.events.last().unwrap().data,
+            SessionEventData::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
+        let stored = {
+            let db = backend.db.lock().expect("sqlite");
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+                    ["open"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            count
+        };
+        assert_eq!(stored, 1);
         let _ = std::fs::remove_file(&path);
     }
 }

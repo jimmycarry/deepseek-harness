@@ -1,8 +1,13 @@
 //! Persistence seam (`ctx.sessionPersistence`).
+//!
+//! [`PersistenceRuntime::inspect`] is the read-only logical view: validated
+//! header and events, in-memory crash-repair closers, no durable rewrite, and
+//! no Session publication. [`PersistenceRuntime::load`] reconstructs a Session
+//! for resume and other publishable paths.
 
 use async_trait::async_trait;
 use dsh_cordis::Service;
-use dsh_session::{Session, SessionError, SessionHeader, SessionId};
+use dsh_session::{Session, SessionError, SessionEvent, SessionHeader, SessionId};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
@@ -34,6 +39,33 @@ pub enum PersistenceError {
     Session(#[from] SessionError),
 }
 
+/// Read-only logical session: validated header and event log, without
+/// publishing a Session or committing crash recovery.
+#[derive(Debug, Clone)]
+pub struct SessionInspection {
+    /// Validated session header.
+    pub meta: SessionHeader,
+    /// Validated contiguous event log. An interrupted trailing turn may
+    /// include an in-memory `turn/end { interrupted }` closer that is not
+    /// written back.
+    pub events: Vec<SessionEvent>,
+}
+
+impl SessionInspection {
+    /// Build an unpublished Session from this view. Does not insert it into
+    /// a [`dsh_session::SessionStore`].
+    ///
+    /// # Errors
+    /// Session append refusal while replaying the inspected events.
+    pub fn into_session(self) -> Result<Session, PersistenceError> {
+        let session = Session::with_header(self.meta);
+        for event in self.events {
+            session.append_logged(event)?;
+        }
+        Ok(session)
+    }
+}
+
 /// Durable save/load for one session log.
 #[async_trait]
 pub trait SessionStoreBackend: Send + Sync {
@@ -41,14 +73,24 @@ pub trait SessionStoreBackend: Send + Sync {
     async fn save(&self, session: &Session) -> Result<(), PersistenceError>;
     /// Reconstruct a session from durable storage.
     async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError>;
+    /// Read-only logical view: parse, validate, and apply in-memory
+    /// crash-repair closers without writing them and without publishing a
+    /// Session. The default reconstructs via [`Self::load`].
+    async fn inspect(&self, id: &SessionId) -> Result<SessionInspection, PersistenceError> {
+        let session = self.load(id).await?;
+        Ok(SessionInspection {
+            meta: session.header().clone(),
+            events: session.events(),
+        })
+    }
     /// Session ids currently stored by this backend.
     async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError>;
     /// Stored headers without requiring a full event-log parse when the
-    /// backend can supply metadata alone. The default loads each id.
+    /// backend can supply metadata alone. The default inspects each id.
     async fn list_headers(&self) -> Result<Vec<SessionHeader>, PersistenceError> {
         let mut headers = Vec::new();
         for id in self.list_ids().await? {
-            headers.push(self.load(&id).await?.header().clone());
+            headers.push(self.inspect(&id).await?.meta);
         }
         Ok(headers)
     }
@@ -79,6 +121,11 @@ impl PersistenceRuntime {
     /// Reconstruct a session from durable storage.
     pub async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
         self.backend.load(id).await
+    }
+
+    /// Read-only logical view. Does not commit crash recovery or publish a Session.
+    pub async fn inspect(&self, id: &SessionId) -> Result<SessionInspection, PersistenceError> {
+        self.backend.inspect(id).await
     }
 
     /// Session ids currently stored by the backend.
@@ -141,6 +188,9 @@ mod tests {
         let session = runtime.load(&session_id("s")).await.unwrap();
         assert_eq!(session.id().as_str(), "s");
         assert!(session.events().is_empty());
+        let inspected = runtime.inspect(&session_id("s")).await.unwrap();
+        assert_eq!(inspected.meta.id.as_str(), "s");
+        assert!(inspected.events.is_empty());
         let headers = runtime.list_headers().await.unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].id.as_str(), "s");
