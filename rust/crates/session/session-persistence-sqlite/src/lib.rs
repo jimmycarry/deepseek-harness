@@ -11,10 +11,12 @@ use dsh_session::{
     SessionEventData, SessionHeader, SessionId, TurnEndReason,
 };
 use dsh_session_persistence::{
-    PersistenceError, PersistenceRuntime, SessionInspection, SessionStoreBackend,
+    session_persistence_revision, PersistenceError, PersistenceRuntime, SessionInspection,
+    SessionPersistenceRevision, SessionPersistenceSnapshot, SessionStoreBackend,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -98,6 +100,14 @@ fn configure(db: &Connection) -> std::result::Result<(), PersistenceError> {
 
 fn sqlite_error(error: rusqlite::Error) -> PersistenceError {
     PersistenceError::Format(error.to_string())
+}
+
+/// Content-addressed revision until the TypeScript incarnation counter lands.
+fn sqlite_revision(store: &str, event_count: i64, header: &str) -> SessionPersistenceRevision {
+    let digest = Sha256::digest(header.as_bytes());
+    session_persistence_revision(format!(
+        "sqlite:{store}:events:{event_count}:header:{digest:x}"
+    ))
 }
 
 fn repair_open_turn(events: &mut Vec<SessionEvent>) {
@@ -262,6 +272,58 @@ impl SessionStoreBackend for SqliteBackend {
         }
         Ok(headers)
     }
+
+    async fn read_stored_revision(
+        &self,
+        id: &SessionId,
+    ) -> std::result::Result<Option<SessionPersistenceRevision>, PersistenceError> {
+        let key = id.as_str().to_string();
+        let store = self.path.to_string_lossy().into_owned();
+        let row = {
+            let db = self.db.lock().expect("sqlite");
+            let mut stmt = db
+                .prepare(
+                    "SELECT header, (SELECT COUNT(*) FROM events WHERE session_id = sessions.id)
+                     FROM sessions WHERE id = ?1",
+                )
+                .map_err(sqlite_error)?;
+            stmt.query_row([&key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()
+            .map_err(sqlite_error)?
+        };
+        Ok(row.map(|(header, count)| sqlite_revision(&store, count, &header)))
+    }
+
+    async fn list_snapshots(
+        &self,
+    ) -> std::result::Result<Vec<SessionPersistenceSnapshot>, PersistenceError> {
+        let store = self.path.to_string_lossy().into_owned();
+        let db = self.db.lock().expect("sqlite");
+        let mut stmt = db
+            .prepare(
+                "SELECT header, (SELECT COUNT(*) FROM events WHERE session_id = sessions.id)
+                 FROM sessions ORDER BY id",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            let (raw, count) = row.map_err(sqlite_error)?;
+            let header: SessionHeader = serde_json::from_str(&raw)
+                .map_err(|error| PersistenceError::Format(error.to_string()))?;
+            snapshots.push(SessionPersistenceSnapshot {
+                header,
+                revision: sqlite_revision(&store, count, &raw),
+            });
+        }
+        Ok(snapshots)
+    }
 }
 
 /// Provide [`PersistenceRuntime`] over a SQLite file.
@@ -407,6 +469,47 @@ mod tests {
             count
         };
         assert_eq!(stored, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn snapshots_change_after_save_and_ignore_inspect_repair() {
+        let path = tmp_path("snapshots");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let id = session_id("snap");
+        let session = Session::new(id.clone());
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        backend.save(&session).await.unwrap();
+        let first = backend.read_stored_revision(&id).await.unwrap().unwrap();
+        let listed = backend.list_snapshots().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].header.id.as_str(), "snap");
+        assert_eq!(listed[0].revision, first);
+        assert_eq!(backend.list_snapshots().await.unwrap()[0].revision, first);
+        backend.inspect(&id).await.unwrap();
+        assert_eq!(
+            backend.read_stored_revision(&id).await.unwrap().as_ref(),
+            Some(&first)
+        );
+        session
+            .append(
+                SessionEventData::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Completed,
+                },
+                None,
+            )
+            .unwrap();
+        backend.save(&session).await.unwrap();
+        let changed = backend.read_stored_revision(&id).await.unwrap().unwrap();
+        assert_ne!(changed, first);
+        assert!(backend
+            .read_stored_revision(&session_id("absent"))
+            .await
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

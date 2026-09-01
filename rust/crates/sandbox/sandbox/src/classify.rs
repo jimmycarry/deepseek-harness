@@ -41,11 +41,7 @@ pub fn is_usable_workdir(path: &str) -> bool {
 }
 
 /// Classify a failed run against the selected backend's denial dialect.
-pub fn classify_denial(
-    exit_code: Option<i32>,
-    stderr: &str,
-    signatures: &[String],
-) -> bool {
+pub fn classify_denial(exit_code: Option<i32>, stderr: &str, signatures: &[String]) -> bool {
     matches_signature(exit_code, stderr, signatures)
 }
 
@@ -139,6 +135,15 @@ pub fn seatbelt_runner_failure_rules() -> Vec<RunnerFailureRule> {
     }]
 }
 
+/// Windows ACL denial dialect (pwsh/.NET, cmd, and Node EACCES).
+pub fn windows_acl_denial_signatures() -> Vec<String> {
+    vec![
+        "access is denied".into(),
+        "access to the path".into(),
+        "permission denied".into(),
+    ]
+}
+
 /// Windows ACL runner-failure rule (exit 127 plus `windows-acl-run: `).
 pub fn windows_acl_runner_failure_rules() -> Vec<RunnerFailureRule> {
     vec![RunnerFailureRule {
@@ -158,18 +163,26 @@ mod tests {
 
     #[test]
     fn matches_signature_requires_nonzero_and_dialect() {
-        assert!(!matches_signature(Some(0), "read-only file system", &[
-            "read-only file system".into()
-        ]));
-        assert!(!matches_signature(None, "read-only file system", &[
-            "read-only file system".into()
-        ]));
-        assert!(matches_signature(Some(1), "touch: Read-only file system", &[
-            "read-only file system".into()
-        ]));
-        assert!(!matches_signature(Some(1), "permission denied", &[
-            "read-only file system".into()
-        ]));
+        assert!(!matches_signature(
+            Some(0),
+            "read-only file system",
+            &["read-only file system".into()]
+        ));
+        assert!(!matches_signature(
+            None,
+            "read-only file system",
+            &["read-only file system".into()]
+        ));
+        assert!(matches_signature(
+            Some(1),
+            "touch: Read-only file system",
+            &["read-only file system".into()]
+        ));
+        assert!(!matches_signature(
+            Some(1),
+            "permission denied",
+            &["read-only file system".into()]
+        ));
     }
 
     #[test]
@@ -248,6 +261,27 @@ mod tests {
     }
 
     #[test]
+    fn windows_acl_denial_signatures_match_the_typescript_dialect() {
+        let signatures = windows_acl_denial_signatures();
+        assert!(classify_denial(Some(1), "Access is denied.", &signatures));
+        assert!(classify_denial(
+            Some(1),
+            "Access to the path 'C:\\repo\\secret' is denied.",
+            &signatures
+        ));
+        assert!(classify_denial(
+            Some(1),
+            "Error: EACCES: permission denied, open '/tmp/x'",
+            &signatures
+        ));
+        assert!(!classify_denial(
+            Some(1),
+            "read-only file system",
+            &signatures
+        ));
+    }
+
+    #[test]
     fn windows_acl_exit_gate_ignores_printed_signature_on_other_exits() {
         let rules = windows_acl_runner_failure_rules();
         assert!(classify_runner_failure(
@@ -266,12 +300,16 @@ mod tests {
 
     #[test]
     fn classify_denial_never_treats_clean_exit_or_signal_as_denial() {
-        assert!(!classify_denial(Some(0), "Permission denied", &[
-            "permission denied".into()
-        ]));
-        assert!(!classify_denial(None, "Permission denied", &[
-            "permission denied".into()
-        ]));
+        assert!(!classify_denial(
+            Some(0),
+            "Permission denied",
+            &["permission denied".into()]
+        ));
+        assert!(!classify_denial(
+            None,
+            "Permission denied",
+            &["permission denied".into()]
+        ));
     }
 
     #[test]

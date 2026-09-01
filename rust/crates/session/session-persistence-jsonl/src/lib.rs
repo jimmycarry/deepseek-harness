@@ -8,7 +8,8 @@ use dsh_session::{
     SessionHeader, SessionId, SessionStore, TurnEndReason, SESSION_FORMAT_VERSION,
 };
 use dsh_session_persistence::{
-    PersistenceError, PersistenceRuntime, SessionInspection, SessionLocation, SessionStoreBackend,
+    session_persistence_revision, PersistenceError, PersistenceRuntime, SessionInspection,
+    SessionLocation, SessionPersistenceRevision, SessionPersistenceSnapshot, SessionStoreBackend,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,29 @@ impl SessionStoreBackend for JsonlBackend {
         Some(SessionLocation::Jsonl {
             path: self.path_for(id),
         })
+    }
+
+    async fn read_stored_revision(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionPersistenceRevision>, PersistenceError> {
+        revision_for_path(&self.path_for(id)).await
+    }
+
+    async fn list_snapshots(&self) -> Result<Vec<SessionPersistenceSnapshot>, PersistenceError> {
+        let mut snapshots = Vec::new();
+        for (id, path) in self.list_jsonl_paths().await? {
+            let header = match read_jsonl_header(&path, &id).await {
+                Ok(header) => header,
+                Err(PersistenceError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let Some(revision) = revision_for_path(&path).await? else {
+                continue;
+            };
+            snapshots.push(SessionPersistenceSnapshot { header, revision });
+        }
+        Ok(snapshots)
     }
 }
 
@@ -290,6 +314,48 @@ pub async fn inspect_jsonl(
         meta: header,
         events,
     })
+}
+
+async fn revision_for_path(
+    path: &Path,
+) -> Result<Option<SessionPersistenceRevision>, PersistenceError> {
+    match fs::metadata(path).await {
+        Ok(meta) => Ok(Some(file_revision(&meta))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// TypeScript JSONL `fileRevision`: `dev:ino:size:mtimeNs:ctimeNs`.
+fn file_revision(meta: &std::fs::Metadata) -> SessionPersistenceRevision {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mtime_ns = (meta.mtime() as u128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u128::from(meta.mtime_nsec() as u32));
+        let ctime_ns = (meta.ctime() as u128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u128::from(meta.ctime_nsec() as u32));
+        session_persistence_revision(format!(
+            "{}:{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            mtime_ns,
+            ctime_ns
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        session_persistence_revision(format!("{}:{}", meta.len(), modified))
+    }
 }
 
 /// Close a dangling `turn/start` with `interrupted`.
@@ -503,6 +569,63 @@ mod tests {
         assert_eq!(before, after);
         assert!(!after.contains("interrupted"));
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn snapshots_use_stat_identity_and_ignore_inspect_repair() {
+        let dir = tmp_dir("snapshots");
+        fs::create_dir_all(&dir).await.unwrap();
+        let backend = JsonlBackend::new(&dir);
+        let id = session_id("snap");
+        let session = Session::new(id.clone());
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        backend.save(&session).await.unwrap();
+        let first = backend.read_stored_revision(&id).await.unwrap().unwrap();
+        let listed = backend.list_snapshots().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].header.id.as_str(), "snap");
+        assert_eq!(listed[0].revision, first);
+        let repeated = backend.list_snapshots().await.unwrap();
+        assert_eq!(repeated[0].revision, first);
+        let reopened = JsonlBackend::new(&dir);
+        assert_eq!(
+            reopened.read_stored_revision(&id).await.unwrap().as_ref(),
+            Some(&first)
+        );
+        backend.inspect(&id).await.unwrap();
+        assert_eq!(
+            backend.read_stored_revision(&id).await.unwrap().as_ref(),
+            Some(&first)
+        );
+        session
+            .append(
+                SessionEventData::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Completed,
+                },
+                None,
+            )
+            .unwrap();
+        backend.save(&session).await.unwrap();
+        let changed = backend.read_stored_revision(&id).await.unwrap().unwrap();
+        assert_ne!(changed, first);
+        assert!(backend
+            .read_stored_revision(&session_id("absent"))
+            .await
+            .unwrap()
+            .is_none());
+        let other = tmp_dir("snapshots-other");
+        fs::create_dir_all(&other).await.unwrap();
+        let other_backend = JsonlBackend::new(&other);
+        other_backend.save(&session).await.unwrap();
+        assert_ne!(
+            other_backend.read_stored_revision(&id).await.unwrap(),
+            Some(changed)
+        );
+        let _ = fs::remove_dir_all(&dir).await;
+        let _ = fs::remove_dir_all(&other).await;
     }
 
     #[tokio::test]

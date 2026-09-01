@@ -22,6 +22,7 @@ members = [
   "crates/subprocess/subprocess-local",
   "crates/sandbox/sandbox",
   "crates/sandbox/sandbox-local",
+  "crates/sandbox/sandbox-windows-acl",
   "crates/sandbox/sandbox-policy",
   "crates/shell/shell",
   "crates/shell/shell-env",
@@ -162,6 +163,7 @@ dsh-subprocess = { path = "crates/subprocess/subprocess" }
 dsh-subprocess-local = { path = "crates/subprocess/subprocess-local" }
 dsh-sandbox = { path = "crates/sandbox/sandbox" }
 dsh-sandbox-local = { path = "crates/sandbox/sandbox-local" }
+dsh-sandbox-windows-acl = { path = "crates/sandbox/sandbox-windows-acl" }
 dsh-sandbox-policy = { path = "crates/sandbox/sandbox-policy" }
 dsh-shell = { path = "crates/shell/shell" }
 dsh-shell-env = { path = "crates/shell/shell-env" }

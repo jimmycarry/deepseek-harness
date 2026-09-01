@@ -4,8 +4,12 @@
 //! header and events, in-memory crash-repair closers, no durable rewrite, and
 //! no Session publication. [`PersistenceRuntime::load`] reconstructs a Session
 //! for resume and other publishable paths.
+//! [`PersistenceRuntime::list_snapshots`] and
+//! [`PersistenceRuntime::read_stored_revision`] expose a backend-owned
+//! revision token without the prepared-session LRU or freshness retry.
 
 use async_trait::async_trait;
+use dsh_brand::Branded;
 use dsh_cordis::Service;
 use dsh_session::{Session, SessionError, SessionEvent, SessionHeader, SessionId};
 use std::path::PathBuf;
@@ -49,6 +53,26 @@ pub struct SessionInspection {
     /// include an in-memory `turn/end { interrupted }` closer that is not
     /// written back.
     pub events: Vec<SessionEvent>,
+}
+
+/// Brand token for a persisted-session revision.
+pub struct SessionPersistenceRevisionBrand;
+
+/// Opaque backend-owned revision of one persisted session log.
+pub type SessionPersistenceRevision = Branded<SessionPersistenceRevisionBrand>;
+
+/// Brand a backend revision token.
+pub fn session_persistence_revision(value: impl Into<String>) -> SessionPersistenceRevision {
+    SessionPersistenceRevision::new(value)
+}
+
+/// One stored session's header plus a cheap revision token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPersistenceSnapshot {
+    /// Detached metadata for one materialized session.
+    pub header: SessionHeader,
+    /// Opaque source-qualified token that changes when this stored log changes.
+    pub revision: SessionPersistenceRevision,
 }
 
 impl SessionInspection {
@@ -100,6 +124,27 @@ pub trait SessionStoreBackend: Send + Sync {
         let _ = id;
         None
     }
+    /// Current revision for one id without loading events. `Ok(None)` if absent.
+    async fn read_stored_revision(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionPersistenceRevision>, PersistenceError> {
+        let _ = id;
+        Ok(None)
+    }
+    /// All materialized sessions with cheap revision tokens.
+    ///
+    /// The default pairs [`Self::list_headers`] with [`Self::read_stored_revision`]
+    /// and skips ids whose revision is absent.
+    async fn list_snapshots(&self) -> Result<Vec<SessionPersistenceSnapshot>, PersistenceError> {
+        let mut snapshots = Vec::new();
+        for header in self.list_headers().await? {
+            if let Some(revision) = self.read_stored_revision(&header.id).await? {
+                snapshots.push(SessionPersistenceSnapshot { header, revision });
+            }
+        }
+        Ok(snapshots)
+    }
 }
 
 /// `ctx.sessionPersistence`.
@@ -141,6 +186,21 @@ impl PersistenceRuntime {
     /// Resolve an absolute per-session artifact without I/O.
     pub fn locate(&self, id: &SessionId) -> Option<SessionLocation> {
         self.backend.locate(id)
+    }
+
+    /// Current revision for one id without loading events. `Ok(None)` if absent.
+    pub async fn read_stored_revision(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionPersistenceRevision>, PersistenceError> {
+        self.backend.read_stored_revision(id).await
+    }
+
+    /// Stored headers plus a backend-owned revision token each.
+    pub async fn list_snapshots(
+        &self,
+    ) -> Result<Vec<SessionPersistenceSnapshot>, PersistenceError> {
+        self.backend.list_snapshots().await
     }
 }
 
@@ -194,5 +254,11 @@ mod tests {
         let headers = runtime.list_headers().await.unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].id.as_str(), "s");
+        assert!(runtime.list_snapshots().await.unwrap().is_empty());
+        assert!(runtime
+            .read_stored_revision(&session_id("s"))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

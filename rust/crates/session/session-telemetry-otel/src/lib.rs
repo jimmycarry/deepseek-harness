@@ -5,6 +5,10 @@
 //! (429/502/503/504 or a transport error) retry inside
 //! `processor.exportTimeoutMillis`, with each HTTP attempt capped by
 //! `exporter.timeoutMillis`. A full queue drops the newest record.
+//! The seam `flush` hint stays unimplemented: forwarding it would be a
+//! second flusher against the batch worker, and the TypeScript backend
+//! refuses that path because concurrent `forceFlush` can drop tail records.
+//! This crate emits no OTel SDK metrics.
 
 mod export;
 
@@ -1380,6 +1384,37 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(collector.captures.lock().expect("captures").is_empty());
         gate.open();
+    }
+
+    #[test]
+    fn session_flush_does_not_export_before_shutdown() {
+        pin_home();
+        let collector = MockCollector::start(None);
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 2_000 },
+                "processor": { "scheduledDelayMillis": 60_000, "maxExportBatchSize": 8 },
+            })),
+        )
+        .unwrap();
+        let session = ctx
+            .service::<SessionStore>()
+            .unwrap()
+            .create(session_id("no-flush"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        ctx.emit("session/flush", json!({ "id": session.id().as_str() }));
+        thread::sleep(Duration::from_millis(40));
+        assert!(collector.captures.lock().expect("captures").is_empty());
+        ctx.dispose();
+        assert!(event_types(&snapshot(&collector))
+            .iter()
+            .any(|name| name == "turn/start"));
     }
 
     #[test]

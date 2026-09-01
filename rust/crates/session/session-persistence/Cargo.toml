@@ -8,6 +8,7 @@ description = "Persistence seam (ctx.sessionPersistence)."
 
 [dependencies]
 async-trait.workspace = true
+dsh-brand.workspace = true
 dsh-cordis.workspace = true
 dsh-session.workspace = true
 thiserror.workspace = true

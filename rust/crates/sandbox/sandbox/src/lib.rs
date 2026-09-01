@@ -14,8 +14,8 @@ mod escalation;
 pub use classify::{
     bwrap_runner_failure_rules, classify_denial, classify_runner_failure, is_usable_workdir,
     landlock_runner_failure_rules, matches_signature, seatbelt_runner_failure_rules,
-    windows_acl_runner_failure_rules, RunnerFailureMatch, LANDLOCK_LAUNCHER_BIN,
-    LANDLOCK_LAUNCHER_FAILURE_EXIT, WINDOWS_ACL_RUNNER_FAILURE_EXIT,
+    windows_acl_denial_signatures, windows_acl_runner_failure_rules, RunnerFailureMatch,
+    LANDLOCK_LAUNCHER_BIN, LANDLOCK_LAUNCHER_FAILURE_EXIT, WINDOWS_ACL_RUNNER_FAILURE_EXIT,
 };
 pub use escalation::{
     approve_escalation, escalation_audit_reason, escalation_hint_marker, sandbox_denial_marker,
