@@ -43,8 +43,10 @@ pub struct PipelineSpec {
     pub url: String,
     /// Extra exporter headers, forwarded verbatim.
     pub headers: Vec<(String, String)>,
-    /// Overall export deadline, including retries. Each attempt uses the remaining time as its socket timeout.
+    /// Per-attempt socket timeout (`exporter.timeoutMillis`).
     pub timeout: Duration,
+    /// Per-batch export deadline, including retries (`processor.exportTimeoutMillis`).
+    pub export_timeout: Duration,
     /// Whether the body is `gzip` compressed.
     pub gzip: bool,
     /// Batch timer.
@@ -69,6 +71,7 @@ impl OtlpPipeline {
         let url = spec.url;
         let headers = spec.headers;
         let timeout = spec.timeout;
+        let export_timeout = spec.export_timeout;
         let gzip = spec.gzip;
         let delay = spec.scheduled_delay;
         let max_batch = spec.max_export_batch_size;
@@ -84,6 +87,7 @@ impl OtlpPipeline {
                         url,
                         headers,
                         timeout,
+                        export_timeout,
                         gzip,
                         delay,
                         max_batch,
@@ -152,6 +156,7 @@ struct WorkerOpts {
     url: String,
     headers: Vec<(String, String)>,
     timeout: Duration,
+    export_timeout: Duration,
     gzip: bool,
     delay: Duration,
     max_batch: usize,
@@ -216,7 +221,14 @@ fn export_batch(
     let records: Vec<SessionTelemetryRecord> = batch.drain(..take).collect();
     let body = encode_resource_logs(&opts.resource, &opts.scope_version, &records);
     let payload = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
-    if let Err(error) = post_otlp(&opts.url, &opts.headers, &payload, opts.timeout, opts.gzip) {
+    if let Err(error) = post_otlp(
+        &opts.url,
+        &opts.headers,
+        &payload,
+        opts.timeout,
+        opts.export_timeout,
+        opts.gzip,
+    ) {
         eprintln!("session-telemetry-otel: export failed: {error}");
         *last_error.lock().expect("otel error") = Some(error);
     }
@@ -420,7 +432,8 @@ fn post_otlp(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
-    timeout: Duration,
+    attempt_timeout: Duration,
+    export_timeout: Duration,
     gzip: bool,
 ) -> std::result::Result<(), String> {
     let payload = if gzip {
@@ -436,16 +449,23 @@ fn post_otlp(
         request_headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
     }
     request_headers.extend(headers.iter().cloned());
-    post_otlp_with_retry(url, &request_headers, &payload, timeout)
+    post_otlp_with_retry(
+        url,
+        &request_headers,
+        &payload,
+        attempt_timeout,
+        export_timeout,
+    )
 }
 
 fn post_otlp_with_retry(
     url: &str,
     headers: &[(String, String)],
     payload: &[u8],
-    timeout: Duration,
+    attempt_timeout: Duration,
+    export_timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + export_timeout;
     let mut backoff = EXPORT_INITIAL_BACKOFF;
     let mut last_error = String::from("export timeout");
     for attempt in 0..EXPORT_MAX_ATTEMPTS {
@@ -453,7 +473,8 @@ fn post_otlp_with_retry(
         if remaining.is_zero() {
             return Err(last_error);
         }
-        match send_otlp(url, headers, payload, remaining) {
+        let attempt_budget = remaining.min(attempt_timeout);
+        match send_otlp(url, headers, payload, attempt_budget) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = error.message;

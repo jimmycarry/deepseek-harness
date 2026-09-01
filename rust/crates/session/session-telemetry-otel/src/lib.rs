@@ -2,7 +2,9 @@
 //! leave the process, and `ctx.sessionTelemetry.sharing` discloses `disabled`
 //! so `/feedback` can report the standing policy. `FULL` and `FEEDBACK_ONLY`
 //! construct an OTLP/HTTP JSON log pipeline. Transient collector failures
-//! (429/502/503/504 or a transport error) retry inside `exporter.timeoutMillis`.
+//! (429/502/503/504 or a transport error) retry inside
+//! `processor.exportTimeoutMillis`, with each HTTP attempt capped by
+//! `exporter.timeoutMillis`. A full queue drops the newest record.
 
 mod export;
 
@@ -28,6 +30,7 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT_MILLIS: f64 = 3_000.0;
 
 const MAX_TIMER_DELAY_MILLIS: f64 = 2_147_483_647.0;
 const DEFAULT_EXPORTER_TIMEOUT_MILLIS: u64 = 10_000;
+const DEFAULT_EXPORT_TIMEOUT_MILLIS: u64 = 30_000;
 const DEFAULT_SCHEDULED_DELAY_MILLIS: u64 = 5_000;
 const DEFAULT_MAX_EXPORT_BATCH_SIZE: usize = 512;
 const DEFAULT_MAX_QUEUE_SIZE: usize = 2_048;
@@ -75,8 +78,9 @@ fn sharing_status_for(mode: SessionTelemetryMode) -> SharingStatus {
 /// Provide `ctx.sessionTelemetry` and, outside `DISABLED`, the OTLP pipeline.
 ///
 /// # Errors
-/// Unknown mode, missing or illegal `exporter.url`, non-positive batch size,
-/// or an illegal `shutdownTimeoutMillis` in an uploading mode.
+/// Unknown mode, missing or illegal `exporter.url`, non-positive batch size
+/// or `exportTimeoutMillis`, or an illegal `shutdownTimeoutMillis` in an
+/// uploading mode.
 pub fn install(ctx: &Context, config: Option<&Value>) -> Result<()> {
     let mode = resolve_mode(config)?;
     match mode {
@@ -237,6 +241,17 @@ fn parse_pipeline_spec(config: &Value) -> Result<PipelineSpec> {
     }
     let exporter = config.get("exporter");
     let processor = config.get("processor");
+    let export_timeout_ms = match processor.and_then(|value| value.get("exportTimeoutMillis")) {
+        None => DEFAULT_EXPORT_TIMEOUT_MILLIS,
+        Some(value) => {
+            let Some(ms) = value.as_u64().filter(|ms| *ms >= 1) else {
+                return Err(CordisError::Validation(format!(
+                    "session-telemetry-otel: processor.exportTimeoutMillis must be a positive integer, got {value}"
+                )));
+            };
+            ms
+        }
+    };
     Ok(PipelineSpec {
         url: url.to_string(),
         headers: header_list(exporter),
@@ -246,6 +261,7 @@ fn parse_pipeline_spec(config: &Value) -> Result<PipelineSpec> {
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_EXPORTER_TIMEOUT_MILLIS),
         ),
+        export_timeout: Duration::from_millis(export_timeout_ms),
         gzip: exporter
             .and_then(|value| value.get("compression"))
             .and_then(Value::as_str)
@@ -1292,6 +1308,8 @@ mod tests {
 
     #[test]
     fn abandons_retry_when_retry_after_exceeds_remaining_timeout() {
+        // Retry-After is compared to the remaining batch deadline
+        // (`processor.exportTimeoutMillis`), not the per-attempt HTTP budget.
         pin_home();
         let collector = MockCollector::start_with(
             None,
@@ -1307,8 +1325,12 @@ mod tests {
             &ctx,
             Some(&json!({
                 "mode": "FULL",
-                "exporter": { "url": collector.url, "timeoutMillis": 80 },
-                "processor": { "scheduledDelayMillis": 60_000, "maxExportBatchSize": 8 },
+                "exporter": { "url": collector.url, "timeoutMillis": 10_000 },
+                "processor": {
+                    "scheduledDelayMillis": 60_000,
+                    "maxExportBatchSize": 8,
+                    "exportTimeoutMillis": 80,
+                },
                 "shutdownTimeoutMillis": 2_000,
             })),
         )
@@ -1326,6 +1348,84 @@ mod tests {
         let captures = snapshot(&collector);
         assert_eq!(captures.len(), 1);
         assert_eq!(captures[0].status, 503);
+    }
+
+    #[test]
+    fn bounds_a_held_export_at_export_timeout_millis() {
+        pin_home();
+        let gate = HoldGate::new();
+        let collector = MockCollector::start(Some(Arc::clone(&gate)));
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 60_000 },
+                "processor": { "scheduledDelayMillis": 10, "exportTimeoutMillis": 80 },
+                "shutdownTimeoutMillis": 4_000,
+            })),
+        )
+        .unwrap();
+        let session = ctx
+            .service::<SessionStore>()
+            .unwrap()
+            .create(session_id("export-timeout"));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        gate.wait_arrived();
+        let started = Instant::now();
+        ctx.dispose();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(collector.captures.lock().expect("captures").is_empty());
+        gate.open();
+    }
+
+    #[test]
+    fn drops_the_newest_record_when_the_queue_is_full() {
+        pin_home();
+        let gate = HoldGate::new();
+        let collector = MockCollector::start(Some(Arc::clone(&gate)));
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 2_000 },
+                "processor": {
+                    "scheduledDelayMillis": 10,
+                    "maxExportBatchSize": 1,
+                    "maxQueueSize": 1,
+                },
+            })),
+        )
+        .unwrap();
+        let telemetry = ctx.service::<SessionTelemetry>().unwrap();
+        let emit = |name: &str| {
+            telemetry.emit(SessionTelemetryRecord {
+                channel: dsh_session_telemetry::SessionTelemetryChannel::Ledger,
+                time: 1,
+                severity: dsh_session_telemetry::SessionTelemetrySeverity::Info,
+                attributes: {
+                    let mut map = Map::new();
+                    map.insert("event.type".into(), json!(name));
+                    map
+                },
+                body: Value::Null,
+            });
+        };
+        emit("first");
+        gate.wait_arrived();
+        emit("second");
+        emit("dropped");
+        gate.open();
+        ctx.dispose();
+        let types = event_types(&snapshot(&collector));
+        assert!(types.iter().any(|name| name == "first"));
+        assert!(types.iter().any(|name| name == "second"));
+        assert!(!types.iter().any(|name| name == "dropped"));
     }
 
     #[test]
@@ -1361,6 +1461,10 @@ mod tests {
             (
                 json!({ "mode": "FULL", "exporter": { "url": "http://c/v1/logs" }, "shutdownTimeoutMillis": 0 }),
                 "shutdownTimeoutMillis",
+            ),
+            (
+                json!({ "mode": "FULL", "exporter": { "url": "http://c/v1/logs" }, "processor": { "exportTimeoutMillis": 0 } }),
+                "exportTimeoutMillis",
             ),
         ];
         for (config, message) in cases {
