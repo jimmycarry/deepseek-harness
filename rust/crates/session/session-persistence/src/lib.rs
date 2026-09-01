@@ -2,11 +2,19 @@
 //!
 //! [`PersistenceRuntime::inspect`] is the read-only logical view: validated
 //! header and events, in-memory crash-repair closers, no durable rewrite, and
-//! no Session publication. [`PersistenceRuntime::load`] reconstructs a Session
-//! for resume and other publishable paths.
-//! [`PersistenceRuntime::list_snapshots`] and
-//! [`PersistenceRuntime::read_stored_revision`] expose a backend-owned
-//! revision token without the prepared-session LRU or freshness retry.
+//! no Session publication. Concurrent inspects of the same id share one
+//! backend read; a ready LRU of [`DEFAULT_PREPARED_SESSION_CACHE_SIZE`]
+//! reuses unpublished views; a changed [`SessionPersistenceRevision`]
+//! discards the ready entry and reloads. [`PersistenceRuntime::load`]
+//! reconstructs a Session for resume and other publishable paths and does
+//! not publish from that LRU. [`PersistenceRuntime::list_snapshots`] and
+//! [`PersistenceRuntime::read_stored_revision`] read the backend directly.
+
+mod preparations;
+
+pub use preparations::{
+    DiscardReady, PreparedSessionSource, SessionPreparations, DEFAULT_PREPARED_SESSION_CACHE_SIZE,
+};
 
 use async_trait::async_trait;
 use dsh_brand::Branded;
@@ -150,17 +158,35 @@ pub trait SessionStoreBackend: Send + Sync {
 /// `ctx.sessionPersistence`.
 pub struct PersistenceRuntime {
     backend: Arc<dyn SessionStoreBackend>,
+    preparations: SessionPreparations,
 }
 
 impl PersistenceRuntime {
-    /// Wrap a backend.
+    /// Wrap a backend with the TypeScript default prepared-session LRU.
     pub fn new(backend: Arc<dyn SessionStoreBackend>) -> Self {
-        Self { backend }
+        Self::with_prepared_session_cache_size(backend, DEFAULT_PREPARED_SESSION_CACHE_SIZE)
+            .expect("default preparedSessionCacheSize is valid")
     }
 
-    /// Persist the current log.
+    /// Wrap a backend with an explicit ready-entry LRU capacity.
+    ///
+    /// # Errors
+    /// `preparedSessionCacheSize` must be a positive integer.
+    pub fn with_prepared_session_cache_size(
+        backend: Arc<dyn SessionStoreBackend>,
+        prepared_session_cache_size: usize,
+    ) -> Result<Self, PersistenceError> {
+        Ok(Self {
+            backend,
+            preparations: SessionPreparations::new(prepared_session_cache_size)?,
+        })
+    }
+
+    /// Persist the current log and drop any cached inspection for that id.
     pub async fn save(&self, session: &Session) -> Result<(), PersistenceError> {
-        self.backend.save(session).await
+        self.backend.save(session).await?;
+        self.preparations.invalidate(session.id());
+        Ok(())
     }
 
     /// Reconstruct a session from durable storage.
@@ -169,8 +195,52 @@ impl PersistenceRuntime {
     }
 
     /// Read-only logical view. Does not commit crash recovery or publish a Session.
+    ///
+    /// Shares an in-flight backend inspect for the same id, reuses a ready
+    /// LRU entry when [`Self::read_stored_revision`] still matches, and
+    /// reloads after a stale ready discard. A reserved hold keeps the cached
+    /// view when the durable revision moves.
     pub async fn inspect(&self, id: &SessionId) -> Result<SessionInspection, PersistenceError> {
-        self.backend.inspect(id).await
+        loop {
+            let source = self
+                .preparations
+                .inspect(id, || self.prepare_core(id))
+                .await?;
+            if self.is_prepared_source_current(&source).await? {
+                return Ok(source.inspection.clone());
+            }
+            if self.preparations.discard_ready(id, &source) == DiscardReady::Retained {
+                return Ok(source.inspection.clone());
+            }
+        }
+    }
+
+    async fn prepare_core(
+        &self,
+        id: &SessionId,
+    ) -> Result<PreparedSessionSource, PersistenceError> {
+        let inspection = self.backend.inspect(id).await?;
+        let revision = self.backend.read_stored_revision(id).await?;
+        Ok(PreparedSessionSource {
+            inspection,
+            revision,
+        })
+    }
+
+    async fn is_prepared_source_current(
+        &self,
+        source: &PreparedSessionSource,
+    ) -> Result<bool, PersistenceError> {
+        Ok(self
+            .backend
+            .read_stored_revision(&source.inspection.meta.id)
+            .await?
+            == source.revision)
+    }
+
+    /// Hold a ready inspection so a later stale inspect borrows it.
+    pub(crate) fn hold_prepared(&self, id: &SessionId) -> bool {
+        self.preparations.hold(id)
     }
 
     /// Session ids currently stored by the backend.
@@ -260,5 +330,220 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    struct CountingBackend {
+        inspects: std::sync::atomic::AtomicUsize,
+        store: std::sync::Mutex<std::collections::HashMap<String, (SessionInspection, String)>>,
+        gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                inspects: std::sync::atomic::AtomicUsize::new(0),
+                store: std::sync::Mutex::new(std::collections::HashMap::new()),
+                gate: None,
+            }
+        }
+
+        fn put(&self, id: &str, revision: &str) {
+            let session = Session::new(session_id(id));
+            self.store.lock().unwrap().insert(
+                id.to_string(),
+                (
+                    SessionInspection {
+                        meta: session.header().clone(),
+                        events: Vec::new(),
+                    },
+                    revision.to_string(),
+                ),
+            );
+        }
+
+        fn set_revision(&self, id: &str, revision: &str) {
+            self.store.lock().unwrap().get_mut(id).expect("session").1 = revision.to_string();
+        }
+    }
+
+    #[async_trait]
+    impl SessionStoreBackend for CountingBackend {
+        async fn save(&self, session: &Session) -> Result<(), PersistenceError> {
+            let mut store = self.store.lock().unwrap();
+            let revision = store
+                .get(session.id().as_str())
+                .map(|(_, revision)| format!("{revision}-saved"))
+                .unwrap_or_else(|| "saved".into());
+            store.insert(
+                session.id().as_str().to_string(),
+                (
+                    SessionInspection {
+                        meta: session.header().clone(),
+                        events: session.events(),
+                    },
+                    revision,
+                ),
+            );
+            Ok(())
+        }
+
+        async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
+            self.inspect(id).await?.into_session()
+        }
+
+        async fn inspect(&self, id: &SessionId) -> Result<SessionInspection, PersistenceError> {
+            self.inspects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(release) = &self.gate {
+                release.notified().await;
+            }
+            self.store
+                .lock()
+                .unwrap()
+                .get(id.as_str())
+                .map(|(inspection, _)| inspection.clone())
+                .ok_or_else(|| PersistenceError::NotFound(id.as_str().to_string()))
+        }
+
+        async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
+            Ok(self.store.lock().unwrap().keys().map(session_id).collect())
+        }
+
+        async fn read_stored_revision(
+            &self,
+            id: &SessionId,
+        ) -> Result<Option<SessionPersistenceRevision>, PersistenceError> {
+            Ok(self
+                .store
+                .lock()
+                .unwrap()
+                .get(id.as_str())
+                .map(|(_, revision)| session_persistence_revision(revision.clone())))
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_prepared_session_cache_size() {
+        let err = match PersistenceRuntime::with_prepared_session_cache_size(Arc::new(Stub), 0) {
+            Ok(_) => panic!("expected invalid preparedSessionCacheSize"),
+            Err(error) => error,
+        };
+        assert!(err
+            .to_string()
+            .contains("preparedSessionCacheSize must be a positive safe integer"));
+    }
+
+    #[tokio::test]
+    async fn shares_in_flight_inspects_for_the_same_id() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(CountingBackend {
+            inspects: std::sync::atomic::AtomicUsize::new(0),
+            store: std::sync::Mutex::new(std::collections::HashMap::new()),
+            gate: Some(Arc::clone(&release)),
+        });
+        backend.put("shared", "r1");
+        let runtime = Arc::new(PersistenceRuntime::new(
+            Arc::clone(&backend) as Arc<dyn SessionStoreBackend>
+        ));
+        let a = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.inspect(&session_id("shared")).await })
+        };
+        while backend.inspects.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let b = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.inspect(&session_id("shared")).await })
+        };
+        tokio::task::yield_now().await;
+        release.notify_waiters();
+        let left = a.await.unwrap().unwrap();
+        let right = b.await.unwrap().unwrap();
+        assert_eq!(left.meta.id.as_str(), "shared");
+        assert_eq!(right.meta.id.as_str(), "shared");
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reloads_a_cached_inspection_after_the_durable_revision_changes() {
+        let backend = Arc::new(CountingBackend::new());
+        backend.put("fresh", "r1");
+        let runtime = PersistenceRuntime::new(Arc::clone(&backend) as Arc<dyn SessionStoreBackend>);
+        runtime.inspect(&session_id("fresh")).await.unwrap();
+        runtime.inspect(&session_id("fresh")).await.unwrap();
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        backend.set_revision("fresh", "r2");
+        runtime.inspect(&session_id("fresh")).await.unwrap();
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn evicts_only_ready_preparations_by_lru_capacity() {
+        let backend = Arc::new(CountingBackend::new());
+        backend.put("a", "1");
+        backend.put("b", "1");
+        let runtime = PersistenceRuntime::with_prepared_session_cache_size(
+            Arc::clone(&backend) as Arc<dyn SessionStoreBackend>,
+            1,
+        )
+        .unwrap();
+        runtime.inspect(&session_id("a")).await.unwrap();
+        runtime.inspect(&session_id("b")).await.unwrap();
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        runtime.inspect(&session_id("b")).await.unwrap();
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        runtime.inspect(&session_id("a")).await.unwrap();
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn save_invalidates_a_ready_inspection() {
+        let backend = Arc::new(CountingBackend::new());
+        backend.put("saved", "r1");
+        let runtime = PersistenceRuntime::new(Arc::clone(&backend) as Arc<dyn SessionStoreBackend>);
+        runtime.inspect(&session_id("saved")).await.unwrap();
+        runtime
+            .save(&Session::new(session_id("saved")))
+            .await
+            .unwrap();
+        runtime.inspect(&session_id("saved")).await.unwrap();
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_a_reserved_preparation_when_inspection_observes_a_newer_revision() {
+        let backend = Arc::new(CountingBackend::new());
+        backend.put("held", "r1");
+        let runtime = PersistenceRuntime::new(Arc::clone(&backend) as Arc<dyn SessionStoreBackend>);
+        runtime.inspect(&session_id("held")).await.unwrap();
+        assert!(runtime.hold_prepared(&session_id("held")));
+        backend.set_revision("held", "r2");
+        runtime.inspect(&session_id("held")).await.unwrap();
+        assert_eq!(
+            backend.inspects.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

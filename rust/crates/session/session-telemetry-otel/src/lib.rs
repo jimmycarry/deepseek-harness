@@ -4,7 +4,10 @@
 //! construct an OTLP/HTTP JSON log pipeline. Transient collector failures
 //! (429/502/503/504 or a transport error) retry inside
 //! `processor.exportTimeoutMillis`, with each HTTP attempt capped by
-//! `exporter.timeoutMillis`. A full queue drops the newest record.
+//! `exporter.timeoutMillis`. `exporter.keepAlive` defaults to true and
+//! reuses one HTTP/1.1 socket per worker; HTTPS still uses one-shot `curl`
+//! and honors `Retry-After` from the dumped response headers. A full queue
+//! drops the newest record.
 //! The seam `flush` hint stays unimplemented: forwarding it would be a
 //! second flusher against the batch worker, and the TypeScript backend
 //! refuses that path because concurrent `forceFlush` can drop tail records.
@@ -256,6 +259,15 @@ fn parse_pipeline_spec(config: &Value) -> Result<PipelineSpec> {
             ms
         }
     };
+    let keep_alive = match exporter.and_then(|value| value.get("keepAlive")) {
+        None => true,
+        Some(Value::Bool(flag)) => *flag,
+        Some(value) => {
+            return Err(CordisError::Validation(format!(
+                "session-telemetry-otel: exporter.keepAlive must be a boolean, got {value}"
+            )));
+        }
+    };
     Ok(PipelineSpec {
         url: url.to_string(),
         headers: header_list(exporter),
@@ -285,6 +297,7 @@ fn parse_pipeline_spec(config: &Value) -> Result<PipelineSpec> {
             .and_then(positive_usize)
             .unwrap_or(DEFAULT_MAX_QUEUE_SIZE),
         shutdown_timeout: Duration::from_secs_f64(shutdown_ms / 1_000.0),
+        keep_alive,
     })
 }
 
@@ -343,7 +356,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct Capture {
         headers: HashMap<String, String>,
@@ -402,6 +415,7 @@ mod tests {
     struct MockCollector {
         url: String,
         captures: Arc<Mutex<Vec<Capture>>>,
+        accepts: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
         addr: std::net::SocketAddr,
         thread: Option<thread::JoinHandle<()>>,
@@ -413,13 +427,27 @@ mod tests {
         }
 
         fn start_with(hold: Option<Arc<HoldGate>>, reply: Option<ReplyScript>) -> Self {
+            Self::start_configured(hold, reply, false)
+        }
+
+        fn start_reusing(reply: Option<ReplyScript>) -> Self {
+            Self::start_configured(None, reply, true)
+        }
+
+        fn start_configured(
+            hold: Option<Arc<HoldGate>>,
+            reply: Option<ReplyScript>,
+            reuse: bool,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("collector bind");
             listener.set_nonblocking(false).expect("collector blocking");
             let addr = listener.local_addr().expect("collector addr");
             let url = format!("http://127.0.0.1:{}/v1/logs", addr.port());
             let captures = Arc::new(Mutex::new(Vec::new()));
+            let accepts = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
             let thread_captures = Arc::clone(&captures);
+            let thread_accepts = Arc::clone(&accepts);
             let thread_stop = Arc::clone(&stop);
             let index = Arc::new(AtomicUsize::new(0));
             let thread = thread::spawn(move || {
@@ -429,8 +457,12 @@ mod tests {
                 while !thread_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                            if let Ok((headers, raw)) = read_http_request(&mut stream) {
+                            thread_accepts.fetch_add(1, Ordering::SeqCst);
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                            loop {
+                                let Ok((headers, raw)) = read_http_request(&mut stream) else {
+                                    break;
+                                };
                                 let n = index.fetch_add(1, Ordering::SeqCst);
                                 if let Some(gate) = &hold {
                                     gate.hold_first(n);
@@ -447,7 +479,11 @@ mod tests {
                                     body,
                                     status,
                                 });
-                                let _ = stream.write_all(&collector_reply(status, retry_after));
+                                let _ =
+                                    stream.write_all(&collector_reply(status, retry_after, reuse));
+                                if !reuse {
+                                    break;
+                                }
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -460,6 +496,7 @@ mod tests {
             Self {
                 url,
                 captures,
+                accepts,
                 stop,
                 addr,
                 thread: Some(thread),
@@ -467,7 +504,7 @@ mod tests {
         }
     }
 
-    fn collector_reply(status: u16, retry_after: Option<&str>) -> Vec<u8> {
+    fn collector_reply(status: u16, retry_after: Option<&str>, keep_alive: bool) -> Vec<u8> {
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
@@ -482,9 +519,10 @@ mod tests {
         if let Some(retry_after) = retry_after {
             response.push_str(&format!("Retry-After: {retry_after}\r\n"));
         }
-        response.push_str(
-            "Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-        );
+        let connection = if keep_alive { "keep-alive" } else { "close" };
+        response.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\n{{}}"
+        ));
         response.into_bytes()
     }
 
@@ -1463,6 +1501,252 @@ mod tests {
         assert!(!types.iter().any(|name| name == "dropped"));
     }
 
+    fn emit_turn(ctx: &Context, id: &str) {
+        let session = ctx
+            .service::<SessionStore>()
+            .unwrap()
+            .create(session_id(id));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn reuses_an_http_socket_when_keepalive_is_enabled() {
+        pin_home();
+        let collector = MockCollector::start_reusing(None);
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 2_000, "keepAlive": true },
+                "processor": {
+                    "scheduledDelayMillis": 60_000,
+                    "maxExportBatchSize": 1,
+                },
+            })),
+        )
+        .unwrap();
+        emit_turn(&ctx, "ka-1");
+        emit_turn(&ctx, "ka-2");
+        ctx.dispose();
+        let captures = snapshot(&collector);
+        assert_eq!(captures.len(), 2);
+        assert_eq!(collector.accepts.load(Ordering::SeqCst), 1);
+        assert!(captures.iter().all(|capture| capture.status == 200));
+    }
+
+    #[test]
+    fn opens_a_new_http_socket_when_keepalive_is_disabled() {
+        pin_home();
+        let collector = MockCollector::start_reusing(None);
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 2_000, "keepAlive": false },
+                "processor": {
+                    "scheduledDelayMillis": 60_000,
+                    "maxExportBatchSize": 1,
+                },
+            })),
+        )
+        .unwrap();
+        emit_turn(&ctx, "close-1");
+        emit_turn(&ctx, "close-2");
+        ctx.dispose();
+        let captures = snapshot(&collector);
+        assert_eq!(captures.len(), 2);
+        assert_eq!(collector.accepts.load(Ordering::SeqCst), 2);
+    }
+
+    struct HttpsRetryCollector {
+        url: String,
+        count_path: PathBuf,
+        child: std::process::Child,
+        previous_ca_bundle: Option<std::ffi::OsString>,
+        previous_ssl_cert: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for HttpsRetryCollector {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            match self.previous_ca_bundle.take() {
+                Some(value) => std::env::set_var("CURL_CA_BUNDLE", value),
+                None => std::env::remove_var("CURL_CA_BUNDLE"),
+            }
+            match self.previous_ssl_cert.take() {
+                Some(value) => std::env::set_var("SSL_CERT_FILE", value),
+                None => std::env::remove_var("SSL_CERT_FILE"),
+            }
+        }
+    }
+
+    impl HttpsRetryCollector {
+        fn request_count(&self) -> usize {
+            std::fs::read_to_string(&self.count_path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn honors_https_retry_after_from_curl_response_headers() {
+        pin_home();
+        let Some(collector) = start_https_retry_after_collector() else {
+            return;
+        };
+        let ctx = Context::new();
+        SessionStore::install(&ctx).unwrap();
+        install(
+            &ctx,
+            Some(&json!({
+                "mode": "FULL",
+                "exporter": { "url": collector.url, "timeoutMillis": 4_000, "keepAlive": true },
+                "processor": {
+                    "scheduledDelayMillis": 60_000,
+                    "maxExportBatchSize": 8,
+                },
+                "shutdownTimeoutMillis": 6_000,
+            })),
+        )
+        .unwrap();
+        emit_turn(&ctx, "https-retry");
+        ctx.dispose();
+        assert!(
+            collector.request_count() >= 2,
+            "HTTPS Retry-After: 0 should retry the 503"
+        );
+    }
+
+    fn start_https_retry_after_collector() -> Option<HttpsRetryCollector> {
+        let openssl = Command::new("openssl").arg("version").output().ok()?;
+        if !openssl.status.success() {
+            return None;
+        }
+        let node = Command::new("node").arg("-v").output().ok()?;
+        if !node.status.success() {
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-otel-https-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let port_path = dir.join("port");
+        let count_path = dir.join("count");
+        let generated = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key.to_str()?,
+                "-out",
+                cert.to_str()?,
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=127.0.0.1",
+            ])
+            .output()
+            .ok()?;
+        if !generated.status.success() {
+            return None;
+        }
+        let script = dir.join("server.js");
+        std::fs::write(
+            &script,
+            r#"
+const https = require('https');
+const fs = require('fs');
+let n = 0;
+const server = https.createServer({
+  key: fs.readFileSync(process.argv[1]),
+  cert: fs.readFileSync(process.argv[2]),
+}, (req, res) => {
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    n += 1;
+    fs.writeFileSync(process.argv[3], String(n));
+    if (n === 1) {
+      res.writeHead(503, {
+        'Retry-After': '0',
+        'Content-Type': 'application/json',
+        'Content-Length': 2,
+      });
+      res.end('{}');
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Length': 2,
+    });
+    res.end('{}');
+  });
+});
+server.listen(0, '127.0.0.1', () => {
+  fs.writeFileSync(process.argv[4], String(server.address().port));
+});
+"#,
+        )
+        .ok()?;
+        let child = Command::new("node")
+            .arg(&script)
+            .arg(&key)
+            .arg(&cert)
+            .arg(&count_path)
+            .arg(&port_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let started = Instant::now();
+        let mut port = String::new();
+        while started.elapsed() < Duration::from_secs(3) {
+            if let Ok(text) = std::fs::read_to_string(&port_path) {
+                if !text.trim().is_empty() {
+                    port = text.trim().to_string();
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if port.is_empty() {
+            return None;
+        }
+        Some(HttpsRetryCollector {
+            url: format!("https://127.0.0.1:{port}/v1/logs"),
+            count_path,
+            child,
+            previous_ca_bundle: {
+                let previous = std::env::var_os("CURL_CA_BUNDLE");
+                std::env::set_var("CURL_CA_BUNDLE", &cert);
+                previous
+            },
+            previous_ssl_cert: {
+                let previous = std::env::var_os("SSL_CERT_FILE");
+                std::env::set_var("SSL_CERT_FILE", &cert);
+                previous
+            },
+        })
+    }
+
     #[test]
     fn config_fails_loud() {
         pin_home();
@@ -1500,6 +1784,10 @@ mod tests {
             (
                 json!({ "mode": "FULL", "exporter": { "url": "http://c/v1/logs" }, "processor": { "exportTimeoutMillis": 0 } }),
                 "exportTimeoutMillis",
+            ),
+            (
+                json!({ "mode": "FULL", "exporter": { "url": "http://c/v1/logs", "keepAlive": "yes" } }),
+                "keepAlive",
             ),
         ];
         for (config, message) in cases {

@@ -9,3 +9,4 @@ description = "Local sandbox provider."
 [dependencies]
 dsh-cordis.workspace = true
 dsh-sandbox.workspace = true
+dsh-sandbox-windows-acl.workspace = true

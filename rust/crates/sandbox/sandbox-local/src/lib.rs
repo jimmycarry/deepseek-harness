@@ -2,9 +2,13 @@
 
 use dsh_cordis::Context;
 use dsh_sandbox::{
-    bwrap_runner_failure_rules, landlock_runner_failure_rules, ConfinedArgv, ProcessConfiner,
-    SandboxEnforcement, SandboxError, SandboxExecutionPolicy, SandboxMode, SandboxPolicy,
-    SandboxRuntime,
+    bwrap_runner_failure_rules, landlock_runner_failure_rules, windows_acl_denial_signatures,
+    windows_acl_runner_failure_rules, ConfinedArgv, ProcessConfiner, SandboxEnforcement,
+    SandboxError, SandboxExecutionPolicy, SandboxMode, SandboxPolicy, SandboxRuntime,
+};
+use dsh_sandbox_windows_acl::{
+    windows_acl_runner_argv, WindowsAclRunnerError, WindowsAclRunnerInvocation,
+    WindowsAclRunnerRequest,
 };
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -174,6 +178,26 @@ fn select_linux_runner() -> Option<LinuxRunner> {
             }
         })
         .clone()
+}
+
+/// Prefix `argv` with the TypeScript windows-acl Node runner.
+///
+/// Enforcement stays in that runner (`CreateRestrictedToken` via koffi).
+/// This helper only builds the seam `ConfinedArgv` (partial enforcement,
+/// the windows-acl denial dialect, exit 127 plus `windows-acl-run: `).
+///
+/// # Errors
+/// [`WindowsAclRunnerError`] when the request violates the runner argv contract.
+pub fn confine_windows_acl_node(
+    invocation: &WindowsAclRunnerInvocation,
+    request: &WindowsAclRunnerRequest,
+) -> Result<ConfinedArgv, WindowsAclRunnerError> {
+    Ok(ConfinedArgv {
+        argv: windows_acl_runner_argv(invocation, request)?,
+        enforcement: SandboxEnforcement::Partial,
+        denial_signatures: windows_acl_denial_signatures(),
+        runner_failure_rules: windows_acl_runner_failure_rules(),
+    })
 }
 
 /// Linux process confiner: bwrap, then landlock-run, else fail closed.
@@ -374,6 +398,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn windows_acl_node_delegation_is_partial_with_the_typescript_dialect() {
+        let workspace = r"C:\Users\agent\repo";
+        let temp = r"C:\Users\agent\AppData\Local\Temp\dsh-abc123";
+        let confined = confine_windows_acl_node(
+            &dsh_sandbox_windows_acl::WindowsAclRunnerInvocation {
+                node: std::path::PathBuf::from("node"),
+                entry: dsh_sandbox_windows_acl::WindowsAclRunnerEntry::BuiltJs(
+                    std::path::PathBuf::from("runner.js"),
+                ),
+            },
+            &dsh_sandbox_windows_acl::WindowsAclRunnerRequest {
+                workspace: workspace.into(),
+                temp: temp.into(),
+                mode: dsh_sandbox_windows_acl::WindowsAclRunnerMode::WorkspaceWrite,
+                write_sid: Some(dsh_sandbox_windows_acl::workspace_write_sid(workspace)),
+                temp_write_sid: Some(dsh_sandbox_windows_acl::temp_write_sid(temp)),
+                command: vec!["pwsh.exe".into(), "-Command".into(), "echo hi".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(confined.enforcement, SandboxEnforcement::Partial);
+        assert_eq!(
+            confined.denial_signatures,
+            dsh_sandbox::windows_acl_denial_signatures()
+        );
+        assert_eq!(
+            confined.runner_failure_rules,
+            dsh_sandbox::windows_acl_runner_failure_rules()
+        );
+        assert_eq!(confined.argv[0], "node");
+        assert_eq!(confined.argv[1], "runner.js");
+        assert!(confined
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--mode", "workspace-write"]));
+        assert_eq!(confined.argv.last().map(String::as_str), Some("echo hi"));
     }
 
     #[test]

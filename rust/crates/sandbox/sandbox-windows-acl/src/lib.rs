@@ -1,10 +1,21 @@
-//! Portable Windows ACL identities and path-boundary checks.
+//! Portable Windows ACL identities, path-boundary checks, and Node runner
+//! delegation.
 //!
 //! [`workspace_write_sid`] and [`temp_write_sid`] are byte-identical to the
 //! TypeScript helpers. [`assert_temp_root_outside_workspace`] and
 //! [`assert_private_temp_disjoint`] keep the standing workspace capability
-//! off the private temp tree. The Win32 restricted-token runner, grant
-//! lifecycle, and koffi FFI are not mounted.
+//! off the private temp tree. Windows confinement prefixes the existing
+//! TypeScript Node runner; this crate does not call `CreateRestrictedToken`,
+//! mutate DACLs, or load koffi. Wine and Linux cannot prove NTFS/DACL.
+
+mod runner;
+
+pub use runner::{
+    parse_windows_acl_runner_args, resolve_windows_acl_runner_entry, windows_acl_runner_argv,
+    windows_acl_runner_flags, windows_acl_runner_prefix, WindowsAclRunnerEntry,
+    WindowsAclRunnerError, WindowsAclRunnerInvocation, WindowsAclRunnerMode,
+    WindowsAclRunnerRequest, RUNNER_FAILURE_EXIT, RUNNER_SIGNATURE,
+};
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

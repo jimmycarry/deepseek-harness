@@ -12,6 +12,4 @@ dsh-brand.workspace = true
 dsh-cordis.workspace = true
 dsh-session.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true

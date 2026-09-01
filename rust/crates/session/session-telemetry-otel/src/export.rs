@@ -57,6 +57,10 @@ pub struct PipelineSpec {
     pub max_queue_size: usize,
     /// Outer bound for [`OtlpPipeline::shutdown`].
     pub shutdown_timeout: Duration,
+    /// SDK `exporter.keepAlive` (default true). HTTP/1.1 reuses one socket
+    /// per worker when the collector also keeps the connection. HTTPS still
+    /// uses one-shot `curl`; `false` passes `--no-keepalive`.
+    pub keep_alive: bool,
 }
 
 impl OtlpPipeline {
@@ -75,6 +79,7 @@ impl OtlpPipeline {
         let gzip = spec.gzip;
         let delay = spec.scheduled_delay;
         let max_batch = spec.max_export_batch_size;
+        let keep_alive = spec.keep_alive;
         let worker_done = Arc::clone(&done);
         let worker_error = Arc::clone(&last_error);
         let worker_queued = Arc::clone(&queued);
@@ -91,6 +96,7 @@ impl OtlpPipeline {
                         gzip,
                         delay,
                         max_batch,
+                        keep_alive,
                         resource,
                         scope_version,
                     },
@@ -160,6 +166,7 @@ struct WorkerOpts {
     gzip: bool,
     delay: Duration,
     max_batch: usize,
+    keep_alive: bool,
     resource: Vec<Value>,
     scope_version: String,
 }
@@ -172,13 +179,17 @@ fn worker_loop(
     queued: Arc<AtomicUsize>,
 ) {
     let mut batch: Vec<SessionTelemetryRecord> = Vec::new();
+    let mut transport = ExportTransport {
+        keep_alive: opts.keep_alive,
+        http: None,
+    };
     loop {
         match rx.recv_timeout(opts.delay) {
             Ok(Msg::Record(record)) => {
                 queued.fetch_sub(1, Ordering::SeqCst);
                 batch.push(record);
                 if batch.len() >= opts.max_batch {
-                    export_batch(&opts, &mut batch, &last_error);
+                    export_batch(&opts, &mut batch, &last_error, &mut transport);
                 }
             }
             Ok(Msg::Shutdown) => {
@@ -189,18 +200,18 @@ fn worker_loop(
                     }
                 }
                 while !batch.is_empty() {
-                    export_batch(&opts, &mut batch, &last_error);
+                    export_batch(&opts, &mut batch, &last_error, &mut transport);
                 }
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !batch.is_empty() {
-                    export_batch(&opts, &mut batch, &last_error);
+                    export_batch(&opts, &mut batch, &last_error, &mut transport);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 if !batch.is_empty() {
-                    export_batch(&opts, &mut batch, &last_error);
+                    export_batch(&opts, &mut batch, &last_error, &mut transport);
                 }
                 break;
             }
@@ -213,6 +224,7 @@ fn export_batch(
     opts: &WorkerOpts,
     batch: &mut Vec<SessionTelemetryRecord>,
     last_error: &Mutex<Option<String>>,
+    transport: &mut ExportTransport,
 ) {
     if batch.is_empty() {
         return;
@@ -228,6 +240,7 @@ fn export_batch(
         opts.timeout,
         opts.export_timeout,
         opts.gzip,
+        transport,
     ) {
         eprintln!("session-telemetry-otel: export failed: {error}");
         *last_error.lock().expect("otel error") = Some(error);
@@ -435,6 +448,7 @@ fn post_otlp(
     attempt_timeout: Duration,
     export_timeout: Duration,
     gzip: bool,
+    transport: &mut ExportTransport,
 ) -> std::result::Result<(), String> {
     let payload = if gzip {
         gzip_bytes(body)?
@@ -455,6 +469,7 @@ fn post_otlp(
         &payload,
         attempt_timeout,
         export_timeout,
+        transport,
     )
 }
 
@@ -464,6 +479,7 @@ fn post_otlp_with_retry(
     payload: &[u8],
     attempt_timeout: Duration,
     export_timeout: Duration,
+    transport: &mut ExportTransport,
 ) -> std::result::Result<(), String> {
     let deadline = Instant::now() + export_timeout;
     let mut backoff = EXPORT_INITIAL_BACKOFF;
@@ -474,7 +490,7 @@ fn post_otlp_with_retry(
             return Err(last_error);
         }
         let attempt_budget = remaining.min(attempt_timeout);
-        match send_otlp(url, headers, payload, attempt_budget) {
+        match send_otlp(url, headers, payload, attempt_budget, transport) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = error.message;
@@ -499,14 +515,25 @@ fn send_otlp(
     headers: &[(String, String)],
     payload: &[u8],
     timeout: Duration,
+    transport: &mut ExportTransport,
 ) -> std::result::Result<(), ExportAttemptError> {
     if url.starts_with("https://") {
-        curl_post(url, headers, payload, timeout)
+        curl_post(url, headers, payload, timeout, transport.keep_alive)
     } else if url.starts_with("http://") {
-        http_post(url, headers, payload, timeout)
+        http_post(url, headers, payload, timeout, transport)
     } else {
         Err(ExportAttemptError::fatal(format!("unsupported url: {url}")))
     }
+}
+
+struct PooledHttp {
+    key: String,
+    stream: TcpStream,
+}
+
+struct ExportTransport {
+    keep_alive: bool,
+    http: Option<PooledHttp>,
 }
 
 fn gzip_bytes(body: &[u8]) -> std::result::Result<Vec<u8>, String> {
@@ -557,19 +584,16 @@ fn parse_http_url(url: &str) -> std::result::Result<ParsedHttpUrl, String> {
     Ok(ParsedHttpUrl { host, port, path })
 }
 
-fn http_post(
-    url: &str,
-    headers: &[(String, String)],
-    body: &[u8],
+fn connect_http(
+    parsed: &ParsedHttpUrl,
     timeout: Duration,
-) -> std::result::Result<(), ExportAttemptError> {
-    let parsed = parse_http_url(url).map_err(ExportAttemptError::fatal)?;
+) -> std::result::Result<TcpStream, ExportAttemptError> {
     let addr = (parsed.host.as_str(), parsed.port)
         .to_socket_addrs()
         .map_err(|error| ExportAttemptError::retryable(error.to_string()))?
         .next()
         .ok_or_else(|| ExportAttemptError::fatal(format!("unresolvable host: {}", parsed.host)))?;
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+    let stream = TcpStream::connect_timeout(&addr, timeout)
         .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
     stream
         .set_read_timeout(Some(timeout))
@@ -577,13 +601,24 @@ fn http_post(
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
+    Ok(stream)
+}
+
+fn write_http_request(
+    stream: &mut TcpStream,
+    parsed: &ParsedHttpUrl,
+    headers: &[(String, String)],
+    body: &[u8],
+    keep_alive: bool,
+) -> std::result::Result<(), ExportAttemptError> {
     let host_header = if parsed.port == 80 {
         parsed.host.clone()
     } else {
         format!("{}:{}", parsed.host, parsed.port)
     };
+    let connection = if keep_alive { "keep-alive" } else { "close" };
     let mut request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: {connection}\r\n",
         parsed.path, host_header
     );
     for (name, value) in headers {
@@ -595,28 +630,107 @@ fn http_post(
         .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
     stream
         .write_all(body)
-        .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
+        .map_err(|error| ExportAttemptError::retryable(error.to_string()))
+}
+
+fn read_http_response(
+    stream: &mut TcpStream,
+) -> std::result::Result<(u16, String, bool), ExportAttemptError> {
     let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
+    let mut byte = [0u8; 1];
+    loop {
+        stream
+            .read_exact(&mut byte)
+            .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
+        buf.push(byte[0]);
+        if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(ExportAttemptError::retryable("HTTP headers too large"));
+        }
+    }
     let text = String::from_utf8_lossy(&buf);
-    let status_line = text.lines().next().unwrap_or("");
+    let status_line = text.lines().next().unwrap_or("").to_string();
     if status_line.is_empty() {
         return Err(ExportAttemptError::retryable("empty HTTP response"));
     }
-    let Some(status) = parse_http_status_line(status_line) else {
+    let Some(status) = parse_http_status_line(&status_line) else {
         return Err(ExportAttemptError::retryable(format!(
             "OTLP collector rejected export: {status_line}"
         )));
     };
+    let mut connection_close = false;
+    let mut length = None;
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            length = value.trim().parse::<usize>().ok();
+        }
+        if name.eq_ignore_ascii_case("connection") && value.trim().eq_ignore_ascii_case("close") {
+            connection_close = true;
+        }
+    }
+    if let Some(length) = length {
+        let mut body = vec![0u8; length];
+        if length > 0 {
+            stream
+                .read_exact(&mut body)
+                .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
+        }
+    } else {
+        let mut rest = Vec::new();
+        stream
+            .read_to_end(&mut rest)
+            .map_err(|error| ExportAttemptError::retryable(error.to_string()))?;
+        connection_close = true;
+    }
+    Ok((status, text.into_owned(), connection_close))
+}
+
+fn http_post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    timeout: Duration,
+    transport: &mut ExportTransport,
+) -> std::result::Result<(), ExportAttemptError> {
+    let parsed = parse_http_url(url).map_err(ExportAttemptError::fatal)?;
+    let key = format!("{}:{}", parsed.host, parsed.port);
+    let mut reused = false;
+    let mut stream = if transport.keep_alive {
+        match transport.http.take() {
+            Some(pooled) if pooled.key == key => {
+                reused = true;
+                pooled.stream
+            }
+            _ => connect_http(&parsed, timeout)?,
+        }
+    } else {
+        connect_http(&parsed, timeout)?
+    };
+    match write_http_request(&mut stream, &parsed, headers, body, transport.keep_alive) {
+        Ok(()) => {}
+        Err(_) if reused => {
+            stream = connect_http(&parsed, timeout)?;
+            write_http_request(&mut stream, &parsed, headers, body, transport.keep_alive)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let (status, header_text, server_close) = read_http_response(&mut stream)?;
+    if transport.keep_alive && !server_close {
+        transport.http = Some(PooledHttp { key, stream });
+    }
     if (200..300).contains(&status) {
         return Ok(());
     }
+    let status_line = header_text.lines().next().unwrap_or("");
     Err(ExportAttemptError {
         message: format!("OTLP collector rejected export: {status_line}"),
         retryable: is_retryable_status(status),
-        retry_after: parse_retry_after_header(&text),
+        retry_after: parse_retry_after_header(&header_text),
     })
 }
 
@@ -625,6 +739,7 @@ fn curl_post(
     headers: &[(String, String)],
     body: &[u8],
     timeout: Duration,
+    keep_alive: bool,
 ) -> std::result::Result<(), ExportAttemptError> {
     let mut command = Command::new("curl");
     command
@@ -634,10 +749,15 @@ fn curl_post(
         .arg("POST")
         .arg("-m")
         .arg(format!("{:.3}", timeout.as_secs_f64()))
+        .arg("-D")
+        .arg("-")
         .arg("-o")
         .arg("/dev/null")
         .arg("-w")
-        .arg("%{http_code}");
+        .arg("\n%{http_code}");
+    if !keep_alive {
+        command.arg("--no-keepalive");
+    }
     for (name, value) in headers {
         command.arg("-H").arg(format!("{name}: {value}"));
     }
@@ -666,15 +786,23 @@ fn curl_post(
             String::from_utf8_lossy(&output.stderr).into_owned(),
         ));
     }
-    let code = String::from_utf8_lossy(&output.stdout);
-    let status = code.trim().parse::<u16>().ok();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (headers, code) = match stdout.rsplit_once('\n') {
+        Some((headers, code)) => (headers, code.trim()),
+        None => ("", stdout.trim()),
+    };
+    let status = code.parse::<u16>().ok();
     if status.is_some_and(|value| (200..300).contains(&value)) {
         return Ok(());
     }
     let retryable = status.is_some_and(is_retryable_status);
     let error = format!("OTLP collector rejected export: HTTP {code}");
     if retryable {
-        Err(ExportAttemptError::retryable(error))
+        Err(ExportAttemptError {
+            message: error,
+            retryable: true,
+            retry_after: parse_retry_after_header(headers),
+        })
     } else {
         Err(ExportAttemptError::fatal(error))
     }
