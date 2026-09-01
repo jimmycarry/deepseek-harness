@@ -107,7 +107,7 @@ mod tests {
         assert_eq!(sid, "S-1-4-907248133-152761708");
         assert_eq!(sid, workspace_write_sid(r"C:\Users\agent\repo"));
         assert!(sid.starts_with("S-1-4-"));
-        assert_eq!(sid.chars().filter(|c| *c == '-').count(), 3);
+        assert_eq!(sid.chars().filter(|c| *c == '-').count(), 4);
     }
 
     #[test]
