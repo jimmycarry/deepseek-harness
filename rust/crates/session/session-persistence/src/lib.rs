@@ -67,7 +67,7 @@ pub fn session_persistence_revision(value: impl Into<String>) -> SessionPersiste
 }
 
 /// One stored session's header plus a cheap revision token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionPersistenceSnapshot {
     /// Detached metadata for one materialized session.
     pub header: SessionHeader,
