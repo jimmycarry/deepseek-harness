@@ -165,11 +165,10 @@ impl LlmAdapter for UnsetAdapter {
         &self,
         _request: LlmRequest,
     ) -> std::result::Result<BoxStream<'static, StreamChunk>, LlmError> {
-        Err(LlmError::Failure(dsh_llm::LlmFailure {
-            message: "no LLM adapter is mounted".into(),
-            code: "MISSING_ADAPTER".into(),
-            status: None,
-        }))
+        Err(LlmError::Failure(dsh_llm::LlmFailure::new(
+            "no LLM adapter is mounted",
+            "MISSING_ADAPTER",
+        )))
     }
 }
 
@@ -875,11 +874,7 @@ fn catalog_for(adapter: &LiveDeepSeekAdapter) -> Result<(u32, Vec<dsh_llm_deepse
             if let Some(good) = adapter.last_good.lock().expect("llm-deepseek catalog").clone() {
                 Ok(good)
             } else {
-                Err(LlmError::Failure(dsh_llm::LlmFailure {
-                    message: error,
-                    code: "CONFIG".into(),
-                    status: None,
-                }))
+                Err(LlmError::Failure(dsh_llm::LlmFailure::new(error, "CONFIG")))
             }
         }
     }

@@ -2,7 +2,10 @@
 //!
 //! This executor has no Config; each provider owns `retryPolicy`. Scheduled
 //! retries are durable (`llm/retry`, then `llm/retry-started`) before the
-//! cancellable wait. Nothing about a retry is model-visible.
+//! cancellable wait. A valid positive `providerRetryAfterMs` at or below
+//! `maxDelayMs` replaces local backoff; an over-cap instruction makes
+//! `normal` delegate and `always` use local backoff. Nothing about a retry
+//! is model-visible.
 
 use dsh_agent::AgentRegistry;
 use dsh_cordis::Context;
@@ -107,13 +110,15 @@ fn recover(agents: &AgentRegistry, payload: Value, mut next: impl FnMut(Value) -
     let retry_id = previous
         .and_then(|(_, id)| (!id.is_empty()).then_some(id))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let delay_ms = policy.local_delay(retry as u32, 0.5);
     let failure = payload.get("failure").cloned().unwrap_or_else(|| {
         json!({
             "message": payload.get("message").and_then(Value::as_str).unwrap_or(""),
             "code": code,
         })
     });
+    let Some(delay_ms) = scheduled_delay_ms(&policy, &failure, retry as u32) else {
+        return next(payload);
+    };
     let mut event = json!({
         "retryId": retry_id,
         "turn": turn,
@@ -155,6 +160,29 @@ fn recover(agents: &AgentRegistry, payload: Value, mut next: impl FnMut(Value) -
     json!({ "kind": "retry" })
 }
 
+/// Local jittered delay, or a bounded provider `Retry-After`.
+///
+/// A valid positive `providerRetryAfterMs` at or below `maxDelayMs` replaces
+/// local backoff. An over-cap instruction makes `normal` delegate (`None`) and
+/// `always` use local backoff so the instruction cannot terminate retries.
+fn scheduled_delay_ms(policy: &RetryPolicy, failure: &Value, retry: u32) -> Option<u64> {
+    let provider = failure
+        .get("providerRetryAfterMs")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value as u64);
+    if let Some(ms) = provider {
+        if ms > policy.max_delay_ms {
+            if policy.mode == "normal" {
+                return None;
+            }
+            return Some(policy.local_delay(retry, 0.5));
+        }
+        return Some(ms);
+    }
+    Some(policy.local_delay(retry, 0.5))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +194,61 @@ mod tests {
             .unwrap();
         let error = install(&ctx, Some(&json!({"retryPolicy": {"mode": "normal"}}))).unwrap_err();
         assert!(error.to_string().contains("belongs under each provider"));
+    }
+
+    fn normal_policy() -> RetryPolicy {
+        RetryPolicy {
+            mode: "normal".into(),
+            max_retries: 5,
+            retryable_codes: vec!["RATE_LIMIT".into()],
+            initial_delay_ms: 500,
+            max_delay_ms: 10_000,
+            jitter_ratio: 0.0,
+        }
+    }
+
+    #[test]
+    fn uses_bounded_provider_retry_after_verbatim() {
+        let delay =
+            scheduled_delay_ms(&normal_policy(), &json!({"providerRetryAfterMs": 2_000}), 1);
+        assert_eq!(delay, Some(2_000));
+    }
+
+    #[test]
+    fn delegates_over_cap_provider_retry_after_in_normal_mode() {
+        let delay = scheduled_delay_ms(
+            &normal_policy(),
+            &json!({"providerRetryAfterMs": 10_001}),
+            1,
+        );
+        assert_eq!(delay, None);
+    }
+
+    #[test]
+    fn always_mode_uses_local_backoff_for_over_cap_retry_after() {
+        let policy = RetryPolicy {
+            mode: "always".into(),
+            initial_delay_ms: 2,
+            max_delay_ms: 4,
+            jitter_ratio: 0.0,
+            ..normal_policy()
+        };
+        let delay = scheduled_delay_ms(&policy, &json!({"providerRetryAfterMs": 10}), 1);
+        assert_eq!(delay, Some(policy.local_delay(1, 0.5)));
+    }
+
+    #[test]
+    fn missing_or_invalid_provider_delay_uses_local_backoff() {
+        let policy = normal_policy();
+        let local = policy.local_delay(1, 0.5);
+        assert_eq!(scheduled_delay_ms(&policy, &json!({}), 1), Some(local));
+        assert_eq!(
+            scheduled_delay_ms(&policy, &json!({"providerRetryAfterMs": 0}), 1),
+            Some(local)
+        );
+        assert_eq!(
+            scheduled_delay_ms(&policy, &json!({"providerRetryAfterMs": "25"}), 1),
+            Some(local)
+        );
     }
 }

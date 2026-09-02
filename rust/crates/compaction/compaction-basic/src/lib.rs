@@ -1261,11 +1261,10 @@ mod tests {
                 hook();
             }
             if self.fail {
-                return Err(LlmError::Failure(LlmFailure {
-                    message: "summarizer boom".into(),
-                    code: "SUMMARIZER".into(),
-                    status: None,
-                }));
+                return Err(LlmError::Failure(LlmFailure::new(
+                    "summarizer boom",
+                    "SUMMARIZER",
+                )));
             }
             Ok(Box::pin(stream::iter(StreamChunk::text_stream(
                 self.text.clone(),

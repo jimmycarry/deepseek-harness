@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use dsh_llm::{
     text_block, tool_block, ContentBlock, FinishReason, LlmAdapter, LlmError, LlmFailure,
-    LlmModelContext, LlmResolvedModelInfo, LlmRequest, RetryPolicy, StreamChunk,
+    LlmModelContext, LlmRequest, LlmResolvedModelInfo, RetryPolicy, StreamChunk,
 };
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,16 @@ pub struct ReplayFailure {
     /// HTTP status returned by the provider, when the script supplies one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Positive provider-requested delay in milliseconds, when the script supplies one.
+    #[serde(
+        default,
+        rename = "providerRetryAfterMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider_retry_after_ms: Option<u64>,
+    /// Opaque provider-issued request identifier, when the script supplies one.
+    #[serde(default, rename = "requestId", skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Scripted tool call.
@@ -57,7 +67,11 @@ pub struct ReplayModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Optional positive integer context capacity published by the adapter.
-    #[serde(default, rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "contextWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub context_window: Option<u32>,
 }
 
@@ -131,14 +145,16 @@ impl ReplayAdapter {
 
 #[async_trait]
 impl LlmAdapter for ReplayAdapter {
-    async fn stream(&self, request: LlmRequest) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
+    async fn stream(
+        &self,
+        request: LlmRequest,
+    ) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
         if let Some(purpose) = request.purpose.as_deref() {
             let Some(text) = self.auxiliary.get(purpose) else {
-                return Err(LlmError::Failure(dsh_llm::LlmFailure {
-                    message: format!("replay adapter has no auxiliary script for purpose {purpose}"),
-                    code: "REPLAY_NO_AUXILIARY".into(),
-                    status: None,
-                }));
+                return Err(LlmError::Failure(LlmFailure::new(
+                    format!("replay adapter has no auxiliary script for purpose {purpose}"),
+                    "REPLAY_NO_AUXILIARY",
+                )));
             };
             let mut chunks = text_block(0, text.clone());
             chunks.push(StreamChunk::Finish {
@@ -162,6 +178,8 @@ impl LlmAdapter for ReplayAdapter {
                 message: error.message,
                 code: error.code,
                 status: error.status,
+                provider_retry_after_ms: error.provider_retry_after_ms,
+                request_id: error.request_id,
             }));
         }
         let mut chunks = Vec::new();
@@ -286,6 +304,8 @@ mod tests {
                     message: "context overflow".into(),
                     code: "CONTEXT_WINDOW_EXCEEDED".into(),
                     status: None,
+                    provider_retry_after_ms: None,
+                    request_id: None,
                 }),
             },
             ReplayTurn {

@@ -1,5 +1,8 @@
 //! Provider-neutral message and streaming vocabulary plus `ctx.llm`.
 
+mod classify;
+mod retry_after;
+
 use async_trait::async_trait;
 use dsh_brand::Branded;
 use dsh_cordis::Service;
@@ -8,6 +11,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
+
+pub use classify::{
+    is_context_window_exceeded_error, is_quota_exceeded_error, CONTEXT_WINDOW_EXCEEDED_CODE,
+    EMPTY_RESPONSE_CODE, INVALID_CREDENTIAL_CODE, QUOTA_EXCEEDED_CODE,
+};
+pub use retry_after::{parse_retry_after, provider_retry_after_ms, RetryAfter};
 
 /// Brand token for a tool-call correlation id.
 pub struct CallIdBrand;
@@ -45,8 +54,31 @@ pub struct LlmFailure {
     /// Stable provider-neutral machine-routing code.
     pub code: String,
     /// HTTP status returned by the provider, when available.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Positive provider-requested delay in milliseconds, when valid.
+    #[serde(
+        default,
+        rename = "providerRetryAfterMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider_retry_after_ms: Option<u64>,
+    /// Opaque provider-issued request identifier for diagnostics.
+    #[serde(default, rename = "requestId", skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl LlmFailure {
+    /// Facts with a message and code and no optional provider fields.
+    pub fn new(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: code.into(),
+            status: None,
+            provider_retry_after_ms: None,
+            request_id: None,
+        }
+    }
 }
 
 /// Failures from the adapter seam.
@@ -60,20 +92,12 @@ pub enum LlmError {
 impl LlmError {
     /// Context-window overflow as reported by the provider.
     pub fn context_window_exceeded(message: impl Into<String>) -> Self {
-        Self::Failure(LlmFailure {
-            message: message.into(),
-            code: "CONTEXT_WINDOW_EXCEEDED".into(),
-            status: None,
-        })
+        Self::Failure(LlmFailure::new(message, CONTEXT_WINDOW_EXCEEDED_CODE))
     }
 
     /// Adapter-returned exact-model metadata that failed runtime validation.
     pub fn invalid_model_info(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Failure(LlmFailure {
-            message: message.into(),
-            code: code.into(),
-            status: None,
-        })
+        Self::Failure(LlmFailure::new(message, code))
     }
 }
 
@@ -1058,7 +1082,11 @@ impl RetryPolicy {
 const RETRY_POLICY_KEYS: &[&str] = &["mode", "maxRetries", "retryableCodes", "backoff"];
 const BACKOFF_KEYS: &[&str] = &["initialDelayMs", "maxDelayMs", "jitterRatio"];
 
-fn unknown_keys(value: &serde_json::Map<String, Value>, allowed: &[&str], path: &str) -> Result<(), String> {
+fn unknown_keys(
+    value: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), String> {
     for key in value.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(format!("{path}: unknown key \"{key}\""));
@@ -1092,9 +1120,9 @@ fn resolve_backoff(config: Option<&Value>, path: &str) -> Result<(u64, u64, f64)
     let jitter_ratio = match config.and_then(|value| value.get("jitterRatio")) {
         None => default_jitter_ratio(),
         Some(value) => {
-            let ratio = value.as_f64().ok_or_else(|| {
-                format!("{path}.jitterRatio must be between 0 and 1")
-            })?;
+            let ratio = value
+                .as_f64()
+                .ok_or_else(|| format!("{path}.jitterRatio must be between 0 and 1"))?;
             if !(0.0..=1.0).contains(&ratio) {
                 return Err(format!("{path}.jitterRatio must be between 0 and 1"));
             }
@@ -1188,7 +1216,11 @@ pub fn resolve_retry_policy(config: Option<&Value>, path: &str) -> Result<RetryP
                         }
                         codes.push(code.to_string());
                     }
-                    if codes.len() != codes.iter().collect::<std::collections::BTreeSet<_>>().len()
+                    if codes.len()
+                        != codes
+                            .iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len()
                     {
                         return Err(format!("{path}.retryableCodes must not contain duplicates"));
                     }
@@ -1705,7 +1737,10 @@ mod tests {
                 ..LlmResolvedModelInfo::identity("replay", "script")
             },
         }));
-        let info = runtime.resolve_model_info("replay", "script").await.unwrap();
+        let info = runtime
+            .resolve_model_info("replay", "script")
+            .await
+            .unwrap();
         assert_eq!(info.context.unwrap().context_window, 128_000);
     }
 
@@ -1714,7 +1749,10 @@ mod tests {
         let runtime = LlmRuntime::new(std::sync::Arc::new(InfoAdapter {
             info: LlmResolvedModelInfo::identity("other", "script"),
         }));
-        let err = runtime.resolve_model_info("replay", "script").await.unwrap_err();
+        let err = runtime
+            .resolve_model_info("replay", "script")
+            .await
+            .unwrap_err();
         match err {
             LlmError::Failure(failure) => assert_eq!(failure.code, "INVALID_MODEL_INFO"),
         }
@@ -1724,7 +1762,10 @@ mod tests {
                 ..LlmResolvedModelInfo::identity("replay", "script")
             },
         }));
-        let err = runtime.resolve_model_info("replay", "script").await.unwrap_err();
+        let err = runtime
+            .resolve_model_info("replay", "script")
+            .await
+            .unwrap_err();
         match err {
             LlmError::Failure(failure) => assert_eq!(failure.code, "INVALID_MODEL_CONTEXT"),
         }
@@ -1737,6 +1778,35 @@ mod tests {
         assert_eq!(
             APP_IDENTITY.url,
             "https://github.com/deepseek-ai/deepseek-harness"
+        );
+    }
+
+    #[test]
+    fn failure_wire_omits_optional_provider_fields() {
+        let bare = LlmFailure::new("busy", "RATE_LIMIT");
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            serde_json::json!({"message":"busy","code":"RATE_LIMIT"})
+        );
+        let legacy: LlmFailure =
+            serde_json::from_value(serde_json::json!({"message":"busy","code":"RATE_LIMIT"}))
+                .unwrap();
+        assert_eq!(legacy, bare);
+        let full = LlmFailure {
+            status: Some(429),
+            provider_retry_after_ms: Some(2_000),
+            request_id: Some("req-429".into()),
+            ..LlmFailure::new("slow down", "RATE_LIMIT")
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::json!({
+                "message":"slow down",
+                "code":"RATE_LIMIT",
+                "status":429,
+                "providerRetryAfterMs":2000,
+                "requestId":"req-429"
+            })
         );
     }
 }

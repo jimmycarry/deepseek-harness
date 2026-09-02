@@ -6,7 +6,8 @@
 //! `processor.exportTimeoutMillis`, with each HTTP attempt capped by
 //! `exporter.timeoutMillis`. `exporter.keepAlive` defaults to true and
 //! reuses one HTTP/1.1 socket per worker; HTTPS still uses one-shot `curl`
-//! and honors `Retry-After` from the dumped response headers. A full queue
+//! and honors `Retry-After` delay-seconds and HTTP-date from the dumped
+//! response headers. A full queue
 //! drops the newest record.
 //! The seam `flush` hint stays unimplemented: forwarding it would be a
 //! second flusher against the batch worker, and the TypeScript backend

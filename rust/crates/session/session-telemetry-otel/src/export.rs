@@ -1,6 +1,6 @@
 //! OTLP/HTTP JSON log pipeline: bounded queue, batch worker, retryable export, synchronous shutdown.
 
-use dsh_llm::APP_IDENTITY;
+use dsh_llm::{parse_retry_after, APP_IDENTITY};
 use dsh_session_telemetry::{
     SessionTelemetryChannel, SessionTelemetryRecord, SessionTelemetrySeverity, SessionTelemetrySink,
 };
@@ -293,7 +293,7 @@ fn parse_retry_after_header(response: &str) -> Option<Duration> {
 }
 
 fn parse_retry_after_value(value: &str) -> Option<Duration> {
-    value.parse::<u64>().ok().map(Duration::from_secs)
+    parse_retry_after(value).map(|parsed| parsed.wait_from(SystemTime::now()))
 }
 
 fn jitter_delay(backoff: Duration) -> Duration {
@@ -824,7 +824,7 @@ mod retry_classification_tests {
     }
 
     #[test]
-    fn honors_retry_after_delta_seconds_and_ignores_http_dates() {
+    fn honors_retry_after_delta_seconds_and_http_dates() {
         assert_eq!(
             parse_retry_after_header(
                 "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n\r\n{}"
@@ -835,12 +835,55 @@ mod retry_classification_tests {
             parse_retry_after_header("HTTP/1.1 429 Too Many Requests\r\nretry-after: 2\r\n\r\n{}"),
             Some(Duration::from_secs(2))
         );
+        // A past HTTP-date is a zero wait (immediate retry), not an ignored header.
         assert_eq!(
             parse_retry_after_header(
                 "HTTP/1.1 503 Service Unavailable\r\nRetry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n{}"
             ),
-            None
+            Some(Duration::ZERO)
         );
+        let when = SystemTime::now() + Duration::from_secs(3);
+        let header = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: {}\r\n\r\n{{}}",
+            format_imf_for_test(when)
+        );
+        let wait = parse_retry_after_header(&header).expect("future HTTP-date");
+        assert!(
+            wait >= Duration::from_secs(2) && wait <= Duration::from_secs(4),
+            "{wait:?}"
+        );
+    }
+
+    fn format_imf_for_test(when: SystemTime) -> String {
+        const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let days = (secs / 86_400) as i64;
+        let tod = secs % 86_400;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u32;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = y + i64::from(m <= 2);
+        let wday = days.rem_euclid(7) as usize;
+        format!(
+            "{}, {d:02} {} {year} {:02}:{:02}:{:02} GMT",
+            WEEKDAYS[wday],
+            MONTHS[(m - 1) as usize],
+            tod / 3_600,
+            (tod % 3_600) / 60,
+            tod % 60
+        )
     }
 
     #[test]
