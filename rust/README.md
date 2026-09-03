@@ -12,4 +12,4 @@ cargo run -p dsh -- --dump-config
 cargo run -p dsh -- --profile headless "reply with the word pong"
 ```
 
-See [docs/architecture.md](../docs/architecture.md) for the product map this port follows.
+See [docs/architecture.md](../docs/architecture.md) for the product map this port follows. Remaining-port priorities are in [docs/ts-rust-functional-gaps.md](docs/ts-rust-functional-gaps.md).

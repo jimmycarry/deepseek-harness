@@ -12,4 +12,4 @@ cargo run -p dsh -- --dump-config
 cargo run -p dsh -- --profile headless "reply with the word pong"
 ```
 
-产品地图见 [docs/architecture.zh.md](../docs/architecture.zh.md)。
+产品地图见 [docs/architecture.zh.md](../docs/architecture.zh.md)。剩余移植优先级见 [docs/ts-rust-functional-gaps.md](docs/ts-rust-functional-gaps.md)。
