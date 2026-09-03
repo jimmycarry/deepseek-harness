@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use dsh_cordis::{Context, Result};
 use dsh_session::{
     interrupted_turn_closers, refuse_unknown, session_event_from_value, session_id, Session,
-    SessionEvent, SessionEventData, SessionHeader, SessionId, TurnEndReason,
+    SessionEvent, SessionHeader, SessionId,
 };
 use dsh_session_persistence::{
     session_persistence_revision, PersistenceError, PersistenceRuntime, SessionInspection,
@@ -533,7 +533,7 @@ fn load_stored_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_session::session_id;
+    use dsh_session::{session_id, SessionEventData, TurnEndReason};
 
     fn tmp_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
