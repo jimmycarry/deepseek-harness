@@ -1,15 +1,19 @@
-//! JSONL persistence provider. Crash repair closes an open turn with `interrupted`.
+//! JSONL persistence provider. `append_events` writes new rows; torn last-line
+//! `commit_repair` truncates to the last complete newline. Crash repair closes
+//! an open turn with `interrupted`.
 
 use async_trait::async_trait;
 use dsh_atomic_write::{write_file_atomic, AtomicWriteError, WriteFileAtomicOptions};
 use dsh_cordis::Context;
 use dsh_session::{
-    now_ms, refuse_unknown, session_event_from_value, Session, SessionEvent, SessionEventData,
-    SessionHeader, SessionId, SessionStore, TurnEndReason, SESSION_FORMAT_VERSION,
+    interrupted_turn_closers, now_ms, refuse_unknown, session_event_from_value, Session,
+    SessionEvent, SessionEventData, SessionHeader, SessionId, SessionStore, TurnEndReason,
+    SESSION_FORMAT_VERSION,
 };
 use dsh_session_persistence::{
     session_persistence_revision, PersistenceError, PersistenceRuntime, SessionInspection,
     SessionLocation, SessionPersistenceRevision, SessionPersistenceSnapshot, SessionStoreBackend,
+    StoredSession,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -55,6 +59,10 @@ impl JsonlBackend {
 
 #[async_trait]
 impl SessionStoreBackend for JsonlBackend {
+    fn name(&self) -> &str {
+        "jsonl"
+    }
+
     async fn save(&self, session: &Session) -> Result<(), PersistenceError> {
         write_jsonl(self.path_for(session.id()), session).await
     }
@@ -112,6 +120,44 @@ impl SessionStoreBackend for JsonlBackend {
         }
         Ok(snapshots)
     }
+
+    async fn load_stored(&self, id: &SessionId) -> Result<Option<StoredSession>, PersistenceError> {
+        match load_stored_jsonl(self.path_for(id), id).await {
+            Ok(stored) => Ok(Some(stored)),
+            Err(PersistenceError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn append_events(
+        &self,
+        header: &SessionHeader,
+        events: &[SessionEvent],
+        materialized: bool,
+    ) -> Result<(), PersistenceError> {
+        let path = self.path_for(&header.id);
+        if materialized {
+            append_jsonl_events(&path, events).await
+        } else {
+            materialize_jsonl(&path, header, events).await
+        }
+    }
+
+    async fn commit_repair(
+        &self,
+        header: &SessionHeader,
+        torn_to: Option<u64>,
+        closers: &[SessionEvent],
+    ) -> Result<(), PersistenceError> {
+        let path = self.path_for(&header.id);
+        if let Some(offset) = torn_to {
+            truncate_jsonl(&path, offset).await?;
+        }
+        if !closers.is_empty() {
+            append_jsonl_events(&path, closers).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Provide [`PersistenceRuntime`] over a JSONL directory.
@@ -123,9 +169,35 @@ pub fn install(
     ctx: &Context,
     dir: impl AsRef<Path>,
 ) -> dsh_cordis::Result<Arc<PersistenceRuntime>> {
+    install_with_options(
+        ctx,
+        dir,
+        dsh_session_persistence::DEFAULT_PREPARED_SESSION_CACHE_SIZE,
+        dsh_session_persistence::DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
+    )
+}
+
+/// Provide [`PersistenceRuntime`] with explicit LRU and write-behind delay.
+///
+/// # Errors
+/// Invalid cache/delay, service provide, or write-path registration.
+pub fn install_with_options(
+    ctx: &Context,
+    dir: impl AsRef<Path>,
+    prepared_session_cache_size: usize,
+    write_batch_max_delay_ms: u64,
+) -> dsh_cordis::Result<Arc<PersistenceRuntime>> {
     let backend = Arc::new(JsonlBackend::new(dir.as_ref()));
-    let runtime = Arc::new(PersistenceRuntime::new(backend));
+    let runtime = Arc::new(
+        PersistenceRuntime::with_options(
+            backend,
+            prepared_session_cache_size,
+            write_batch_max_delay_ms,
+        )
+        .map_err(|error| dsh_cordis::CordisError::plugin(error.to_string()))?,
+    );
     ctx.provide(Arc::clone(&runtime))?;
+    runtime.install_write_path(ctx)?;
     let drain_dir = dir.as_ref().to_path_buf();
     let lookup = ctx.clone();
     ctx.effect("jsonl persistence drain", move || {
@@ -279,27 +351,53 @@ pub async fn read_jsonl(
     inspect_jsonl(path, id).await?.into_session()
 }
 
-/// Read-only logical view. An interrupted trailing turn receives an
-/// in-memory closer; the file is not rewritten.
-pub async fn inspect_jsonl(
+/// Committed prefix plus an optional byte-offset torn tail. No closers.
+pub async fn load_stored_jsonl(
     path: impl AsRef<Path>,
     id: &SessionId,
-) -> Result<SessionInspection, PersistenceError> {
-    let body = match fs::read_to_string(&path).await {
-        Ok(body) => body,
+) -> Result<StoredSession, PersistenceError> {
+    let bytes = match fs::read(&path).await {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(PersistenceError::NotFound(id.as_str().to_string()));
         }
         Err(error) => return Err(error.into()),
     };
-    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    let header_text = lines
+    parse_stored_jsonl(&bytes, id)
+}
+
+fn parse_stored_jsonl(bytes: &[u8], id: &SessionId) -> Result<StoredSession, PersistenceError> {
+    let last_nl = bytes.iter().rposition(|byte| *byte == b'\n');
+    let (complete, remainder, remainder_offset) = match last_nl {
+        None => (&[][..], bytes, 0u64),
+        Some(index) => (&bytes[..index], &bytes[index + 1..], (index + 1) as u64),
+    };
+    let mut torn_to = None;
+    let mut lines: Vec<&[u8]> = complete.split(|byte| *byte == b'\n').collect();
+    if !remainder.is_empty() {
+        match std::str::from_utf8(remainder)
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        {
+            Some(_) => lines.push(remainder),
+            None => torn_to = Some(remainder_offset),
+        }
+    }
+    let mut records = lines
+        .into_iter()
+        .filter(|line| !line.is_empty() && !line.iter().all(|byte| byte.is_ascii_whitespace()));
+    let header_text = records
         .next()
         .ok_or_else(|| PersistenceError::Format("missing session header line".into()))?;
-    let header = parse_header_line(header_text, id)?;
+    let header_str = std::str::from_utf8(header_text)
+        .map_err(|error| PersistenceError::Format(error.to_string()))?;
+    let header = parse_header_line(header_str, id)?;
     let mut events: Vec<SessionEvent> = Vec::new();
-    for line in lines {
-        let value: Value = serde_json::from_str(line)
+    for line in records {
+        let text = std::str::from_utf8(line)
+            .map_err(|error| PersistenceError::Format(error.to_string()))?;
+        let value: Value = serde_json::from_str(text)
             .map_err(|error| PersistenceError::Format(error.to_string()))?;
         let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");
         let ignorable = value
@@ -309,9 +407,91 @@ pub async fn inspect_jsonl(
         refuse_unknown(type_name, ignorable)?;
         events.push(session_event_from_value(value)?);
     }
-    repair_open_turn(&mut events);
+    Ok(StoredSession {
+        inspection: SessionInspection {
+            meta: header,
+            events,
+        },
+        torn_to,
+    })
+}
+
+async fn materialize_jsonl(
+    path: &Path,
+    header: &SessionHeader,
+    events: &[SessionEvent],
+) -> Result<(), PersistenceError> {
+    let mut body = serde_json::to_string(&header_line(header))
+        .map_err(|error| PersistenceError::Format(error.to_string()))?;
+    body.push('\n');
+    for event in events {
+        body.push_str(
+            &serde_json::to_string(event)
+                .map_err(|error| PersistenceError::Format(error.to_string()))?,
+        );
+        body.push('\n');
+    }
+    write_file_atomic(
+        path,
+        body,
+        WriteFileAtomicOptions {
+            mode: 0o600,
+            dir_mode: Some(0o700),
+        },
+    )
+    .await
+    .map_err(atomic_error)
+}
+
+async fn append_jsonl_events(path: &Path, events: &[SessionEvent]) -> Result<(), PersistenceError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let mut body = String::new();
+    for event in events {
+        body.push_str(
+            &serde_json::to_string(event)
+                .map_err(|error| PersistenceError::Format(error.to_string()))?,
+        );
+        body.push('\n');
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(body.as_bytes()).await?;
+    file.sync_all().await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+async fn truncate_jsonl(path: &Path, offset: u64) -> Result<(), PersistenceError> {
+    let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    file.set_len(offset).await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+/// Read-only logical view. An interrupted trailing turn receives an
+/// in-memory closer; the file is not rewritten.
+pub async fn inspect_jsonl(
+    path: impl AsRef<Path>,
+    id: &SessionId,
+) -> Result<SessionInspection, PersistenceError> {
+    let stored = load_stored_jsonl(path, id).await?;
+    let mut events = stored.inspection.events;
+    events.extend(interrupted_turn_closers(&events));
     Ok(SessionInspection {
-        meta: header,
+        meta: stored.inspection.meta,
         events,
     })
 }
@@ -637,6 +817,35 @@ mod tests {
             Ok(_) => panic!("missing jsonl must be NotFound"),
         };
         assert!(matches!(err, PersistenceError::NotFound(id) if id == "nope"));
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn append_and_torn_load_commit_repair() {
+        let dir = tmp_dir("append-torn");
+        fs::create_dir_all(&dir).await.unwrap();
+        let backend = JsonlBackend::new(&dir);
+        let header = SessionHeader::new(session_id("s"), None);
+        let session = Session::with_header(header.clone());
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        backend
+            .append_events(&header, &session.events(), false)
+            .await
+            .unwrap();
+        let path = backend.path_for(&header.id);
+        let mut body = fs::read_to_string(&path).await.unwrap();
+        body.push_str("{\"seq\":1,\"type\":\"turn/end\"");
+        fs::write(&path, body).await.unwrap();
+        let stored = backend.load_stored(&header.id).await.unwrap().unwrap();
+        assert_eq!(stored.inspection.events.len(), 1);
+        assert!(stored.torn_to.is_some());
+        let runtime = PersistenceRuntime::new(Arc::new(backend) as _);
+        runtime.load(&header.id).await.unwrap();
+        let repaired = fs::read_to_string(&path).await.unwrap();
+        assert!(repaired.contains("interrupted"));
+        assert!(!repaired.contains("{\"seq\":1,\"type\":\"turn/end\""));
         let _ = fs::remove_dir_all(&dir).await;
     }
 }

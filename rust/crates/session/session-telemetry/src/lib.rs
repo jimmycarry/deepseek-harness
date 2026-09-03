@@ -597,10 +597,7 @@ mod tests {
 
     fn next_session_id() -> dsh_session::SessionId {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        session_id(format!(
-            "cap-{}",
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+        session_id(format!("cap-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
     }
 
     struct FakeBackend {
@@ -672,12 +669,8 @@ mod tests {
         let ctx = Context::new();
         SessionStore::install(&ctx).unwrap();
         let backend = FakeBackend::new();
-        let coordinator = SessionTelemetryCoordinator::install(
-            &ctx,
-            backend.clone(),
-            capture,
-        )
-        .unwrap();
+        let coordinator =
+            SessionTelemetryCoordinator::install(&ctx, backend.clone(), capture).unwrap();
         let session = ctx
             .service::<SessionStore>()
             .unwrap()
@@ -714,12 +707,8 @@ mod tests {
         let ctx = Context::new();
         SessionStore::install(&ctx).unwrap();
         let backend = FakeBackend::new();
-        SessionTelemetryCoordinator::install(
-            &ctx,
-            backend.clone(),
-            SessionTelemetryCapture::Live,
-        )
-        .unwrap();
+        SessionTelemetryCoordinator::install(&ctx, backend.clone(), SessionTelemetryCapture::Live)
+            .unwrap();
         let session = ctx
             .service::<SessionStore>()
             .unwrap()
@@ -745,6 +734,7 @@ mod tests {
                     turn: 1,
                     step: 1,
                     message: ToolResultMessage::new(call_id("c1"), vec![], true),
+                    error: None,
                 },
                 Some(SurfaceOp::append()),
             )
@@ -766,7 +756,10 @@ mod tests {
             .into_iter()
             .map(|record| {
                 (
-                    record.attributes["event.type"].as_str().unwrap().to_string(),
+                    record.attributes["event.type"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
                     record.severity,
                 )
             })
@@ -857,12 +850,8 @@ mod tests {
         SessionStore::install(&ctx).unwrap();
         let backend = FakeBackend::new();
         *backend.fail_seq.lock().expect("fail") = Some(1);
-        SessionTelemetryCoordinator::install(
-            &ctx,
-            backend.clone(),
-            SessionTelemetryCapture::Live,
-        )
-        .unwrap();
+        SessionTelemetryCoordinator::install(&ctx, backend.clone(), SessionTelemetryCapture::Live)
+            .unwrap();
         let session = ctx
             .service::<SessionStore>()
             .unwrap()

@@ -1,7 +1,8 @@
 //! Automation-only Agent Client Protocol server over newline-delimited
-//! JSON-RPC. Carries prompt text, committed assistant text, and cancellation;
-//! presentation and human-interaction features stay with the harness's UI
-//! modules.
+//! JSON-RPC. Carries prompt text, optional inline images when an attachment
+//! store and a vision default model are mounted, committed assistant text,
+//! and cancellation; presentation and human-interaction features stay with
+//! the harness's UI modules.
 //!
 //! The TypeScript bridge streams `session/update` while the turn runs and
 //! answers `session/prompt` at quiescence. This server matches that split:
@@ -10,10 +11,11 @@
 //! the prompt RPC waits for idle, and later frames (including `session/cancel`)
 //! are read on a dedicated stdin thread.
 
-use dsh_agent::{Agent, AgentCancelCause, AgentHandle, AgentRegistry};
+use dsh_agent::{Agent, AgentCancelCause, AgentDefaultModel, AgentHandle, AgentRegistry};
 use dsh_agent_loop::run_followup;
+use dsh_attachment::{AttachmentStore, ImageMediaType, SaveImageAttachment};
 use dsh_cordis::{Context, Service};
-use dsh_llm::{ContentBlock, UserMessage};
+use dsh_llm::{ContentBlock, ImageContentRef, UserMessage};
 use dsh_sdk_protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcStdout};
 use dsh_session::{Session, SessionEventData, SessionHeader, SessionStore, TurnEndReason};
 use dsh_session_persistence::PersistenceRuntime;
@@ -120,10 +122,7 @@ impl AcpServer {
     }
 
     fn live(&self) -> bool {
-        self.outbound
-            .lock()
-            .expect("acp outbound")
-            .is_some()
+        self.outbound.lock().expect("acp outbound").is_some()
     }
 
     fn forward_assistant_chunks(&self, payload: &Value) {
@@ -174,7 +173,10 @@ impl AcpServer {
     ) -> (Vec<JsonRpcNotification>, JsonRpcResponse) {
         let id = request.id.clone();
         match request.method.as_str() {
-            "initialize" => (Vec::new(), initialize_response(id)),
+            "initialize" => (
+                Vec::new(),
+                initialize_response(id, supports_acp_image_prompts(ctx)),
+            ),
             "authenticate" => (
                 Vec::new(),
                 JsonRpcResponse::result(id, serde_json::json!({})),
@@ -203,9 +205,7 @@ impl AcpServer {
         let Some(record) = sessions.get(session_id) else {
             return;
         };
-        record
-            .cancel_requested
-            .store(true, Ordering::SeqCst);
+        record.cancel_requested.store(true, Ordering::SeqCst);
         record.agent.cancel(AgentCancelCause {
             kind: "user".into(),
         });
@@ -299,13 +299,19 @@ impl AcpServer {
                     block.get("text").and_then(Value::as_str).unwrap_or(""),
                 )),
                 Some("image") => {
-                    return (
-                        Vec::new(),
-                        invalid_params(
-                            id,
-                            "inline image prompts were not advertised by this connection",
-                        ),
-                    )
+                    if !supports_acp_image_prompts(ctx) {
+                        return (
+                            Vec::new(),
+                            invalid_params(
+                                id,
+                                "inline image prompts were not advertised by this connection",
+                            ),
+                        );
+                    }
+                    match admit_acp_image(ctx, block) {
+                        Ok(image) => content.push(image),
+                        Err(message) => return (Vec::new(), invalid_params(id, &message)),
+                    }
                 }
                 Some("audio") => {
                     return (
@@ -407,16 +413,94 @@ impl AcpServer {
     }
 }
 
-/// The single-version `initialize` result: this server's one protocol version
-/// and its fixed automation capabilities (no image, audio, or embedded context).
-fn initialize_response(id: Value) -> JsonRpcResponse {
+/// Whether this connection advertises inline image prompts.
+///
+/// Requires a mounted attachment store and a vision-capable default model.
+pub fn supports_acp_image_prompts(ctx: &Context) -> bool {
+    if ctx.get::<AttachmentStore>().is_none() {
+        return false;
+    }
+    ctx.get::<AgentDefaultModel>()
+        .is_some_and(|model| model.model.contains("vision"))
+}
+
+fn admit_acp_image(ctx: &Context, block: &Value) -> Result<ContentBlock, String> {
+    let Some(store) = ctx.get::<AttachmentStore>() else {
+        return Err("inline image prompts were not advertised by this connection".into());
+    };
+    let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+    let mime = block
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("image/png");
+    let media_type = ImageMediaType::parse(mime)
+        .ok_or_else(|| format!("unsupported image media type: {mime}"))?;
+    let bytes = decode_base64(data).map_err(|_| "image data is not valid base64".to_string())?;
+    let saved = store
+        .save_image(SaveImageAttachment {
+            data: bytes,
+            media_type,
+            name: block.get("uri").and_then(Value::as_str).map(str::to_string),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(ContentBlock::Image {
+        attachment: ImageContentRef {
+            attachment_id: saved.attachment_id,
+            media_type: saved.media_type.as_str().to_string(),
+            bytes: saved.bytes,
+            width: saved.width,
+            height: saved.height,
+            name: saved.name,
+        },
+    })
+}
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let filtered: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if filtered.len() % 4 != 0 {
+        return Err(());
+    }
+    let mut out = Vec::new();
+    for chunk in filtered.chunks(4) {
+        let a = value(chunk[0]).ok_or(())?;
+        let b = value(chunk[1]).ok_or(())?;
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            let c = value(chunk[2]).ok_or(())?;
+            out.push((b << 4) | (c >> 2));
+            if chunk[3] != b'=' {
+                let d = value(chunk[3]).ok_or(())?;
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The single-version `initialize` result: this server's protocol version
+/// and automation capabilities. `image` is true only when attachments and a
+/// vision default model are mounted.
+fn initialize_response(id: Value, image: bool) -> JsonRpcResponse {
     JsonRpcResponse::result(
         id,
         serde_json::json!({
             "protocolVersion": PROTOCOL_VERSION,
             "agentInfo": { "name": AGENT_NAME, "version": AGENT_VERSION },
             "agentCapabilities": {
-                "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
+                "promptCapabilities": { "image": image, "audio": false, "embeddedContext": false },
             },
             "authMethods": [],
         }),
@@ -737,6 +821,115 @@ mod tests {
         );
     }
 
+    fn encode_base64_for_test(bytes: &[u8]) -> String {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b0 = bytes[i];
+            let b1 = bytes.get(i + 1).copied();
+            let b2 = bytes.get(i + 2).copied();
+            out.push(TABLE[(b0 >> 2) as usize] as char);
+            out.push(TABLE[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+            if b1.is_none() {
+                out.push('=');
+                out.push('=');
+            } else {
+                out.push(
+                    TABLE[(((b1.unwrap_or(0) & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize]
+                        as char,
+                );
+                if b2.is_none() {
+                    out.push('=');
+                } else {
+                    out.push(TABLE[(b2.unwrap_or(0) & 0x3f) as usize] as char);
+                }
+            }
+            i += 3;
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn advertises_and_admits_images_when_store_and_vision_are_mounted() {
+        let home = std::env::temp_dir().join(format!(
+            "dsh-acp-img-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let ctx = Context::new();
+        apply_replay(&ctx, "ONE").unwrap();
+        dsh_attachment_local::install(
+            &ctx,
+            dsh_attachment_local::Config::resolve(Some(&serde_json::json!({
+                "dshHome": home.to_string_lossy()
+            })))
+            .unwrap(),
+        )
+        .unwrap();
+        ctx.provide(Arc::new(AgentDefaultModel::new(
+            "deepseek-official",
+            "deepseek-v4-flash-vision-exp",
+        )))
+        .unwrap();
+        let server = AcpServer::new();
+        let (_, response) = server
+            .handle_request(
+                &ctx,
+                request(1, "initialize", serde_json::json!({"protocolVersion": 1})),
+            )
+            .await;
+        assert_eq!(
+            response.result.unwrap()["agentCapabilities"]["promptCapabilities"]["image"],
+            true
+        );
+        let (_, response) = server
+            .handle_request(
+                &ctx,
+                request(2, "session/new", serde_json::json!({"cwd": "/tmp"})),
+            )
+            .await;
+        let session_id = response.result.unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, response) = server
+            .handle_request(
+                &ctx,
+                request(
+                    3,
+                    "session/prompt",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "prompt": [{
+                            "type": "image",
+                            "mimeType": "image/png",
+                            "data": encode_base64_for_test(dsh_attachment_local::TINY_PNG),
+                        }],
+                    }),
+                ),
+            )
+            .await;
+        assert_eq!(response.result.unwrap()["stopReason"], "end_turn");
+        let events = ctx
+            .service::<dsh_session::SessionStore>()
+            .unwrap()
+            .get(&dsh_session::session_id(&session_id))
+            .unwrap()
+            .events();
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            SessionEventData::UserMessage(message)
+                if message.content.iter().any(ContentBlock::is_image)
+        )));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn stop_reason_mapping_matches_the_typescript_settlement() {
         assert_eq!(
@@ -984,7 +1177,10 @@ mod tests {
                     .is_some_and(|frame| frame.get("id") == Some(&Value::from(2)))
             });
             if has_chunk {
-                assert!(!has_response, "chunk must precede the prompt response: {body}");
+                assert!(
+                    !has_response,
+                    "chunk must precede the prompt response: {body}"
+                );
                 break;
             }
             if std::time::Instant::now() > deadline {

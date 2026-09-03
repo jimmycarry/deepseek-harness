@@ -50,18 +50,18 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 
 ### P0 — shipped-profile correctness (Linux)
 
-1. **Session persistence coordinator** — no write-behind (`writeBatchMaxDelayMs`), no public `prepare` / `readFrom` / `append`, no durable `commitRepair`; JSONL and SQLite `save()` rewrite the whole log ([`packages/session/session-persistence`](../../packages/session/session-persistence/README.md), [`rust/crates/session/session-persistence/src/lib.rs`](../crates/session/session-persistence/src/lib.rs), [`session-persistence-sqlite`](../crates/session/session-persistence-sqlite/src/lib.rs) `DELETE FROM events` then reinsert).
-2. **LLM DeepSeek transport** — `"stream": false` JSON POST only; no SSE, no image blocks, no Files API ([`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)).
-3. **Attachment raster pipeline** — magic-byte and header-dimension checks only; no decode, sRGB normalize, or request-image projection ([`rust/crates/attachment/attachment-local/src/lib.rs`](../crates/attachment/attachment-local/src/lib.rs)).
-4. **ACP image prompts** — `promptCapabilities.image: false`; inline images reject ([`rust/crates/acp/acp/src/lib.rs`](../crates/acp/acp/src/lib.rs)). Blocked on attachments + vision.
-5. **Settings Service Definition** — `settings-file` only; no `packages/settings/settings` register / watch / revision / mutate API.
-6. **Plan-mode review on headless** — `exit_plan_mode` needs a `ctx.userQuestions` provider; headless fails closed with the TypeScript sentences ([`rust/crates/plan/plan-mode/src/lib.rs`](../crates/plan/plan-mode/src/lib.rs)).
+1. **Session persistence coordinator** — **closed.** `PersistenceRuntime` write-behind (`writeBatchMaxDelayMs`, default 200, not reset by further appends), public `create` / `append` / `prepare` / `readFrom`, and durable `commitRepair` on JSONL (truncate to the last complete `\n`) and SQLite (`DELETE` from the first undecodable or gapped seq). SQLite stays at schema `2`. `inspect` still synthesizes closers in memory ([`rust/crates/session/session-persistence/src/lib.rs`](../crates/session/session-persistence/src/lib.rs)).
+2. **LLM DeepSeek transport** — **closed** for SSE and image blocks. `"stream": true` plus `stream_options.include_usage`; parse `data:` / `[DONE]`; a stream without `[DONE]` is `STREAM_CLOSED`; `finish` / `usage` emit only after `[DONE]`. A vision model (`model` contains `vision`) sends user images as `image_url` data-URLs. Files API upload is not mounted ([`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)).
+3. **Attachment raster pipeline** — **closed.** `request_image` decodes, longest-edge downscales (`normalizedImageMaxDimension`, default 2048), and JPEG-re-encodes under `normalizedImageMaxBytes` (default 4 MiB). Over-cap after quality 85 then 80 is `IMAGE_TOO_LARGE` ([`rust/crates/attachment/attachment-local/src/lib.rs`](../crates/attachment/attachment-local/src/lib.rs)).
+4. **ACP image prompts** — **closed.** Advertise `image: true` only when `ctx.attachments` and a vision `AgentDefaultModel` are mounted; admit `image` blocks through `save_image`. Default headless stays `image: false` and rejects with `inline image prompts were not advertised by this connection` ([`rust/crates/acp/acp/src/lib.rs`](../crates/acp/acp/src/lib.rs)).
+5. **Settings Service Definition** — **closed** on `settings-file` (`ctx.settings`): `register` / `watch` / `revision` / `mutate` / `describe` plus `settings/updated` (`ns`, `revision`, `value`) and `settings/document-updated` (`revision`). A standalone `settings` crate is still absent.
+6. **Plan-mode review on headless** — **closed.** Default review has no provider and fails with `no user-questions provider is registered`. Config `reviewProvider: "auto"` mounts a first-option approver; that option without `ctx.userQuestions` fails at install. The default headless patch does not set `reviewProvider` ([`rust/crates/plan/plan-mode/src/lib.rs`](../crates/plan/plan-mode/src/lib.rs)).
 7. **Agent-loop finish-chunk errors** — the loop ends a turn on `stream()` `Err`, and only `FinishReason::MaxTokens` changes turn end; in-stream `finish { kind: error \| aborted }` is logged and the turn still completes ([`rust/crates/core/agent-loop/src/lib.rs`](../crates/core/agent-loop/src/lib.rs)). **Report only; do not edit `dsh-agent-loop` to close this row.**
 
 ### P1 — durability and ops on shipped profiles
 
-8. Wire `preparedSessionCacheSize` / `writeBatchMaxDelayMs` from plugin `install` Config once the coordinator exists (the LRU default 5 already exists on `PersistenceRuntime`).
-9. `readFrom` / suffix reads.
+8. Wire `preparedSessionCacheSize` / `writeBatchMaxDelayMs` from plugin `install` Config — **closed** with P0-1 (`dsh-app-boot` / `PersistenceRuntime`).
+9. `readFrom` / suffix reads — **closed** with P0-1 (`PersistenceRuntime::read_from`).
 10. `session-projection-cache` (no crate).
 11. Session-query FTS (`openAt: never` in [`rust/crates/bundle/base/cordis.patch.yml`](../crates/bundle/base/cordis.patch.yml); SQLite FTS schema 1 vs TypeScript 8).
 12. Enable `web-fetch-http` in profiles that need URL retrieval (crate exists; base `fetch: false`).
@@ -105,15 +105,12 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 
 ## Recommended closure order
 
-1. Persistence coordinator (write-behind, durable `commitRepair`, append) — unblocks correct resume and cold `list_agents` inspect.
-2. DeepSeek SSE + image blocks.
-3. Attachment normalization — prerequisite for vision and ACP images.
-4. Settings Service Definition — adapters stop reading the file ad hoc.
-5. Headless plan-review provider or an explicit automation bypass that keeps the TypeScript failure sentence when no provider exists.
-6. Record the loop finish-chunk gap; do not change `dsh-agent-loop` here.
-7. Session-query FTS opt-in, web fetch enablement, skill watching, OTel flush, SDK helpers, external subagents.
-8. Platform sandbox and PTY/LSP only when those headless hosts are in scope.
-9. Rust-as-host for the existing TypeScript Web client only after the headless spine gaps above are closed.
+1. Persistence coordinator, DeepSeek SSE + image blocks, attachment normalization, settings Service Definition, and headless plan-review — **closed** (P0 items 1–6).
+2. Record the loop finish-chunk gap; do not change `dsh-agent-loop` here (P0 item 7, report only).
+3. DeepSeek Files API upload (inline `image_url` data-URLs already ship).
+4. Session-query FTS opt-in, web fetch enablement, skill watching, OTel flush, SDK helpers, external subagents.
+5. Platform sandbox and PTY/LSP only when those headless hosts are in scope.
+6. Rust-as-host for the existing TypeScript Web client only after the headless spine gaps above are closed.
 
 ## Per-group matrix
 
@@ -123,7 +120,7 @@ Status values: **aligned** (headless contract matches), **thinner** (crate exist
 
 | Package | Status | Gap | Pri |
 |---|---|---|---|
-| `acp` | thinner | Text ACP ships; `promptCapabilities.image/audio/embeddedContext` are false; image prompts reject | P0 (images, after attachments) |
+| `acp` | aligned for image prompts | Advertise `image: true` only with `ctx.attachments` + vision default model; audio / embeddedContext stay false | remaining (audio / resource) |
 
 ### api
 
@@ -137,13 +134,13 @@ Status values: **aligned** (headless contract matches), **thinner** (crate exist
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `attachment` | aligned | Store types present | — |
-| `attachment-local` | thinner | Verify + store only; no Sharp normalize / request-image cache | P0 |
+| `attachment-local` | aligned | Magic-byte admit plus `request_image` JPEG normalization | remaining (Files API is DeepSeek-side) |
 
 ### boot
 
 | Package | Status | Gap | Pri |
 |---|---|---|---|
-| `app-boot` | thinner | Real mounts for the headless tree; leftover names no-op | P1 (wire persistence Config); no-ops listed above |
+| `app-boot` | thinner | Real mounts for the headless tree; leftover names no-op; persistence Config (`preparedSessionCacheSize` / `writeBatchMaxDelayMs`) wired | P1 no-ops listed above |
 | `cmdline` | absent | TypeScript shared argv parser; Rust inlines task flags on headless startup | P2 |
 
 ### bundle
@@ -260,7 +257,7 @@ All three packages **absent** / **P4**.
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `commands` / `permission-presets` / `user-approval` | aligned | Headless `never` / `ask` fail-closed | — |
-| `user-questions` | thinner | Service without a provider | P0 (plan review) |
+| `user-questions` | thinner | Service without a default provider; plan-mode can opt in `reviewProvider: "auto"` | remaining (interactive provider) |
 | `tool-ask-user` | absent | Model `ask_user_question` | P1 |
 
 ### jobs
@@ -272,7 +269,7 @@ All three packages **absent** / **P4**.
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `llm` | aligned | Chunk tags include `FinishReason::Error` | P0 consumers must honor it |
-| `llm-deepseek` | thinner | Non-stream POST; text-only; retry/classify/`Retry-After` aligned | P0 SSE + images |
+| `llm-deepseek` | thinner | SSE + user `image_url` data-URLs aligned; no Files API upload; retry/classify/`Retry-After` aligned | remaining (Files API) |
 | `llm-retry` / `token-meter` | aligned | `providerRetryAfterMs` over-cap rules | — |
 | `llm-pi-ai` | no-op | Bundle row, no crate | P2 |
 | `llm-replay` | remap | Lives under `llm/` | — |
@@ -289,7 +286,7 @@ All three packages **absent** / **P4**.
 
 ### plan
 
-`plan-mode`: **thinner** / **P0** (review path). Tools and `plan/mode` events ship.
+`plan-mode`: **aligned** for `/plan` + `exit_plan_mode` and opt-in `reviewProvider: "auto"`. Default review stays fail-closed.
 
 ### preset
 
@@ -321,9 +318,9 @@ All three packages **absent** / **P4**.
 
 | Package | Status | Gap | Pri |
 |---|---|---|---|
-| `session-persistence` | thinner | `save` / `load` / `inspect` / list / revision; no coordinator, `prepare`, `readFrom`, `commitRepair` | P0 |
-| `session-persistence-jsonl` | thinner | Atomic full-file rewrite; inspect repair stays in memory | P0 |
-| `session-persistence-sqlite` | thinner | Schema 2; `DELETE` + reinsert on save | P0 append; schema 17 is **skip** |
+| `session-persistence` | aligned | write-behind, `create` / `append` / `prepare` / `readFrom`, `load` durable `commitRepair`; `inspect` stays in-memory closers | remaining (read-repair / incarnation) |
+| `session-persistence-jsonl` | aligned | Header + events + `list` + torn last-line `commitRepair` | remaining (read-repair) |
+| `session-persistence-sqlite` | aligned | Schema 2 plus torn-row `commitRepair`; schema 17 is **skip** | remaining (read-repair) |
 | `session-projection` | aligned | Registry present | — |
 | `session-checkpoint-policy` | aligned | Flush before model request and top-level tool dispatch | P1 (re-test with write-behind) |
 | `session-telemetry` / `session-telemetry-otel` | thinner | OTLP logs + `Retry-After` + keepAlive; no flush hint; no metrics | P1 flush; metrics **skip** |
@@ -346,8 +343,8 @@ All three packages **absent** / **P4**.
 
 | Package | Status | Gap | Pri |
 |---|---|---|---|
-| `settings-file` | thinner | File document + YAML leaf `update`; no namespace Service Definition | P0 |
-| `settings` | absent | `register` / `watch` / `revision` / `mutate` / `describe` | P0 |
+| `settings-file` | aligned | File document, YAML leaf `update` / `replace`, plus `register` / `watch` / `revision` / `mutate` / `describe` and settings events | remaining (none on this crate) |
+| `settings` | absent | Methods live on `settings-file` (`ctx.settings`); no standalone definition crate | remaining (split only if roles diverge) |
 
 ### shell
 
@@ -438,7 +435,7 @@ All four packages **absent** / **P2**.
 
 ## Already aligned (do not re-open as gaps)
 
-Credentials resolution, `llm-retry` `retryPolicy` + `providerRetryAfterMs` (delay-seconds and HTTP-date, over-cap `normal`/`always`), sandbox-policy / approval / permission-presets, continuable in-process subagents with cold resume and `list_agents` diagnostics, inspect LRU `preparedSessionCacheSize` default 5, Windows ACL Node runner argv, OTel keepAlive + `Retry-After` HTTP-date, compaction-basic main path, goal / todo / plan tools (except headless review), jobs, spill, agent-instructions, fs observation gate, skill catalog tool, token-meter, titles.
+Credentials resolution, `llm-retry` `retryPolicy` + `providerRetryAfterMs` (delay-seconds and HTTP-date, over-cap `normal`/`always`), sandbox-policy / approval / permission-presets, continuable in-process subagents with cold resume and `list_agents` diagnostics, persistence write-behind / `append` / durable `commitRepair` / inspect LRU `preparedSessionCacheSize`, Windows ACL Node runner argv, OTel keepAlive + `Retry-After` HTTP-date, compaction-basic main path, goal / todo / plan tools (including opt-in `reviewProvider: "auto"`; default headless review stays fail-closed), jobs, spill, agent-instructions, fs observation gate, skill catalog tool, token-meter, titles, attachment `request_image`, ACP image prompts when store + vision are mounted, DeepSeek SSE + `image_url` data-URLs, settings `register` / `watch` / `revision` / `mutate`.
 
 ## Verification
 

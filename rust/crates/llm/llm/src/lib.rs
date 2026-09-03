@@ -219,6 +219,31 @@ pub enum ContentBlock {
         #[serde(rename = "isError")]
         is_error: bool,
     },
+    /// Durable image reference. Bytes stay in the attachment store.
+    Image {
+        /// Content-addressed attachment facts.
+        attachment: ImageContentRef,
+    },
+}
+
+/// Durable image reference carried in a model-visible content block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageContentRef {
+    /// Content-addressed id (`sha256:` + hex).
+    #[serde(rename = "attachmentId")]
+    pub attachment_id: String,
+    /// Verified media type.
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
+    /// Exact encoded byte length.
+    pub bytes: usize,
+    /// Intrinsic width.
+    pub width: u32,
+    /// Intrinsic height.
+    pub height: u32,
+    /// Optional display name stripped of local path information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl ContentBlock {
@@ -226,6 +251,16 @@ impl ContentBlock {
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
     }
+
+    /// Whether this block is an image reference.
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image { .. })
+    }
+}
+
+/// Whether any block is an image reference.
+pub fn content_has_image(blocks: &[ContentBlock]) -> bool {
+    blocks.iter().any(ContentBlock::is_image)
 }
 
 /// Named contribution inside a `snapshot` plugin source.

@@ -6,22 +6,32 @@
 //! backend read; a ready LRU of [`DEFAULT_PREPARED_SESSION_CACHE_SIZE`]
 //! reuses unpublished views; a changed [`SessionPersistenceRevision`]
 //! discards the ready entry and reloads. [`PersistenceRuntime::load`]
-//! reconstructs a Session for resume and other publishable paths and does
-//! not publish from that LRU. [`PersistenceRuntime::list_snapshots`] and
-//! [`PersistenceRuntime::read_stored_revision`] read the backend directly.
+//! reconstructs a Session for resume, commits crash-recovery closers when the
+//! backend implements [`SessionStoreBackend::commit_repair`], and does not
+//! publish from the LRU. Live sessions enqueue `session/event` through
+//! write-behind when [`PersistenceRuntime::install_write_path`] is mounted.
 
+mod coordinator;
 mod preparations;
+mod write_behind;
 
 pub use preparations::{
     DiscardReady, PreparedSessionSource, SessionPreparations, DEFAULT_PREPARED_SESSION_CACHE_SIZE,
 };
+pub use write_behind::{
+    parse_write_batch_max_delay_ms, SessionWriteBehind, DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
+    MAX_WRITE_BATCH_DELAY_MS,
+};
 
 use async_trait::async_trait;
 use dsh_brand::Branded;
-use dsh_cordis::Service;
-use dsh_session::{Session, SessionError, SessionEvent, SessionHeader, SessionId};
+use dsh_cordis::{Context, Service};
+use dsh_session::{
+    interrupted_turn_closers, Session, SessionError, SessionEvent, SessionHeader, SessionId,
+};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 
 /// Absolute per-session artifact target, when the backend has one.
@@ -49,6 +59,17 @@ pub enum PersistenceError {
     /// Session append or required-on-read refusal.
     #[error(transparent)]
     Session(#[from] SessionError),
+}
+
+impl Clone for PersistenceError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Format(message) => Self::Format(message.clone()),
+            Self::NotFound(id) => Self::NotFound(id.clone()),
+            Self::Io(error) => Self::Format(error.to_string()),
+            Self::Session(error) => Self::Format(error.to_string()),
+        }
+    }
 }
 
 /// Read-only logical session: validated header and event log, without
@@ -101,6 +122,11 @@ impl SessionInspection {
 /// Durable save/load for one session log.
 #[async_trait]
 pub trait SessionStoreBackend: Send + Sync {
+    /// Human-readable backend name, used in background-write warnings.
+    fn name(&self) -> &str {
+        "session-store"
+    }
+
     /// Persist the current log.
     async fn save(&self, session: &Session) -> Result<(), PersistenceError>;
     /// Reconstruct a session from durable storage.
@@ -140,6 +166,58 @@ pub trait SessionStoreBackend: Send + Sync {
         let _ = id;
         Ok(None)
     }
+    /// Header and committed events without in-memory closers. `Ok(None)` if absent.
+    async fn load_stored(&self, id: &SessionId) -> Result<Option<StoredSession>, PersistenceError> {
+        match self.inspect(id).await {
+            Ok(inspection) => Ok(Some(StoredSession {
+                inspection,
+                torn_to: None,
+            })),
+            Err(PersistenceError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Physical suffix starting at `from_seq`. Does not apply closers.
+    async fn load_stored_from(
+        &self,
+        id: &SessionId,
+        from_seq: u64,
+    ) -> Result<StoredSession, PersistenceError> {
+        let Some(mut stored) = self.load_stored(id).await? else {
+            return Err(PersistenceError::NotFound(id.as_str().to_string()));
+        };
+        stored
+            .inspection
+            .events
+            .retain(|event| event.seq >= from_seq);
+        Ok(stored)
+    }
+
+    /// Append a contiguous event batch. `materialized` is false on first write.
+    async fn append_events(
+        &self,
+        header: &SessionHeader,
+        events: &[SessionEvent],
+        materialized: bool,
+    ) -> Result<(), PersistenceError> {
+        let _ = (header, events, materialized);
+        Err(PersistenceError::Format(
+            "append_events is not implemented".into(),
+        ))
+    }
+
+    /// Truncate a torn tail and/or append durable crash-recovery closers.
+    async fn commit_repair(
+        &self,
+        header: &SessionHeader,
+        torn_to: Option<u64>,
+        closers: &[SessionEvent],
+    ) -> Result<(), PersistenceError> {
+        let _ = (header, torn_to, closers);
+        Ok(())
+    }
+
     /// All materialized sessions with cheap revision tokens.
     ///
     /// The default pairs [`Self::list_headers`] with [`Self::read_stored_revision`]
@@ -155,10 +233,32 @@ pub trait SessionStoreBackend: Send + Sync {
     }
 }
 
+/// Committed prefix plus an optional torn-tail marker (JSONL byte offset or
+/// SQLite physical seq).
+#[derive(Debug, Clone)]
+pub struct StoredSession {
+    /// Validated header and committed events, without crash-recovery closers.
+    pub inspection: SessionInspection,
+    /// Truncation point for [`SessionStoreBackend::commit_repair`].
+    pub torn_to: Option<u64>,
+}
+
+pub(crate) struct SessionPersistState {
+    pub(crate) meta: SessionHeader,
+    pub(crate) cursor: u64,
+    pub(crate) materialized: bool,
+}
+
 /// `ctx.sessionPersistence`.
 pub struct PersistenceRuntime {
-    backend: Arc<dyn SessionStoreBackend>,
-    preparations: SessionPreparations,
+    pub(crate) backend: Arc<dyn SessionStoreBackend>,
+    pub(crate) preparations: SessionPreparations,
+    pub(crate) write_batch_max_delay_ms: u64,
+    pub(crate) states: Mutex<HashMap<String, SessionPersistState>>,
+    pub(crate) live: Mutex<HashMap<String, Arc<coordinator::LiveSession>>>,
+    pub(crate) chains: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) self_weak: Mutex<Option<Weak<PersistenceRuntime>>>,
+    pub(crate) ctx: Mutex<Option<Context>>,
 }
 
 impl PersistenceRuntime {
@@ -176,9 +276,40 @@ impl PersistenceRuntime {
         backend: Arc<dyn SessionStoreBackend>,
         prepared_session_cache_size: usize,
     ) -> Result<Self, PersistenceError> {
+        Self::with_options(
+            backend,
+            prepared_session_cache_size,
+            DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
+        )
+    }
+
+    /// Wrap a backend with explicit LRU capacity and write-behind delay.
+    ///
+    /// # Errors
+    /// `preparedSessionCacheSize` must be a positive integer.
+    /// `write_batch_max_delay_ms` must be in `1..=MAX_WRITE_BATCH_DELAY_MS`.
+    pub fn with_options(
+        backend: Arc<dyn SessionStoreBackend>,
+        prepared_session_cache_size: usize,
+        write_batch_max_delay_ms: u64,
+    ) -> Result<Self, PersistenceError> {
+        if write_batch_max_delay_ms < 1
+            || write_batch_max_delay_ms > crate::MAX_WRITE_BATCH_DELAY_MS
+        {
+            return Err(PersistenceError::Format(format!(
+                "writeBatchMaxDelayMs must be an integer between 1 and {}",
+                crate::MAX_WRITE_BATCH_DELAY_MS
+            )));
+        }
         Ok(Self {
             backend,
             preparations: SessionPreparations::new(prepared_session_cache_size)?,
+            write_batch_max_delay_ms,
+            states: Mutex::new(HashMap::new()),
+            live: Mutex::new(HashMap::new()),
+            chains: Mutex::new(HashMap::new()),
+            self_weak: Mutex::new(None),
+            ctx: Mutex::new(None),
         })
     }
 
@@ -189,9 +320,32 @@ impl PersistenceRuntime {
         Ok(())
     }
 
-    /// Reconstruct a session from durable storage.
+    /// Reconstruct a session from durable storage, committing crash recovery.
     pub async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
-        self.backend.load(id).await
+        let Some(stored) = self.backend.load_stored(id).await? else {
+            return Err(PersistenceError::NotFound(id.as_str().to_string()));
+        };
+        let closers = interrupted_turn_closers(&stored.inspection.events);
+        if stored.torn_to.is_none() && closers.is_empty() {
+            return stored.inspection.into_session();
+        }
+        self.backend
+            .commit_repair(&stored.inspection.meta, stored.torn_to, &closers)
+            .await?;
+        self.preparations.invalidate(id);
+        if let Some(reloaded) = self.backend.load_stored(id).await? {
+            let remaining = interrupted_turn_closers(&reloaded.inspection.events);
+            if reloaded.torn_to.is_none() && remaining.is_empty() {
+                return reloaded.inspection.into_session();
+            }
+        }
+        let mut events = stored.inspection.events;
+        events.extend(closers);
+        SessionInspection {
+            meta: stored.inspection.meta,
+            events,
+        }
+        .into_session()
     }
 
     /// Read-only logical view. Does not commit crash recovery or publish a Session.
@@ -219,10 +373,17 @@ impl PersistenceRuntime {
         &self,
         id: &SessionId,
     ) -> Result<PreparedSessionSource, PersistenceError> {
-        let inspection = self.backend.inspect(id).await?;
+        let Some(stored) = self.backend.load_stored(id).await? else {
+            return Err(PersistenceError::NotFound(id.as_str().to_string()));
+        };
+        let mut events = stored.inspection.events;
+        events.extend(interrupted_turn_closers(&events));
         let revision = self.backend.read_stored_revision(id).await?;
         Ok(PreparedSessionSource {
-            inspection,
+            inspection: SessionInspection {
+                meta: stored.inspection.meta,
+                events,
+            },
             revision,
         })
     }

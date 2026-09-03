@@ -10,6 +10,7 @@ description = "Content-addressed attachment store under DSH_HOME."
 dsh-attachment.workspace = true
 dsh-cordis.workspace = true
 dsh-home-paths.workspace = true
+image.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true

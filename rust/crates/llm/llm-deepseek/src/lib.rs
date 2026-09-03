@@ -1,14 +1,24 @@
-//! DeepSeek LLM adapter. Self-skips with-key tests when `DEEPSEEK_API_KEY` is unset.
+//! DeepSeek LLM adapter. Chat uses SSE (`stream: true`); a missing `[DONE]` is
+//! `STREAM_CLOSED`. Vision models send user images as `image_url` data-URLs.
+//! Self-skips with-key tests when `DEEPSEEK_API_KEY` is unset.
+
+mod sse;
+mod translate;
+
+pub use sse::{parse_sse, DONE};
+pub use translate::{map_finish_reason, map_usage, translate};
 
 use async_trait::async_trait;
 use dsh_credentials::{Credential, CredentialsRuntime};
 use dsh_llm::{
-    is_context_window_exceeded_error, is_quota_exceeded_error, provider_retry_after_ms,
-    ContentBlock, LlmAdapter, LlmError, LlmFailure, LlmModelContext, LlmRequest,
-    LlmResolvedModelInfo, Message, StreamChunk, CONTEXT_WINDOW_EXCEEDED_CODE, QUOTA_EXCEEDED_CODE,
+    content_has_image, is_context_window_exceeded_error, is_quota_exceeded_error,
+    provider_retry_after_ms, ContentBlock, LlmAdapter, LlmError, LlmFailure, LlmModelContext,
+    LlmRequest, LlmResolvedModelInfo, Message, StreamChunk, CONTEXT_WINDOW_EXCEEDED_CODE,
+    QUOTA_EXCEEDED_CODE,
 };
 use futures::stream::{self, BoxStream};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -226,6 +236,13 @@ pub struct DeepSeekAdapter {
     pub base_url: String,
     /// Model id.
     pub model: String,
+    /// Prepared request-image bytes keyed by attachment id.
+    pub images: HashMap<String, Vec<u8>>,
+}
+
+/// Whether this catalog model accepts image input.
+pub fn model_accepts_image(model: &str) -> bool {
+    model.contains("vision")
 }
 
 impl DeepSeekAdapter {
@@ -238,6 +255,7 @@ impl DeepSeekAdapter {
             api_key,
             base_url,
             model: "deepseek-chat".into(),
+            images: HashMap::new(),
         })
     }
 }
@@ -255,11 +273,11 @@ impl LlmAdapter for DeepSeekAdapter {
             )));
         }
         let url = join_url(&self.base_url, "/chat/completions");
-        let body = request_body(&self.model, &request);
+        let body = request_body(&self.model, &request, &self.images)?;
         let raw = post_json(&url, &self.api_key, &body).await?;
-        let content = parse_content(&raw)
-            .map_err(|message| LlmError::Failure(LlmFailure::new(message, "TRANSPORT")))?;
-        Ok(Box::pin(stream::iter(StreamChunk::text_stream(content))))
+        let payloads = parse_sse(&raw)?;
+        let chunks = translate(&payloads)?;
+        Ok(Box::pin(stream::iter(chunks)))
     }
 
     async fn resolve_model(
@@ -285,7 +303,11 @@ fn join_url(base: &str, path: &str) -> String {
     )
 }
 
-fn request_body(model: &str, request: &LlmRequest) -> String {
+fn request_body(
+    model: &str,
+    request: &LlmRequest,
+    images: &HashMap<String, Vec<u8>>,
+) -> Result<String, LlmError> {
     let mut messages = Vec::new();
     if let Some(system) = &request.system {
         messages.push(json!({ "role": "system", "content": system }));
@@ -293,26 +315,121 @@ fn request_body(model: &str, request: &LlmRequest) -> String {
     for message in &request.messages {
         match message {
             Message::User(user) => {
-                messages.push(json!({ "role": "user", "content": blocks_text(&user.content) }));
+                messages.push(json!({
+                    "role": "user",
+                    "content": user_content(&user.content, model, images)?,
+                }));
             }
             Message::Assistant(assistant) => {
+                if content_has_image(&assistant.content) {
+                    return Err(unsupported_image_role("assistant"));
+                }
                 messages.push(json!({ "role": "assistant", "content": assistant.text() }));
             }
             Message::Tool(tool) => {
+                let blocks = tool.result_blocks();
+                if content_has_image(blocks) {
+                    return Err(unsupported_image_role("tool"));
+                }
                 messages.push(json!({
                     "role": "tool",
-                    "content": blocks_text(tool.result_blocks()),
+                    "content": blocks_text(blocks),
                     "tool_call_id": tool.tool_call_id().unwrap_or(""),
                 }));
             }
         }
     }
-    json!({
+    Ok(json!({
         "model": model,
         "messages": messages,
-        "stream": false,
+        "stream": true,
+        "stream_options": { "include_usage": true },
     })
-    .to_string()
+    .to_string())
+}
+
+fn unsupported_image_role(role: &str) -> LlmError {
+    LlmError::Failure(LlmFailure::new(
+        format!(
+            "The DeepSeek chat-completions adapter cannot represent image content in a {role} message."
+        ),
+        "UNSUPPORTED_CONTENT",
+    ))
+}
+
+fn user_content(
+    blocks: &[ContentBlock],
+    model: &str,
+    images: &HashMap<String, Vec<u8>>,
+) -> Result<Value, LlmError> {
+    if !content_has_image(blocks) {
+        return Ok(Value::String(blocks_text(blocks)));
+    }
+    if !model_accepts_image(model) {
+        return Err(LlmError::Failure(LlmFailure::new(
+            format!("DeepSeek model \"{model}\" does not accept image input."),
+            "UNSUPPORTED_CONTENT",
+        )));
+    }
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+            ContentBlock::Image { attachment } => {
+                let Some(bytes) = images.get(&attachment.attachment_id) else {
+                    return Err(LlmError::Failure(LlmFailure::new(
+                        format!(
+                            "DeepSeek request image {} was not prepared.",
+                            attachment.attachment_id
+                        ),
+                        "INVALID_REQUEST",
+                    )));
+                };
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!(
+                            "data:{};base64,{}",
+                            attachment.media_type,
+                            encode_base64(bytes)
+                        )
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(Value::Array(parts))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let b1 = bytes.get(i + 1).copied();
+        let b2 = bytes.get(i + 2).copied();
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        if b1.is_none() {
+            out.push('=');
+            out.push('=');
+        } else {
+            out.push(
+                TABLE[(((b1.unwrap_or(0) & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char,
+            );
+            if b2.is_none() {
+                out.push('=');
+            } else {
+                out.push(TABLE[(b2.unwrap_or(0) & 0x3f) as usize] as char);
+            }
+        }
+        i += 3;
+    }
+    out
 }
 
 fn blocks_text(blocks: &[ContentBlock]) -> String {
@@ -326,23 +443,11 @@ fn blocks_text(blocks: &[ContentBlock]) -> String {
         .join("")
 }
 
-fn parse_content(raw: &str) -> Result<String, String> {
-    let value: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
-    value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| "missing choices[0].message.content".into())
-}
-
 async fn post_json(url: &str, api_key: &str, body: &str) -> Result<String, LlmError> {
     let headers = [
         ("Authorization", format!("Bearer {api_key}")),
         ("Content-Type", "application/json".into()),
+        ("Accept", "text/event-stream".into()),
     ];
     let raw = if url.starts_with("https://") {
         curl_post(url, &headers, body).await
@@ -541,7 +646,7 @@ fn parse_http_response(raw: &str) -> Result<HttpResponse, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsh_llm::{LlmCallConfig, UserMessage};
+    use dsh_llm::{LlmCallConfig, MessageSource, UserMessage};
     use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -581,7 +686,8 @@ mod tests {
             let mut buf = vec![0u8; 16_384];
             let n = socket.read(&mut buf).await.unwrap();
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            let body = r#"{"choices":[{"message":{"content":"pong"}}]}"#;
+            let body =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -593,6 +699,7 @@ mod tests {
             api_key: "test-key".into(),
             base_url: format!("http://{addr}"),
             model: "deepseek-chat".into(),
+            images: HashMap::new(),
         };
         let stream = adapter
             .stream(LlmRequest {
@@ -613,6 +720,8 @@ mod tests {
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /chat/completions HTTP/1.1"));
         assert!(request.contains("Authorization: Bearer test-key"));
+        assert!(request.contains("\"stream\":true"));
+        assert!(request.contains("text/event-stream"));
     }
 
     #[test]
@@ -667,6 +776,133 @@ mod tests {
         );
         assert_eq!(merged["defaultContextWindow"], 2000);
         assert_eq!(merged["baseURL"], "https://plugin.test");
+    }
+
+    fn sample_image() -> (ContentBlock, HashMap<String, Vec<u8>>) {
+        let id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let block = ContentBlock::Image {
+            attachment: dsh_llm::ImageContentRef {
+                attachment_id: id.into(),
+                media_type: "image/png".into(),
+                bytes: 4,
+                width: 1,
+                height: 1,
+                name: None,
+            },
+        };
+        let mut images = HashMap::new();
+        images.insert(id.into(), vec![1, 2, 3, 4]);
+        (block, images)
+    }
+
+    #[test]
+    fn vision_user_image_becomes_data_url() {
+        let (block, images) = sample_image();
+        let body = request_body(
+            "deepseek-v4-flash-vision-exp",
+            &LlmRequest {
+                config: LlmCallConfig::default(),
+                adapter_defaults: None,
+                system: None,
+                messages: vec![Message::User(UserMessage::from_parts(
+                    vec![ContentBlock::text("see"), block],
+                    MessageSource::User,
+                ))],
+                tools: vec![],
+                purpose: None,
+            },
+            &images,
+        )
+        .unwrap();
+        assert!(body.contains("\"stream\":true"));
+        assert!(body.contains("image_url"));
+        assert!(body.contains("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn non_vision_model_refuses_image_input() {
+        let (block, images) = sample_image();
+        let err = request_body(
+            "deepseek-chat",
+            &LlmRequest {
+                config: LlmCallConfig::default(),
+                adapter_defaults: None,
+                system: None,
+                messages: vec![Message::User(UserMessage::from_parts(
+                    vec![block],
+                    MessageSource::User,
+                ))],
+                tools: vec![],
+                purpose: None,
+            },
+            &images,
+        )
+        .unwrap_err();
+        let LlmError::Failure(failure) = err;
+        assert_eq!(failure.code, "UNSUPPORTED_CONTENT");
+        assert_eq!(
+            failure.message,
+            "DeepSeek model \"deepseek-chat\" does not accept image input."
+        );
+    }
+
+    #[test]
+    fn missing_prepared_image_fails_loud() {
+        let (block, _) = sample_image();
+        let err = request_body(
+            "deepseek-v4-flash-vision-exp",
+            &LlmRequest {
+                config: LlmCallConfig::default(),
+                adapter_defaults: None,
+                system: None,
+                messages: vec![Message::User(UserMessage::from_parts(
+                    vec![block],
+                    MessageSource::User,
+                ))],
+                tools: vec![],
+                purpose: None,
+            },
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        let LlmError::Failure(failure) = err;
+        assert_eq!(failure.code, "INVALID_REQUEST");
+        assert!(
+            failure.message.contains("was not prepared"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn assistant_and_tool_images_are_unsupported() {
+        let (block, images) = sample_image();
+        let assistant = request_body(
+            "deepseek-v4-flash-vision-exp",
+            &LlmRequest {
+                config: LlmCallConfig::default(),
+                adapter_defaults: None,
+                system: None,
+                messages: vec![Message::Assistant(dsh_llm::AssistantMessage::model(
+                    vec![block.clone()],
+                    "deepseek-official",
+                    "deepseek-v4-flash-vision-exp",
+                ))],
+                tools: vec![],
+                purpose: None,
+            },
+            &images,
+        )
+        .unwrap_err();
+        let LlmError::Failure(failure) = assistant;
+        assert_eq!(failure.code, "UNSUPPORTED_CONTENT");
+        assert!(
+            failure
+                .message
+                .contains("cannot represent image content in a assistant message."),
+            "{}",
+            failure.message
+        );
     }
 
     #[test]
@@ -802,6 +1038,7 @@ mod tests {
             api_key: "test-key".into(),
             base_url: format!("http://{addr}"),
             model: "deepseek-chat".into(),
+            images: HashMap::new(),
         };
         let error = adapter
             .stream(LlmRequest {

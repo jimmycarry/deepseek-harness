@@ -3,9 +3,10 @@
 //! Activation is committed as a log-only `plan/mode` event; the configured
 //! policy `section` renders as prompt section `plan:policy` (order 50) only
 //! while plan mode is in force. `exit_plan_mode` presents the plan through
-//! `ctx.userQuestions`; without a registered provider (automation
-//! assemblies) it fails with the provider's exact sentence and the session
-//! stays in plan mode.
+//! `ctx.userQuestions`. Default review has no provider, so automation
+//! assemblies fail with the exact sentence and stay in plan mode. Config
+//! `reviewProvider: "auto"` mounts a first-option approver; that option
+//! without `ctx.userQuestions` fails at install.
 
 use async_trait::async_trait;
 use dsh_agent::AgentRegistry;
@@ -13,16 +14,29 @@ use dsh_cordis::{Context, CordisError, Service};
 use dsh_session::{session_id, Session, SessionEventData};
 use dsh_system_prompt::{PromptSection, SystemPrompt};
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome, ToolRuntime};
-use dsh_user_questions::{UserQuestion, UserQuestionsService};
+use dsh_user_questions::{
+    UserQuestion, UserQuestionProvider, UserQuestionReply, UserQuestionsService,
+};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Opt-in plan-review channel. Default is fail-closed (no provider).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewProvider {
+    /// No `ctx.userQuestions` provider — headless stays fail-closed.
+    None,
+    /// Approve the first option. Not mounted by the default headless patch.
+    Auto,
+}
 
 /// Required deployment policy text; this plugin adds no defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Plan-mode policy section rendered while plan mode is active.
     pub section: String,
+    /// Optional automation review provider. Default [`ReviewProvider::None`].
+    pub review_provider: ReviewProvider,
 }
 
 impl Config {
@@ -36,15 +50,24 @@ impl Config {
             .ok_or_else(|| "plan-mode: config must supply a non-empty section".to_string())?;
         let unknown: Vec<&str> = map
             .keys()
-            .filter(|key| key.as_str() != "section")
+            .filter(|key| !matches!(key.as_str(), "section" | "reviewProvider"))
             .map(String::as_str)
             .collect();
         if !unknown.is_empty() {
             return Err(format!(
-                "PlanModeConfig has unknown key(s) {} — config is {{ section }}",
+                "PlanModeConfig has unknown key(s) {} — config is {{ section, reviewProvider? }}",
                 unknown.join(", ")
             ));
         }
+        let review_provider = match map.get("reviewProvider").and_then(Value::as_str) {
+            None => ReviewProvider::None,
+            Some("auto") => ReviewProvider::Auto,
+            Some(other) => {
+                return Err(format!(
+                    "plan-mode: reviewProvider must be \"auto\" when set, got {other}"
+                ))
+            }
+        };
         let section = map
             .get("section")
             .and_then(Value::as_str)
@@ -53,7 +76,10 @@ impl Config {
         if section.trim().is_empty() {
             return Err("plan-mode: config must supply a non-empty section".into());
         }
-        Ok(Self { section })
+        Ok(Self {
+            section,
+            review_provider,
+        })
     }
 }
 
@@ -207,6 +233,22 @@ fn starts_with_heading(plan: &str) -> bool {
     after_gap.len() < rest.len() && !after_gap.is_empty()
 }
 
+struct AutoApproveQuestions;
+
+#[async_trait]
+impl UserQuestionProvider for AutoApproveQuestions {
+    async fn ask(&self, question: UserQuestion) -> Result<UserQuestionReply, String> {
+        Ok(UserQuestionReply {
+            choice: question
+                .options
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Approve".into()),
+            feedback: None,
+        })
+    }
+}
+
 /// Install `ctx.planMode`, `exit_plan_mode`, and the `/plan` command.
 ///
 /// # Errors
@@ -222,6 +264,14 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<Arc<PlanRunt
     });
     plan.render(false);
     ctx.provide(Arc::clone(&plan))?;
+    if config.review_provider == ReviewProvider::Auto {
+        let Some(questions) = ctx.get::<UserQuestionsService>() else {
+            return Err(CordisError::Validation(
+                "plan-mode: reviewProvider \"auto\" requires ctx.userQuestions".into(),
+            ));
+        };
+        let _provider = questions.register(Arc::new(AutoApproveQuestions));
+    }
     tools.insert(Arc::new(ExitPlanModeTool {
         plan: Arc::clone(&plan),
         agents,
@@ -361,6 +411,7 @@ mod tests {
             &ctx,
             Config {
                 section: "You are in plan mode.".into(),
+                review_provider: ReviewProvider::None,
             },
         )
         .unwrap();
@@ -497,5 +548,68 @@ mod tests {
             session.events().last().unwrap().data,
             SessionEventData::PlanMode { active: false }
         ));
+    }
+
+    #[test]
+    fn auto_review_requires_user_questions() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        ctx.provide(Arc::new(agents)).unwrap();
+        let err = match install(
+            &ctx,
+            Config {
+                section: "You are in plan mode.".into(),
+                review_provider: ReviewProvider::Auto,
+            },
+        ) {
+            Ok(_) => panic!("auto review without userQuestions must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string()
+                .contains("reviewProvider \"auto\" requires ctx.userQuestions"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_review_provider_approves() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(SystemPrompt::new())).unwrap();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        let agents = AgentRegistry::new();
+        agents.set_factory(Arc::new(StubFactory));
+        agents
+            .create(Arc::new(Session::new(session_id("plan-auto"))))
+            .unwrap();
+        ctx.provide(Arc::new(agents)).unwrap();
+        UserQuestionsService::install(&ctx).unwrap();
+        let plan = install(
+            &ctx,
+            Config {
+                section: "You are in plan mode.".into(),
+                review_provider: ReviewProvider::Auto,
+            },
+        )
+        .unwrap();
+        let agents = ctx.service::<AgentRegistry>().unwrap();
+        let session = agents.get(&session_id("plan-auto")).unwrap().session();
+        plan.set_active(session.as_ref(), true).unwrap();
+        let outcome = ctx
+            .service::<ToolRuntime>()
+            .unwrap()
+            .get("exit_plan_mode")
+            .unwrap()
+            .execute_call(&call(
+                serde_json::json!({ "plan": "# Plan" }),
+                Some("plan-auto"),
+            ))
+            .await
+            .unwrap();
+        assert!(!outcome.is_error);
+        assert!(!plan.is_active());
     }
 }

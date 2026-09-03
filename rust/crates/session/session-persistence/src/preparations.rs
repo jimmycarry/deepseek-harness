@@ -210,6 +210,30 @@ impl SessionPreparations {
         self.lock().remove(id.as_str());
     }
 
+    /// Whether this id has an in-flight, ready, or reserved preparation.
+    pub fn has(&self, id: &SessionId) -> bool {
+        self.lock().entries.contains_key(id.as_str())
+    }
+
+    /// Refuse appends while a resume reservation owns this id.
+    ///
+    /// # Errors
+    /// The id is reserved for an unpublished preparation.
+    pub fn assert_writable(&self, id: &SessionId) -> Result<(), PersistenceError> {
+        let inner = self.lock();
+        if inner
+            .entries
+            .get(id.as_str())
+            .is_some_and(|entry| entry.phase == Phase::Reserved)
+        {
+            return Err(PersistenceError::Format(format!(
+                "cannot append session \"{}\" while its persisted preparation is reserved",
+                id.as_str()
+            )));
+        }
+        Ok(())
+    }
+
     fn finish_load(
         &self,
         id: &SessionId,

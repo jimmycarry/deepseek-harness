@@ -2250,6 +2250,7 @@ async fn compact_preserves_tool_pairing_profile() {
                     vec![ContentBlock::text("done")],
                     false,
                 ),
+                error: None,
             },
             Some(SurfaceOp::append()),
         )

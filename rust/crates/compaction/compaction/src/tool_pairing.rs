@@ -30,12 +30,14 @@ fn cut_balance(session: &Session, seq: u64, offset: usize) -> Result<bool, Strin
     let Some(&index) = index_by_seq.get(&seq) else {
         return Err(format!("tool-pairing balance: surface seq {seq} not found"));
     };
-    cuts.get(index + offset).copied().ok_or_else(|| {
-        format!("tool-pairing balance: surface seq {seq} not found")
-    })
+    cuts.get(index + offset)
+        .copied()
+        .ok_or_else(|| format!("tool-pairing balance: surface seq {seq} not found"))
 }
 
-fn fold_surface(session: &Session) -> Result<(Vec<bool>, std::collections::BTreeMap<u64, usize>), String> {
+fn fold_surface(
+    session: &Session,
+) -> Result<(Vec<bool>, std::collections::BTreeMap<u64, usize>), String> {
     let events = session.events();
     let seqs = session.surface().nodes;
     let mut cuts = vec![true];

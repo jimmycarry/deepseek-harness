@@ -1,18 +1,19 @@
 //! SQLite session store. Newer `user_version` values are refused.
 //!
-//! Physical records are one JSON event row per seq. This crate's
-//! `SCHEMA_VERSION` is monotonic and starts at `1`; it does not read the
-//! TypeScript packed schema.
+//! Physical records are one JSON event row per seq. `append_events` inserts
+//! new rows; torn-row `commit_repair` deletes from the first undecodable or
+//! gapped seq. This crate's `SCHEMA_VERSION` is monotonic and starts at `1`;
+//! it does not read the TypeScript packed schema.
 
 use async_trait::async_trait;
 use dsh_cordis::{Context, Result};
 use dsh_session::{
-    now_ms, refuse_unknown, session_event_from_value, session_id, Session, SessionEvent,
-    SessionEventData, SessionHeader, SessionId, TurnEndReason,
+    interrupted_turn_closers, refuse_unknown, session_event_from_value, session_id, Session,
+    SessionEvent, SessionEventData, SessionHeader, SessionId, TurnEndReason,
 };
 use dsh_session_persistence::{
     session_persistence_revision, PersistenceError, PersistenceRuntime, SessionInspection,
-    SessionPersistenceRevision, SessionPersistenceSnapshot, SessionStoreBackend,
+    SessionPersistenceRevision, SessionPersistenceSnapshot, SessionStoreBackend, StoredSession,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
@@ -110,33 +111,12 @@ fn sqlite_revision(store: &str, event_count: i64, header: &str) -> SessionPersis
     ))
 }
 
-fn repair_open_turn(events: &mut Vec<SessionEvent>) {
-    let mut open: Option<u32> = None;
-    for event in events.iter() {
-        match &event.data {
-            SessionEventData::TurnStart { turn } => open = Some(*turn),
-            SessionEventData::TurnEnd { .. } => open = None,
-            _ => {}
-        }
-    }
-    if let Some(turn) = open {
-        let seq = events.len() as u64;
-        events.push(SessionEvent {
-            seq,
-            time: now_ms(),
-            data: SessionEventData::TurnEnd {
-                turn,
-                reason: TurnEndReason::Interrupted,
-            },
-            source_event_seqs: None,
-            surface_op: None,
-            ignorable: false,
-        });
-    }
-}
-
 #[async_trait]
 impl SessionStoreBackend for SqliteBackend {
+    fn name(&self) -> &str {
+        "sqlite"
+    }
+
     async fn save(&self, session: &Session) -> std::result::Result<(), PersistenceError> {
         let id = session.id().as_str().to_string();
         let payloads = session
@@ -232,7 +212,7 @@ impl SessionStoreBackend for SqliteBackend {
             refuse_unknown(type_name, ignorable)?;
             events.push(session_event_from_value(value)?);
         }
-        repair_open_turn(&mut events);
+        events.extend(interrupted_turn_closers(&events));
         Ok(SessionInspection {
             meta: header,
             events,
@@ -324,17 +304,230 @@ impl SessionStoreBackend for SqliteBackend {
         }
         Ok(snapshots)
     }
+
+    async fn load_stored(
+        &self,
+        id: &SessionId,
+    ) -> std::result::Result<Option<StoredSession>, PersistenceError> {
+        match load_stored_sqlite(self, id) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(PersistenceError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn append_events(
+        &self,
+        header: &SessionHeader,
+        events: &[SessionEvent],
+        materialized: bool,
+    ) -> std::result::Result<(), PersistenceError> {
+        let id = header.id.as_str().to_string();
+        let header_json = serde_json::to_string(header)
+            .map_err(|error| PersistenceError::Format(error.to_string()))?;
+        let payloads = events
+            .iter()
+            .map(|event| {
+                serde_json::to_string(event)
+                    .map_err(|error| PersistenceError::Format(error.to_string()))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let created_at = header.created_at as i64;
+        let db = self.db.lock().expect("sqlite");
+        let tx = db.unchecked_transaction().map_err(sqlite_error)?;
+        if !materialized {
+            tx.execute(
+                "INSERT INTO sessions(id, created_at, header) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET header = excluded.header",
+                rusqlite::params![id, created_at, header_json],
+            )
+            .map_err(sqlite_error)?;
+        } else {
+            let exists: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if exists == 0 {
+                tx.execute(
+                    "INSERT INTO sessions(id, created_at, header) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id, created_at, header_json],
+                )
+                .map_err(sqlite_error)?;
+            }
+        }
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO events(session_id, seq, payload) VALUES (?1, ?2, ?3)")
+                .map_err(sqlite_error)?;
+            for (event, payload) in events.iter().zip(payloads.iter()) {
+                insert
+                    .execute(rusqlite::params![id, event.seq as i64, payload])
+                    .map_err(sqlite_error)?;
+            }
+        }
+        tx.commit().map_err(sqlite_error)?;
+        Ok(())
+    }
+
+    async fn commit_repair(
+        &self,
+        header: &SessionHeader,
+        torn_to: Option<u64>,
+        closers: &[SessionEvent],
+    ) -> std::result::Result<(), PersistenceError> {
+        let id = header.id.as_str().to_string();
+        let closer_payloads = closers
+            .iter()
+            .map(|event| {
+                serde_json::to_string(event)
+                    .map_err(|error| PersistenceError::Format(error.to_string()))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let db = self.db.lock().expect("sqlite");
+        let tx = db.unchecked_transaction().map_err(sqlite_error)?;
+        if let Some(torn) = torn_to {
+            tx.execute(
+                "DELETE FROM events WHERE session_id = ?1 AND seq >= ?2",
+                rusqlite::params![id, torn as i64],
+            )
+            .map_err(sqlite_error)?;
+        }
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO events(session_id, seq, payload) VALUES (?1, ?2, ?3)")
+                .map_err(sqlite_error)?;
+            for (event, payload) in closers.iter().zip(closer_payloads.iter()) {
+                insert
+                    .execute(rusqlite::params![id, event.seq as i64, payload])
+                    .map_err(sqlite_error)?;
+            }
+        }
+        tx.commit().map_err(sqlite_error)?;
+        Ok(())
+    }
 }
 
 /// Provide [`PersistenceRuntime`] over a SQLite file.
 pub fn install(ctx: &Context, path: impl Into<PathBuf>) -> Result<Arc<PersistenceRuntime>> {
+    install_with_options(
+        ctx,
+        path,
+        dsh_session_persistence::DEFAULT_PREPARED_SESSION_CACHE_SIZE,
+        dsh_session_persistence::DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
+    )
+}
+
+/// Provide [`PersistenceRuntime`] with explicit LRU and write-behind delay.
+///
+/// # Errors
+/// Invalid cache/delay, open failure, or write-path registration.
+pub fn install_with_options(
+    ctx: &Context,
+    path: impl Into<PathBuf>,
+    prepared_session_cache_size: usize,
+    write_batch_max_delay_ms: u64,
+) -> Result<Arc<PersistenceRuntime>> {
     let backend = Arc::new(
         SqliteBackend::open(path)
             .map_err(|error| dsh_cordis::CordisError::plugin(error.to_string()))?,
     );
-    let runtime = Arc::new(PersistenceRuntime::new(backend));
+    let runtime = Arc::new(
+        PersistenceRuntime::with_options(
+            backend,
+            prepared_session_cache_size,
+            write_batch_max_delay_ms,
+        )
+        .map_err(|error| dsh_cordis::CordisError::plugin(error.to_string()))?,
+    );
     ctx.provide(Arc::clone(&runtime))?;
+    runtime.install_write_path(ctx)?;
     Ok(runtime)
+}
+
+fn load_stored_sqlite(
+    backend: &SqliteBackend,
+    id: &SessionId,
+) -> std::result::Result<StoredSession, PersistenceError> {
+    let key = id.as_str().to_string();
+    let (header, rows) = {
+        let db = backend.db.lock().expect("sqlite");
+        let header: Option<String> = {
+            let mut stmt = db
+                .prepare("SELECT header FROM sessions WHERE id = ?1")
+                .map_err(sqlite_error)?;
+            stmt.query_row([&key], |row| row.get(0))
+                .optional()
+                .map_err(sqlite_error)?
+        };
+        let mut stmt = db
+            .prepare("SELECT seq, payload FROM events WHERE session_id = ?1 ORDER BY seq")
+            .map_err(sqlite_error)?;
+        let mapped = stmt
+            .query_map([&key], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        let rows = mapped
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
+        (header, rows)
+    };
+    let Some(header) = header else {
+        return Err(PersistenceError::NotFound(id.as_str().to_string()));
+    };
+    let header: SessionHeader = serde_json::from_str(&header)
+        .map_err(|error| PersistenceError::Format(error.to_string()))?;
+    if header.id.as_str() != id.as_str() {
+        return Err(PersistenceError::Format(format!(
+            "stored header id {} does not match requested session {}",
+            header.id.as_str(),
+            id.as_str()
+        )));
+    }
+    let mut events = Vec::new();
+    let mut torn_to = None;
+    let mut expected = 0u64;
+    for (seq, payload) in rows {
+        let physical = seq as u64;
+        if physical != expected {
+            torn_to = Some(physical);
+            break;
+        }
+        let value: Value = match serde_json::from_str(&payload) {
+            Ok(value) => value,
+            Err(_) => {
+                torn_to = Some(physical);
+                break;
+            }
+        };
+        let type_name = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let ignorable = value
+            .get("ignorable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if refuse_unknown(type_name, ignorable).is_err() {
+            torn_to = Some(physical);
+            break;
+        }
+        match session_event_from_value(value) {
+            Ok(event) => events.push(event),
+            Err(_) => {
+                torn_to = Some(physical);
+                break;
+            }
+        }
+        expected += 1;
+    }
+    Ok(StoredSession {
+        inspection: SessionInspection {
+            meta: header,
+            events,
+        },
+        torn_to,
+    })
 }
 
 #[cfg(test)]
@@ -510,6 +703,46 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn append_and_torn_load_commit_repair() {
+        let path = tmp_path("append-torn");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let header = SessionHeader::new(session_id("s"), None);
+        let session = Session::with_header(header.clone());
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        backend
+            .append_events(&header, &session.events(), false)
+            .await
+            .unwrap();
+        {
+            let db = backend.db.lock().expect("sqlite");
+            db.execute(
+                "INSERT INTO events(session_id, seq, payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["s", 1i64, "{not-json"],
+            )
+            .unwrap();
+        }
+        let stored = backend.load_stored(&header.id).await.unwrap().unwrap();
+        assert_eq!(stored.inspection.events.len(), 1);
+        assert_eq!(stored.torn_to, Some(1));
+        let runtime = PersistenceRuntime::new(Arc::new(backend) as _);
+        runtime.load(&header.id).await.unwrap();
+        let reopened = SqliteBackend::open(&path).unwrap();
+        let after = reopened.load_stored(&header.id).await.unwrap().unwrap();
+        assert_eq!(after.inspection.events.len(), 2);
+        assert!(after.torn_to.is_none());
+        assert!(matches!(
+            after.inspection.events.last().unwrap().data,
+            SessionEventData::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -4,23 +4,27 @@
 //! mount as no-ops so the headless tree can load; their behavior is filled
 //! in later without changing the composition identity.
 
-use dsh_credentials::CredentialsRuntime;
 use dsh_agent::{AgentDefaultModel, AgentRegistry};
 use dsh_agent_loop::AgentLoop;
+use dsh_attachment::{AttachmentStore, ImageAttachmentRef};
 use dsh_bash_local::BashLocal;
 use dsh_commands::CommandRegistry;
 use dsh_cordis::{Context, CordisError, Result, Service};
+use dsh_credentials::CredentialsRuntime;
 use dsh_fs::FsRuntime;
-use dsh_llm::{resolve_retry_policy, LlmAdapter, LlmError, LlmRequest, LlmRuntime, StreamChunk};
+use dsh_llm::{
+    resolve_retry_policy, ContentBlock, LlmAdapter, LlmError, LlmFailure, LlmRequest, LlmRuntime,
+    Message, StreamChunk,
+};
 use dsh_llm_replay::ReplayAdapter;
 use dsh_sandbox::SandboxRuntime;
 use dsh_session::SessionStore;
+use dsh_settings_file::SettingsRuntime;
 use dsh_shell::ShellRuntime;
 use dsh_subprocess::SubprocessRuntime;
 use dsh_subprocess_local::LocalSubprocess;
 use dsh_system_prompt::{PromptSection, SystemPrompt};
 use dsh_tool_bash::BashTool;
-use dsh_settings_file::SettingsRuntime;
 use dsh_tool_fs::{EditTool, ReadTool, WriteTool};
 use dsh_tools::ToolRuntime;
 use futures::stream::BoxStream;
@@ -219,7 +223,8 @@ fn apply_persistence_sqlite(ctx: &Context, config: Option<Value>) -> Result<()> 
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent).map_err(|error| CordisError::plugin(error.to_string()))?;
     }
-    dsh_session_persistence_sqlite::install(ctx, path)?;
+    let (cache, delay) = persistence_options(config.as_ref())?;
+    dsh_session_persistence_sqlite::install_with_options(ctx, path, cache, delay)?;
     Ok(())
 }
 
@@ -309,8 +314,28 @@ fn apply_persistence(ctx: &Context, config: Option<Value>) -> Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| CordisError::Validation("session-persistence-jsonl requires root".into()))?;
     std::fs::create_dir_all(dir).map_err(|error| CordisError::plugin(error.to_string()))?;
-    dsh_session_persistence_jsonl::install(ctx, dir)?;
+    let (cache, delay) = persistence_options(config.as_ref())?;
+    dsh_session_persistence_jsonl::install_with_options(ctx, dir, cache, delay)?;
     Ok(())
+}
+
+fn persistence_options(config: Option<&Value>) -> Result<(usize, u64)> {
+    let cache = match config.and_then(|value| value.get("preparedSessionCacheSize")) {
+        None | Some(Value::Null) => dsh_session_persistence::DEFAULT_PREPARED_SESSION_CACHE_SIZE,
+        Some(value) => {
+            let Some(size) = value.as_u64().filter(|size| *size >= 1) else {
+                return Err(CordisError::Validation(
+                    "preparedSessionCacheSize must be a positive safe integer".into(),
+                ));
+            };
+            size as usize
+        }
+    };
+    let delay = dsh_session_persistence::parse_write_batch_max_delay_ms(
+        config.and_then(|value| value.get("writeBatchMaxDelayMs")),
+    )
+    .map_err(CordisError::Validation)?;
+    Ok((cache, delay))
 }
 
 fn apply_subprocess(ctx: &Context) -> Result<()> {
@@ -339,8 +364,8 @@ fn apply_sandbox(ctx: &Context, config: Option<Value>) -> Result<()> {
 }
 
 fn apply_sandbox_policy(ctx: &Context, config: Option<Value>) -> Result<()> {
-    let resolved = dsh_sandbox_policy::Config::resolve(config.as_ref())
-        .map_err(CordisError::Validation)?;
+    let resolved =
+        dsh_sandbox_policy::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     if !ctx.has_service(SandboxRuntime::KEY) {
         dsh_sandbox_local::install(ctx, resolved.workspace_root.clone())?;
     }
@@ -456,16 +481,13 @@ fn apply_tool_bash(ctx: &Context, config: Option<Value>) -> Result<()> {
     apply_shell(ctx)?;
     let tools = ensure_tools(ctx)?;
     let shell = ctx.service::<ShellRuntime>()?;
-    dsh_tool_bash::require_confining_policy(ctx, shell.as_ref()).map_err(CordisError::Validation)?;
+    dsh_tool_bash::require_confining_policy(ctx, shell.as_ref())
+        .map_err(CordisError::Validation)?;
     let resolved =
         dsh_tool_bash::Config::resolve(config.as_ref()).map_err(CordisError::Validation)?;
     let jobs = ctx.get::<dsh_jobs::JobRegistry>();
-    let mut tool = BashTool::with_jobs(
-        shell,
-        jobs,
-        resolved.enable_run_in_background,
-    )
-    .with_context(ctx.clone());
+    let mut tool = BashTool::with_jobs(shell, jobs, resolved.enable_run_in_background)
+        .with_context(ctx.clone());
     if let Some(shell_env) = ctx.get::<dsh_shell_env::ShellEnvRegistry>() {
         tool = tool.with_shell_env(shell_env);
     }
@@ -806,7 +828,8 @@ fn apply_llm_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
     if let Some(settings) = ctx.get::<SettingsRuntime>() {
         settings.register("llm-deepseek")?;
     }
-    let catalog = dsh_llm_deepseek::resolve_catalog(config.as_ref()).map_err(CordisError::Validation)?;
+    let catalog =
+        dsh_llm_deepseek::resolve_catalog(config.as_ref()).map_err(CordisError::Validation)?;
     let retry_policy = resolve_retry_policy(
         config.as_ref().and_then(|value| value.get("retryPolicy")),
         "llm-deepseek.retryPolicy",
@@ -815,6 +838,7 @@ fn apply_llm_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
     ctx.provide(Arc::new(LlmRuntime::new(Arc::new(LiveDeepSeekAdapter {
         settings: ctx.get::<SettingsRuntime>(),
         credentials: ctx.get::<CredentialsRuntime>(),
+        attachments: ctx.get::<AttachmentStore>(),
         plugin_config: config,
         last_good: Mutex::new(Some(catalog)),
         retry_policy,
@@ -824,6 +848,7 @@ fn apply_llm_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
 struct LiveDeepSeekAdapter {
     settings: Option<Arc<SettingsRuntime>>,
     credentials: Option<Arc<CredentialsRuntime>>,
+    attachments: Option<Arc<AttachmentStore>>,
     plugin_config: Option<Value>,
     last_good: Mutex<Option<(u32, Vec<dsh_llm_deepseek::CatalogModel>)>>,
     retry_policy: dsh_llm::RetryPolicy,
@@ -835,7 +860,9 @@ fn resolve_deepseek(
 ) -> (String, String, String) {
     let section = dsh_llm_deepseek::merge_connection_config(
         plugin,
-        settings.and_then(|settings| settings.section("llm-deepseek")).as_ref(),
+        settings
+            .and_then(|settings| settings.section("llm-deepseek"))
+            .as_ref(),
     );
     let api_key_env = section
         .get("apiKeyEnv")
@@ -856,7 +883,9 @@ fn resolve_deepseek(
     (api_key_env, base_url, model)
 }
 
-fn catalog_for(adapter: &LiveDeepSeekAdapter) -> Result<(u32, Vec<dsh_llm_deepseek::CatalogModel>), LlmError> {
+fn catalog_for(
+    adapter: &LiveDeepSeekAdapter,
+) -> Result<(u32, Vec<dsh_llm_deepseek::CatalogModel>), LlmError> {
     let section = dsh_llm_deepseek::merge_connection_config(
         adapter.plugin_config.as_ref(),
         adapter
@@ -871,7 +900,12 @@ fn catalog_for(adapter: &LiveDeepSeekAdapter) -> Result<(u32, Vec<dsh_llm_deepse
             Ok(catalog)
         }
         Err(error) => {
-            if let Some(good) = adapter.last_good.lock().expect("llm-deepseek catalog").clone() {
+            if let Some(good) = adapter
+                .last_good
+                .lock()
+                .expect("llm-deepseek catalog")
+                .clone()
+            {
                 Ok(good)
             } else {
                 Err(LlmError::Failure(dsh_llm::LlmFailure::new(error, "CONFIG")))
@@ -889,10 +923,12 @@ impl LlmAdapter for LiveDeepSeekAdapter {
         let (api_key_env, base_url, model) =
             resolve_deepseek(self.settings.as_deref(), self.plugin_config.as_ref());
         let api_key = dsh_llm_deepseek::resolve_api_key(self.credentials.as_deref(), &api_key_env)?;
+        let images = collect_request_images(&request, self.attachments.as_deref())?;
         dsh_llm_deepseek::DeepSeekAdapter {
             api_key,
             base_url,
             model,
+            images,
         }
         .stream(request)
         .await
@@ -952,28 +988,80 @@ fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
         }
     }
     if let Some(providers) = config.as_ref().and_then(|value| value.get("providers")) {
-        let parsed = serde_json::from_value::<Vec<dsh_llm_replay::ReplayProviderConfig>>(
-            providers.clone(),
-        )
-        .map_err(|error| {
-            CordisError::Validation(format!("llm-replay: invalid providers catalog: {error}"))
-        })?;
+        let parsed =
+            serde_json::from_value::<Vec<dsh_llm_replay::ReplayProviderConfig>>(providers.clone())
+                .map_err(|error| {
+                    CordisError::Validation(format!(
+                        "llm-replay: invalid providers catalog: {error}"
+                    ))
+                })?;
         let array = providers.as_array().ok_or_else(|| {
             CordisError::Validation("llm-replay: providers must be an array".into())
         })?;
         let mut policies = std::collections::HashMap::new();
         for (index, provider) in parsed.iter().enumerate() {
             let raw = array.get(index).and_then(|item| item.get("retryPolicy"));
-            let policy = resolve_retry_policy(
-                raw,
-                &format!("llm-replay: providers[{index}].retryPolicy"),
-            )
-            .map_err(CordisError::Validation)?;
+            let policy =
+                resolve_retry_policy(raw, &format!("llm-replay: providers[{index}].retryPolicy"))
+                    .map_err(CordisError::Validation)?;
             policies.insert(provider.id.clone(), policy);
         }
-        adapter = adapter
-            .with_providers(parsed)
-            .with_retry_policies(policies);
+        adapter = adapter.with_providers(parsed).with_retry_policies(policies);
     }
     ctx.provide(Arc::new(LlmRuntime::new(Arc::new(adapter))))
+}
+
+fn collect_request_images(
+    request: &LlmRequest,
+    store: Option<&AttachmentStore>,
+) -> std::result::Result<std::collections::HashMap<String, Vec<u8>>, LlmError> {
+    let mut images = std::collections::HashMap::new();
+    for message in &request.messages {
+        let blocks: &[ContentBlock] = match message {
+            Message::User(user) => &user.content,
+            Message::Assistant(assistant) => &assistant.content,
+            Message::Tool(tool) => tool.result_blocks(),
+        };
+        for block in blocks {
+            let ContentBlock::Image { attachment } = block else {
+                continue;
+            };
+            let Some(store) = store else {
+                return Err(LlmError::Failure(LlmFailure::new(
+                    format!(
+                        "DeepSeek request image {} was not prepared.",
+                        attachment.attachment_id
+                    ),
+                    "INVALID_REQUEST",
+                )));
+            };
+            let media_type = dsh_attachment::ImageMediaType::parse(&attachment.media_type)
+                .ok_or_else(|| {
+                    LlmError::Failure(LlmFailure::new(
+                        format!(
+                            "DeepSeek request image {} has an unsupported media type.",
+                            attachment.attachment_id
+                        ),
+                        "INVALID_REQUEST",
+                    ))
+                })?;
+            let stored = store
+                .read_image(&ImageAttachmentRef {
+                    attachment_id: attachment.attachment_id.clone(),
+                    media_type,
+                    bytes: attachment.bytes,
+                    width: attachment.width,
+                    height: attachment.height,
+                    name: attachment.name.clone(),
+                })
+                .map_err(|error| {
+                    LlmError::Failure(LlmFailure::new(error.to_string(), error.code()))
+                })?;
+            let prepared = dsh_attachment_local::request_image(&stored.data).map_err(|error| {
+                LlmError::Failure(LlmFailure::new(error.to_string(), error.code()))
+            })?;
+            images.insert(attachment.attachment_id.clone(), prepared);
+        }
+    }
+    Ok(images)
 }

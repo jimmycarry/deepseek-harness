@@ -50,18 +50,18 @@
 
 ### P0 — 已交付 profile 的正确性（Linux）
 
-1. **会话 persistence 协调器** — 无 write-behind（`writeBatchMaxDelayMs`），无公开的 `prepare` / `readFrom` / `append`，无耐久 `commitRepair`；JSONL 与 SQLite 的 `save()` 整份重写日志（[`packages/session/session-persistence`](../../packages/session/session-persistence/README.md)，[`rust/crates/session/session-persistence/src/lib.rs`](../crates/session/session-persistence/src/lib.rs)，[`session-persistence-sqlite`](../crates/session/session-persistence-sqlite/src/lib.rs) 先 `DELETE FROM events` 再插入）。
-2. **LLM DeepSeek 传输** — 仅 `"stream": false` 的 JSON POST；无 SSE、无图像块、无 Files API（[`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)）。
-3. **附件栅格流水线** — 只做魔数与头尺寸检查；无解码、sRGB 归一化或 request-image 投影（[`rust/crates/attachment/attachment-local/src/lib.rs`](../crates/attachment/attachment-local/src/lib.rs)）。
-4. **ACP 图像提示** — `promptCapabilities.image: false`；内联图像拒绝（[`rust/crates/acp/acp/src/lib.rs`](../crates/acp/acp/src/lib.rs)）。被附件与 vision 挡住。
-5. **settings Service Definition** — 只有 `settings-file`；没有 `packages/settings/settings` 的 register / watch / revision / mutate API。
-6. **headless 上的 plan-mode 评审** — `exit_plan_mode` 需要 `ctx.userQuestions` provider；headless 按 TypeScript 文句失败闭合（[`rust/crates/plan/plan-mode/src/lib.rs`](../crates/plan/plan-mode/src/lib.rs)）。
+1. **会话 persistence 协调器** — **已关闭。** `PersistenceRuntime` 的 write-behind（`writeBatchMaxDelayMs`，默认 200，后续 append 不重置窗口）、公开的 `create` / `append` / `prepare` / `readFrom`，以及 JSONL（截到最后一个完整 `\n`）与 SQLite（从第一个无法解码或出现缺口的 seq 起 `DELETE`）上的耐久 `commitRepair`。SQLite 保持 schema `2`。`inspect` 仍在内存中合成 closer（[`rust/crates/session/session-persistence/src/lib.rs`](../crates/session/session-persistence/src/lib.rs)）。
+2. **LLM DeepSeek 传输** — SSE 与图像块 **已关闭。** `"stream": true` 加 `stream_options.include_usage`；解析 `data:` / `[DONE]`；缺少 `[DONE]` 为 `STREAM_CLOSED`；`finish` / `usage` 只在 `[DONE]` 之后发出。vision 模型（`model` 含 `vision`）把用户图像做成 `image_url` data-URL。Files API 上传未挂载（[`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)）。
+3. **附件栅格流水线** — **已关闭。** `request_image` 解码、按最长边缩小（`normalizedImageMaxDimension`，默认 2048），并在 `normalizedImageMaxBytes`（默认 4 MiB）下重编码为 JPEG。质量 85 再 80 后仍超上限则为 `IMAGE_TOO_LARGE`（[`rust/crates/attachment/attachment-local/src/lib.rs`](../crates/attachment/attachment-local/src/lib.rs)）。
+4. **ACP 图像提示** — **已关闭。** 仅当挂了 `ctx.attachments` 且 `AgentDefaultModel` 为 vision 时广告 `image: true`；经 `save_image` 接纳 `image` 块。默认 headless 仍为 `image: false`，并以 `inline image prompts were not advertised by this connection` 拒绝（[`rust/crates/acp/acp/src/lib.rs`](../crates/acp/acp/src/lib.rs)）。
+5. **settings Service Definition** — 在 `settings-file`（`ctx.settings`）上 **已关闭**：`register` / `watch` / `revision` / `mutate` / `describe`，以及 `settings/updated`（`ns`、`revision`、`value`）与 `settings/document-updated`（`revision`）。独立的 `settings` crate 仍缺席。
+6. **headless 上的 plan-mode 评审** — **已关闭。** 默认无 provider，以 `no user-questions provider is registered` 失败。Config `reviewProvider: "auto"` 挂载选取第一项的 approver；该选项在没有 `ctx.userQuestions` 时于 install 失败。默认 headless patch 不设置 `reviewProvider`（[`rust/crates/plan/plan-mode/src/lib.rs`](../crates/plan/plan-mode/src/lib.rs)）。
 7. **agent-loop 的 finish-chunk 错误** — loop 在 `stream()` `Err` 时结束 turn，且只有 `FinishReason::MaxTokens` 改变 turn 结束；流内 `finish { kind: error \| aborted }` 被记录后 turn 仍完成（[`rust/crates/core/agent-loop/src/lib.rs`](../crates/core/agent-loop/src/lib.rs)）。**只报告；不要改 `dsh-agent-loop` 来关闭本行。**
 
 ### P1 — 已交付 profile 上的耐久性与运维
 
-8. 协调器落地后，从插件 `install` Config 接通 `preparedSessionCacheSize` / `writeBatchMaxDelayMs`（`PersistenceRuntime` 上默认 5 的 LRU 已存在）。
-9. `readFrom` / 后缀读取。
+8. 从插件 `install` Config 接通 `preparedSessionCacheSize` / `writeBatchMaxDelayMs` — 随 P0-1 **已关闭**（`dsh-app-boot` / `PersistenceRuntime`）。
+9. `readFrom` / 后缀读取 — 随 P0-1 **已关闭**（`PersistenceRuntime::read_from`）。
 10. `session-projection-cache`（无 crate）。
 11. session-query FTS（[`rust/crates/bundle/base/cordis.patch.yml`](../crates/bundle/base/cordis.patch.yml) 里 `openAt: never`；SQLite FTS schema 1 对 TypeScript 8）。
 12. 在需要取 URL 的 profile 里启用 `web-fetch-http`（crate 已在；base 为 `fetch: false`）。
@@ -105,15 +105,12 @@
 
 ## 建议关闭顺序
 
-1. persistence 协调器（write-behind、耐久 `commitRepair`、append）——解锁正确 resume 与冷 `list_agents` inspect。
-2. DeepSeek SSE + 图像块。
-3. 附件归一化——vision 与 ACP 图像的前提。
-4. settings Service Definition——adapter 不再临时读文件。
-5. headless 的 plan 评审 provider，或在无 provider 时保持 TypeScript 失败文句的明确自动化旁路。
-6. 记录 loop 的 finish-chunk 差距；此处不改 `dsh-agent-loop`。
-7. session-query FTS 可选开启、web fetch 启用、skill 监听、OTel flush、SDK 助手、外部子代理。
-8. 仅当那些 headless 宿主进入范围时，再做平台沙箱与 PTY/LSP。
-9. 仅在上面的 headless spine 差距关闭之后，才让 Rust 做现有 TypeScript Web 客户端的宿主。
+1. persistence 协调器、DeepSeek SSE + 图像块、附件归一化、settings Service Definition、headless plan 评审 — **已关闭**（P0 第 1–6 项）。
+2. 记录 loop 的 finish-chunk 差距；此处不改 `dsh-agent-loop`（P0 第 7 项，只报告）。
+3. DeepSeek Files API 上传（内联 `image_url` data-URL 已交付）。
+4. session-query FTS 可选开启、web fetch 启用、skill 监听、OTel flush、SDK 助手、外部子代理。
+5. 仅当那些 headless 宿主进入范围时，再做平台沙箱与 PTY/LSP。
+6. 仅在上面的 headless spine 差距关闭之后，才让 Rust 做现有 TypeScript Web 客户端的宿主。
 
 ## 分组对照表
 
@@ -123,7 +120,7 @@
 
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
-| `acp` | thinner | 文本 ACP 已交付；`promptCapabilities.image/audio/embeddedContext` 为 false；图像提示拒绝 | P0（图像，在附件之后） |
+| `acp` | 图像提示 aligned | 仅在有 `ctx.attachments` + vision 默认模型时广告 `image: true`；audio / embeddedContext 仍为 false | remaining（audio / resource） |
 
 ### api
 
@@ -137,13 +134,13 @@
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
 | `attachment` | aligned | 存储类型已在 | — |
-| `attachment-local` | thinner | 只校验 + 存储；无 Sharp 归一化 / request-image 缓存 | P0 |
+| `attachment-local` | aligned | 魔数准入加 `request_image` JPEG 归一化 | remaining（Files API 在 DeepSeek 侧） |
 
 ### boot
 
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
-| `app-boot` | thinner | headless 树真实挂载；剩余名字空操作 | P1（接通 persistence Config）；空操作见上 |
+| `app-boot` | thinner | headless 树真实挂载；剩余名字空操作；persistence Config（`preparedSessionCacheSize` / `writeBatchMaxDelayMs`）已接通 | P1 空操作见上 |
 | `cmdline` | absent | TypeScript 共享 argv 解析；Rust 把任务旗标内联进 headless 启动 | P2 |
 
 ### bundle
@@ -260,7 +257,7 @@
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
 | `commands` / `permission-presets` / `user-approval` | aligned | headless 的 `never` / `ask` 失败闭合 | — |
-| `user-questions` | thinner | 有服务无 provider | P0（plan 评审） |
+| `user-questions` | thinner | 有服务、无默认 provider；plan-mode 可选择 `reviewProvider: "auto"` | remaining（交互式 provider） |
 | `tool-ask-user` | absent | 模型的 `ask_user_question` | P1 |
 
 ### jobs
@@ -272,7 +269,7 @@
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
 | `llm` | aligned | chunk 标签含 `FinishReason::Error` | P0 消费者必须遵守 |
-| `llm-deepseek` | thinner | 非流式 POST；仅文本；retry/classify/`Retry-After` 已对齐 | P0 SSE + 图像 |
+| `llm-deepseek` | thinner | SSE + 用户 `image_url` data-URL 已对齐；无 Files API 上传；retry/classify/`Retry-After` 已对齐 | remaining（Files API） |
 | `llm-retry` / `token-meter` | aligned | `providerRetryAfterMs` 超上限规则 | — |
 | `llm-pi-ai` | no-op | bundle 行，无 crate | P2 |
 | `llm-replay` | remap | 在 `llm/` 下 | — |
@@ -289,7 +286,7 @@
 
 ### plan
 
-`plan-mode`：**thinner** / **P0**（评审路径）。工具与 `plan/mode` 事件已交付。
+`plan-mode`：`/plan` + `exit_plan_mode` 与可选 `reviewProvider: "auto"` **aligned**。默认评审保持失败闭合。
 
 ### preset
 
@@ -321,9 +318,9 @@
 
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
-| `session-persistence` | thinner | `save` / `load` / `inspect` / list / revision；无协调器、`prepare`、`readFrom`、`commitRepair` | P0 |
-| `session-persistence-jsonl` | thinner | 原子整文件重写；inspect 修复留在内存 | P0 |
-| `session-persistence-sqlite` | thinner | schema 2；保存时 `DELETE` 再插入 | P0 append；schema 17 为 **skip** |
+| `session-persistence` | aligned | write-behind、`create` / `append` / `prepare` / `readFrom`、`load` 的耐久 `commitRepair`；`inspect` 仍是内存 closer | remaining（read-repair / incarnation） |
+| `session-persistence-jsonl` | aligned | header + 事件 + `list` + 撕毁最后一行的 `commitRepair` | remaining（read-repair） |
+| `session-persistence-sqlite` | aligned | schema 2 加撕毁行 `commitRepair`；schema 17 为 **skip** | remaining（read-repair） |
 | `session-projection` | aligned | registry 已在 | — |
 | `session-checkpoint-policy` | aligned | 模型请求与顶层工具分派前刷盘 | P1（与 write-behind 一起回归） |
 | `session-telemetry` / `session-telemetry-otel` | thinner | OTLP 日志 + `Retry-After` + keepAlive；无 flush 提示；无 metrics | P1 flush；metrics **skip** |
@@ -346,8 +343,8 @@
 
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
-| `settings-file` | thinner | 文件文档 + YAML 叶级 `update`；无 namespace Service Definition | P0 |
-| `settings` | absent | `register` / `watch` / `revision` / `mutate` / `describe` | P0 |
+| `settings-file` | aligned | 文件文档、YAML 叶级 `update` / `replace`，以及 `register` / `watch` / `revision` / `mutate` / `describe` 与 settings 事件 | remaining（本 crate 无剩余） |
+| `settings` | absent | 方法在 `settings-file`（`ctx.settings`）上；无独立 Definition crate | remaining（仅当角色独立演化时再拆） |
 
 ### shell
 
@@ -438,7 +435,7 @@
 
 ## 已经对齐（不要再当成差距打开）
 
-凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、inspect LRU 默认 `preparedSessionCacheSize` 5、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（headless 评审除外）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题。
+凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、persistence write-behind / `append` / 耐久 `commitRepair` / inspect LRU `preparedSessionCacheSize`、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（含可选 `reviewProvider: "auto"`；默认 headless 评审仍失败闭合）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题、附件 `request_image`、在 store + vision 挂载时的 ACP 图像提示、DeepSeek SSE + `image_url` data-URL、settings 的 `register` / `watch` / `revision` / `mutate`。
 
 ## 验证
 

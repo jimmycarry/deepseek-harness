@@ -54,6 +54,11 @@ impl TokenMeter {
                 ContentBlock::ToolResult { content, .. } => {
                     tokens += self.estimate_content(content) + BLOCK_OVERHEAD;
                 }
+                ContentBlock::Image { attachment } => {
+                    tokens += self
+                        .tokens_for(attachment.attachment_id.len() + attachment.media_type.len())
+                        + BLOCK_OVERHEAD;
+                }
             }
         }
         tokens

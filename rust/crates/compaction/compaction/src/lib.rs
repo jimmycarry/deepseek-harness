@@ -172,6 +172,7 @@ mod tests {
                         vec![ContentBlock::text("done")],
                         false,
                     ),
+                    error: None,
                 },
                 Some(SurfaceOp::append()),
             )

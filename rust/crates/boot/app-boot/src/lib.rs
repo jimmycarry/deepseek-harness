@@ -88,7 +88,8 @@ pub fn compose_profile(
     home_patch: &[EntryPatch],
     overlay: &[EntryPatch],
 ) -> Result<Vec<Entry>, LoaderError> {
-    let mut layers: Vec<Vec<EntryPatch>> = bundles.iter().map(|layer| layer.patches.clone()).collect();
+    let mut layers: Vec<Vec<EntryPatch>> =
+        bundles.iter().map(|layer| layer.patches.clone()).collect();
     if !profile_patch.is_empty() {
         layers.push(profile_patch.to_vec());
     }
@@ -234,7 +235,10 @@ mod tests {
             .map(|entry| entry.id.as_deref().expect("composed row has id"))
             .collect();
         assert_eq!(ids, HEADLESS_IDS);
-        let hmr = entries.iter().find(|entry| entry.id.as_deref() == Some("hmr")).unwrap();
+        let hmr = entries
+            .iter()
+            .find(|entry| entry.id.as_deref() == Some("hmr"))
+            .unwrap();
         assert_eq!(
             hmr.disabled.as_ref().and_then(|value| value.as_bool()),
             Some(true)

@@ -482,6 +482,7 @@ impl LoopAgent {
                             turn,
                             step,
                             message: tool_message,
+                            error: None,
                         },
                         SurfaceOp::append(),
                         call_seq.map(|seq| vec![seq]).unwrap_or_default(),

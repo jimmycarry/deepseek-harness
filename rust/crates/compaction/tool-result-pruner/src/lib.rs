@@ -122,6 +122,7 @@ impl ToolResultPruner {
                 turn,
                 step,
                 message,
+                ..
             } = &event.data
             else {
                 continue;
@@ -158,6 +159,7 @@ impl ToolResultPruner {
                     turn: *turn,
                     step: *step,
                     message: replacement,
+                    error: None,
                 },
                 SurfaceOp::Replace {
                     start: seq,
@@ -249,6 +251,7 @@ mod tests {
                         vec![ContentBlock::text(long)],
                         false,
                     ),
+                    error: None,
                 },
                 Some(SurfaceOp::append()),
             )

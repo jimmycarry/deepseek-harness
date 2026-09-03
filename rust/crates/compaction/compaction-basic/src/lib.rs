@@ -12,7 +12,7 @@ use dsh_llm::{
     BlockAssembler, ContentBlock, FinishReason, LlmCallConfig, LlmRequest, LlmRuntime, Message,
     MessageSource, StreamChunk, UserMessage,
 };
-use dsh_session::{session_id, derive_event_message, Session, SessionEventData, SurfaceOp};
+use dsh_session::{derive_event_message, session_id, Session, SessionEventData, SurfaceOp};
 use dsh_session_persistence::PersistenceRuntime;
 use dsh_token_meter::TokenMeter;
 use futures::executor::block_on;
@@ -143,11 +143,12 @@ impl CompactionPolicy {
                 return Err("BasicCompactionConfig: auto must be a boolean".into());
             }
         }
-        let threshold_ratio = optional_ratio(config, "thresholdRatio")?
-            .unwrap_or(DEFAULT_THRESHOLD_RATIO);
+        let threshold_ratio =
+            optional_ratio(config, "thresholdRatio")?.unwrap_or(DEFAULT_THRESHOLD_RATIO);
         let retention = resolve_retention(config, ResolvedRetention::Ratio(DEFAULT_RETAIN_RATIO))?;
         validate_ratio_retention(threshold_ratio, retention, "BasicCompactionConfig")?;
-        let model_policies = resolve_model_policies(config.and_then(|value| value.get("modelPolicies")))?;
+        let model_policies =
+            resolve_model_policies(config.and_then(|value| value.get("modelPolicies")))?;
         for (index, policy) in model_policies.iter().enumerate() {
             validate_ratio_retention(
                 policy.threshold_ratio.unwrap_or(threshold_ratio),
@@ -169,8 +170,12 @@ impl CompactionPolicy {
                 .unwrap_or(true),
             summarization_provider: string_field(config, "summarizationProvider")?,
             summarization_model: string_field(config, "summarizationModel")?,
-            max_tokens: optional_positive_int(config, "maxTokens", "BasicCompactionConfig.maxTokens")?
-                .unwrap_or(8192),
+            max_tokens: optional_positive_int(
+                config,
+                "maxTokens",
+                "BasicCompactionConfig.maxTokens",
+            )?
+            .unwrap_or(8192),
             compaction_retries: optional_non_negative_int(
                 config,
                 "compactionRetries",
@@ -190,9 +195,10 @@ impl CompactionPolicy {
     /// Merge the exact provider/model override over the default policy.
     #[must_use]
     pub fn resolve_target(&self, provider: &str, model: &str) -> ResolvedTargetPolicy {
-        let override_policy = self.model_policies.iter().find(|policy| {
-            policy.provider == provider && policy.model == model
-        });
+        let override_policy = self
+            .model_policies
+            .iter()
+            .find(|policy| policy.provider == provider && policy.model == model);
         let inherited = self.default_retention();
         ResolvedTargetPolicy {
             threshold_ratio: override_policy
@@ -239,8 +245,7 @@ impl CompactionPolicy {
     }
 }
 
-impl ResolvedTargetPolicy {
-}
+impl ResolvedTargetPolicy {}
 
 fn validate_keys(value: &Value, keys: &[&str], name: &str) -> Result<(), String> {
     let Some(map) = value.as_object() else {
@@ -267,19 +272,27 @@ fn validate_policy(config: Option<&Value>, name: &str) -> Result<(), String> {
     if config.and_then(|value| value.get("retainRatio")).is_some()
         && config.and_then(|value| value.get("retainTokens")).is_some()
     {
-        return Err(format!("{name}: retainRatio and retainTokens are mutually exclusive"));
+        return Err(format!(
+            "{name}: retainRatio and retainTokens are mutually exclusive"
+        ));
     }
     if config.and_then(|value| value.get("maxTokens")).is_some() {
         optional_positive_int(config, "maxTokens", &format!("{name}.maxTokens"))?;
     }
-    if config.and_then(|value| value.get("compactionRetries")).is_some() {
+    if config
+        .and_then(|value| value.get("compactionRetries"))
+        .is_some()
+    {
         optional_non_negative_int(
             config,
             "compactionRetries",
             &format!("{name}.compactionRetries"),
         )?;
     }
-    if config.and_then(|value| value.get("maxOverflowRetries")).is_some() {
+    if config
+        .and_then(|value| value.get("maxOverflowRetries"))
+        .is_some()
+    {
         optional_non_negative_int(
             config,
             "maxOverflowRetries",
@@ -466,9 +479,10 @@ fn optional_positive_int(
     match config.and_then(|value| value.get(key)) {
         None => Ok(None),
         Some(value) => {
-            let number = value.as_u64().filter(|value| *value > 0).ok_or_else(|| {
-                format!("{name} ({value}) must be a positive integer")
-            })?;
+            let number = value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("{name} ({value}) must be a positive integer"))?;
             Ok(Some(number as u32))
         }
     }
@@ -482,9 +496,9 @@ fn optional_non_negative_int(
     match config.and_then(|value| value.get(key)) {
         None => Ok(None),
         Some(value) => {
-            let number = value.as_u64().ok_or_else(|| {
-                format!("{name} ({value}) must be a non-negative integer")
-            })?;
+            let number = value
+                .as_u64()
+                .ok_or_else(|| format!("{name} ({value}) must be a non-negative integer"))?;
             Ok(Some(number))
         }
     }
@@ -562,7 +576,8 @@ impl BasicCompactionEngine {
                                 let _pressure = meter.estimate_session(&agent.session());
                             }
                             let _ = block_on(
-                                engine.compact_if_needed(agent.as_ref(), CompactionTrigger::Pressure),
+                                engine
+                                    .compact_if_needed(agent.as_ref(), CompactionTrigger::Pressure),
                             );
                         }
                     }
@@ -586,7 +601,11 @@ impl BasicCompactionEngine {
                     .and_then(Value::as_str)
                     .is_some_and(|status| status.eq_ignore_ascii_case("idle"))
                 {
-                    engine.overflow_retries.lock().expect("overflow retries").clear();
+                    engine
+                        .overflow_retries
+                        .lock()
+                        .expect("overflow retries")
+                        .clear();
                 }
             })?;
         }
@@ -627,7 +646,8 @@ impl BasicCompactionEngine {
             return None;
         }
         let generation = session.surface().replace_generation;
-        let _ = block_on(self.compact_if_needed(agent.as_ref(), CompactionTrigger::ContextOverflow));
+        let _ =
+            block_on(self.compact_if_needed(agent.as_ref(), CompactionTrigger::ContextOverflow));
         if session.surface().replace_generation <= generation {
             return None;
         }
@@ -662,11 +682,7 @@ impl BasicCompactionEngine {
             return Ok(None);
         };
         let target = format!("{provider}/{model}");
-        let Some(llm) = self
-            .llm
-            .clone()
-            .or_else(|| self.lookup.get::<LlmRuntime>())
-        else {
+        let Some(llm) = self.llm.clone().or_else(|| self.lookup.get::<LlmRuntime>()) else {
             return Err(missing_capacity(&target));
         };
         let info = llm
@@ -722,8 +738,7 @@ impl BasicCompactionEngine {
             }
             retain_tokens
         };
-        let Some((start, end, shadowed)) =
-            select_compactable_span(&session, meter, retain_tokens)
+        let Some((start, end, shadowed)) = select_compactable_span(&session, meter, retain_tokens)
         else {
             return Ok(None);
         };
@@ -755,29 +770,15 @@ impl BasicCompactionEngine {
                     .sum()
             })
             .unwrap_or(0);
-        let llm = self
-            .llm
-            .clone()
-            .or_else(|| self.lookup.get::<LlmRuntime>());
-        let summarized = match summarize_with_llm(
-            llm.as_deref(),
-            &effective,
-            &session,
-            &shadowed,
-        )
-        .await
-        {
-            Ok(summarized) => summarized,
-            Err(error) => {
-                close_failed(
-                    &session,
-                    compaction_id,
-                    source_command_id,
-                    error,
-                )?;
-                return Err(ManualCompactionError::Summary);
-            }
-        };
+        let llm = self.llm.clone().or_else(|| self.lookup.get::<LlmRuntime>());
+        let summarized =
+            match summarize_with_llm(llm.as_deref(), &effective, &session, &shadowed).await {
+                Ok(summarized) => summarized,
+                Err(error) => {
+                    close_failed(&session, compaction_id, source_command_id, error)?;
+                    return Err(ManualCompactionError::Summary);
+                }
+            };
         let framed = frame_summary(&summarized.summary);
         if let Some(meter) = self.meter.as_deref() {
             let framed_tokens = meter.estimate_message(&Message::User(UserMessage::from_parts(
@@ -788,12 +789,7 @@ impl BasicCompactionEngine {
                 let error = format!(
                     "summary is not smaller than the shadowed content ({framed_tokens} estimated framed tokens >= {shadowed_token_count})"
                 );
-                close_failed(
-                    &session,
-                    compaction_id,
-                    source_command_id,
-                    error,
-                )?;
+                close_failed(&session, compaction_id, source_command_id, error)?;
                 return Err(ManualCompactionError::Summary);
             }
         }
@@ -1027,19 +1023,23 @@ fn last_assistant_seq(session: &Session) -> u64 {
 }
 
 fn last_request_route(session: &Session) -> Option<(String, String)> {
-    session.events().into_iter().rev().find_map(|event| match event.data {
-        SessionEventData::RequestContext {
-            provider, model, ..
-        } => Some((provider, model)),
-        SessionEventData::RequestHeader { header, .. } => {
-            let config = header.get("config")?;
-            Some((
-                config.get("provider")?.as_str()?.to_string(),
-                config.get("model")?.as_str()?.to_string(),
-            ))
-        }
-        _ => None,
-    })
+    session
+        .events()
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.data {
+            SessionEventData::RequestContext {
+                provider, model, ..
+            } => Some((provider, model)),
+            SessionEventData::RequestHeader { header, .. } => {
+                let config = header.get("config")?;
+                Some((
+                    config.get("provider")?.as_str()?.to_string(),
+                    config.get("model")?.as_str()?.to_string(),
+                ))
+            }
+            _ => None,
+        })
 }
 
 fn last_request_prefix(session: &Session) -> (Option<String>, Vec<dsh_llm::ToolSchema>) {
@@ -1173,7 +1173,10 @@ impl CompactionEngine for BasicCompactionEngine {
         trigger: CompactionTrigger,
     ) -> Result<Option<CompactionResult>, ManualCompactionError> {
         if trigger == CompactionTrigger::ContextOverflow {
-            if let Some(pruner) = self.lookup.get::<dsh_tool_result_pruner::ToolResultPruner>() {
+            if let Some(pruner) = self
+                .lookup
+                .get::<dsh_tool_result_pruner::ToolResultPruner>()
+            {
                 let _ = pruner.prune_session(&agent.session(), self.meter.as_deref());
             }
             return self.compact_session(agent, true, None).await;
@@ -1231,9 +1234,7 @@ mod tests {
     use dsh_agent::{
         Agent, AgentCancelCause, AgentError, AgentFactory, AgentStatus, Inbox, InboxTarget,
     };
-    use dsh_llm::{
-        call_id, AssistantMessage, LlmAdapter, LlmError, LlmFailure, ToolResultMessage,
-    };
+    use dsh_llm::{call_id, AssistantMessage, LlmAdapter, LlmError, LlmFailure, ToolResultMessage};
     use dsh_session::{session_id, Session, SessionStore};
     use futures::stream;
     use std::collections::HashMap;
@@ -1252,10 +1253,8 @@ mod tests {
         async fn stream(
             &self,
             request: LlmRequest,
-        ) -> std::result::Result<
-            futures::stream::BoxStream<'static, StreamChunk>,
-            LlmError,
-        > {
+        ) -> std::result::Result<futures::stream::BoxStream<'static, StreamChunk>, LlmError>
+        {
             *self.last.lock().expect("last") = Some(request);
             if let Some(hook) = self.during.lock().expect("during").take() {
                 hook();
@@ -1277,9 +1276,9 @@ mod tests {
             model: &str,
         ) -> std::result::Result<dsh_llm::LlmResolvedModelInfo, LlmError> {
             Ok(dsh_llm::LlmResolvedModelInfo {
-                context: self.context_window.map(|context_window| {
-                    dsh_llm::LlmModelContext { context_window }
-                }),
+                context: self
+                    .context_window
+                    .map(|context_window| dsh_llm::LlmModelContext { context_window }),
                 ..dsh_llm::LlmResolvedModelInfo::identity(provider, model)
             })
         }
@@ -1304,7 +1303,9 @@ mod tests {
             .unwrap(),
             meter: Some(Arc::new(TokenMeter::new(4))),
             lookup: Context::new(),
-            llm: Some(Arc::new(LlmRuntime::new(Arc::clone(&adapter) as Arc<dyn LlmAdapter>))),
+            llm: Some(Arc::new(LlmRuntime::new(
+                Arc::clone(&adapter) as Arc<dyn LlmAdapter>
+            ))),
             overflow_retries: Mutex::new(HashMap::new()),
         };
         (engine, adapter)
@@ -1415,10 +1416,9 @@ mod tests {
             .derive_messages()
             .iter()
             .any(|message| match message {
-                dsh_llm::Message::User(user) => user
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))),
+                dsh_llm::Message::User(user) => user.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))
+                ),
                 _ => false,
             }));
         let summary = session
@@ -1433,14 +1433,24 @@ mod tests {
                     summary,
                     max_tokens,
                     ..
-                } => Some((provider, model, llm_stream_call, raw_output, summary, max_tokens)),
+                } => Some((
+                    provider,
+                    model,
+                    llm_stream_call,
+                    raw_output,
+                    summary,
+                    max_tokens,
+                )),
                 _ => None,
             })
             .expect("compaction/summary");
         assert_eq!(summary.0, "replay");
         assert_eq!(summary.1, "script");
         assert_eq!(summary.2, Some(true));
-        assert_eq!(summary.3, Some(vec![ContentBlock::text("condensed checkpoint")]));
+        assert_eq!(
+            summary.3,
+            Some(vec![ContentBlock::text("condensed checkpoint")])
+        );
         assert_eq!(summary.4, vec![ContentBlock::text("condensed checkpoint")]);
         assert_eq!(summary.5, Some(8192));
     }
@@ -1489,7 +1499,7 @@ mod tests {
             during: Mutex::new(None),
         });
         ctx.provide(Arc::new(LlmRuntime::new(
-            Arc::clone(&adapter) as Arc<dyn LlmAdapter>,
+            Arc::clone(&adapter) as Arc<dyn LlmAdapter>
         )))
         .unwrap();
         BasicCompactionEngine::install(&ctx, policy).unwrap();
@@ -1532,7 +1542,7 @@ mod tests {
         .unwrap()
         .get("kind")
         .and_then(Value::as_str)
-        == Some("retry")
+            == Some("retry")
     }
 
     #[test]
@@ -1559,7 +1569,10 @@ mod tests {
                 |payload| payload,
             )
             .unwrap();
-        assert_ne!(missing_agent.get("kind").and_then(Value::as_str), Some("retry"));
+        assert_ne!(
+            missing_agent.get("kind").and_then(Value::as_str),
+            Some("retry")
+        );
 
         let session = Arc::new(Session::new(session_id("headerless")));
         append_user(&session, &bulky("only"));
@@ -1707,7 +1720,10 @@ mod tests {
             "thresholdMessages": 40
         })))
         .unwrap_err();
-        assert!(unknown.contains("unknown key \"thresholdMessages\""), "{unknown}");
+        assert!(
+            unknown.contains("unknown key \"thresholdMessages\""),
+            "{unknown}"
+        );
         assert!(CompactionPolicy::resolve(Some(&serde_json::json!({
             "thresholdRatio": 0.1,
             "retainRatio": 0.2
@@ -1906,18 +1922,23 @@ mod tests {
         let (engine, _) = scripted_engine(&verbose);
         let err = engine.compact_now(&agent, None).await.unwrap_err();
         assert!(matches!(err, ManualCompactionError::Summary));
-        let end = session.events().into_iter().rev().find_map(|event| match event.data {
-            SessionEventData::CompactionEnd { error, .. } => error,
-            _ => None,
-        });
+        let end = session
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.data {
+                SessionEventData::CompactionEnd { error, .. } => error,
+                _ => None,
+            });
         let error = end.expect("compaction/end.error");
         assert!(
             error.contains("summary is not smaller than the shadowed content"),
             "{error}"
         );
-        assert!(!session.events().iter().any(|event| {
-            matches!(event.data, SessionEventData::CompactionSummary { .. })
-        }));
+        assert!(!session
+            .events()
+            .iter()
+            .any(|event| { matches!(event.data, SessionEventData::CompactionSummary { .. }) }));
         assert!(session
             .derive_messages()
             .iter()
@@ -2017,6 +2038,7 @@ mod tests {
                         vec![ContentBlock::text("done")],
                         false,
                     ),
+                    error: None,
                 },
                 Some(SurfaceOp::append()),
             )
@@ -2159,10 +2181,9 @@ mod tests {
             .derive_messages()
             .iter()
             .any(|message| match message {
-                Message::User(user) => user
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))),
+                Message::User(user) => user.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))
+                ),
                 _ => false,
             }));
     }
@@ -2182,10 +2203,9 @@ mod tests {
             .derive_messages()
             .iter()
             .any(|message| match message {
-                Message::User(user) => user
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))),
+                Message::User(user) => user.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text.contains("alpha "))
+                ),
                 _ => false,
             }));
     }
@@ -2209,13 +2229,18 @@ mod tests {
             async fn load(
                 &self,
                 _: &dsh_session::SessionId,
-            ) -> std::result::Result<Session, dsh_session_persistence::PersistenceError> {
-                Err(dsh_session_persistence::PersistenceError::Format("nope".into()))
+            ) -> std::result::Result<Session, dsh_session_persistence::PersistenceError>
+            {
+                Err(dsh_session_persistence::PersistenceError::Format(
+                    "nope".into(),
+                ))
             }
             async fn list_ids(
                 &self,
-            ) -> std::result::Result<Vec<dsh_session::SessionId>, dsh_session_persistence::PersistenceError>
-            {
+            ) -> std::result::Result<
+                Vec<dsh_session::SessionId>,
+                dsh_session_persistence::PersistenceError,
+            > {
                 Ok(Vec::new())
             }
         }

@@ -14,6 +14,10 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod repair;
+
+pub use repair::{interrupted_turn_closers, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN};
+
 /// Firehose invoked after a store-backed append commits.
 pub type SessionEventSink = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
 
@@ -286,6 +290,9 @@ pub enum SessionEventData {
         step: u32,
         /// Result message.
         message: ToolResultMessage,
+        /// Crash-recovery classification when this result is a synthetic closer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ToolRecoveryError>,
     },
     /// Permission preset selected for this session.
     #[serde(rename = "permission/preset")]
@@ -606,6 +613,15 @@ impl<'de> Deserialize<'de> for SessionEvent {
             ignorable,
         })
     }
+}
+
+/// Classification carried on a synthetic interrupted `tool/result`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRecoveryError {
+    /// TypeScript error `name`.
+    pub name: String,
+    /// TypeScript error `code`.
+    pub code: String,
 }
 
 impl SessionEventData {

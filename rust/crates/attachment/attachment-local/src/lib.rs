@@ -1,8 +1,9 @@
 //! Content-addressed local attachment backend rooted below `DSH_HOME`.
 //!
 //! Stored objects live at `$DSH_HOME/attachments/v1/objects/<aa>/<sha256>`.
-//! This port verifies magic bytes and header dimensions and stores admitted
-//! source bytes; it does not raster-decode or downscale.
+//! Admission verifies magic bytes and header dimensions. `request_image`
+//! decodes to 8-bit sRGB, downscales the long edge, and JPEG-encodes the
+//! model-request projection.
 
 use dsh_attachment::{
     AttachmentBackend, AttachmentError, AttachmentStore, ImageAttachmentLimits, ImageAttachmentRef,
@@ -45,6 +46,10 @@ pub struct Config {
     pub max_image_pixels: u64,
     /// Maximum intrinsic width and height.
     pub max_image_dimension: u32,
+    /// Max side length for a request-image projection.
+    pub normalized_image_max_dimension: u32,
+    /// Max encoded bytes for a request-image projection.
+    pub normalized_image_max_bytes: usize,
 }
 
 impl Config {
@@ -93,6 +98,20 @@ impl Config {
                 u64::from(DEFAULT_MAX_IMAGE_DIMENSION),
             )?)
             .map_err(|_| "attachment-local: maxImageDimension is too large".to_string())?,
+            normalized_image_max_dimension: u32::try_from(u64_field(
+                value,
+                "normalizedImageMaxDimension",
+                u64::from(DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION),
+            )?)
+            .map_err(|_| {
+                "attachment-local: normalizedImageMaxDimension is too large".to_string()
+            })?,
+            normalized_image_max_bytes: usize::try_from(u64_field(
+                value,
+                "normalizedImageMaxBytes",
+                DEFAULT_NORMALIZED_IMAGE_MAX_BYTES as u64,
+            )?)
+            .map_err(|_| "attachment-local: normalizedImageMaxBytes is too large".to_string())?,
         })
     }
 }
@@ -133,7 +152,10 @@ pub fn detect_image(data: &[u8]) -> Result<DetectedImage, AttachmentError> {
 
 fn png_size(data: &[u8]) -> Result<DetectedImage, AttachmentError> {
     if data.len() < 24 || &data[12..16] != b"IHDR" {
-        return Err(AttachmentError::new("PNG header is invalid.", "INVALID_IMAGE"));
+        return Err(AttachmentError::new(
+            "PNG header is invalid.",
+            "INVALID_IMAGE",
+        ));
     }
     let width = u32::from_be_bytes(data[16..20].try_into().expect("png width"));
     let height = u32::from_be_bytes(data[20..24].try_into().expect("png height"));
@@ -146,7 +168,10 @@ fn png_size(data: &[u8]) -> Result<DetectedImage, AttachmentError> {
 
 fn gif_size(data: &[u8]) -> Result<DetectedImage, AttachmentError> {
     if data.len() < 10 {
-        return Err(AttachmentError::new("GIF header is invalid.", "INVALID_IMAGE"));
+        return Err(AttachmentError::new(
+            "GIF header is invalid.",
+            "INVALID_IMAGE",
+        ));
     }
     let width = u16::from_le_bytes([data[6], data[7]]) as u32;
     let height = u16::from_le_bytes([data[8], data[9]]) as u32;
@@ -506,6 +531,74 @@ fn limits_from(config: &Config) -> ImageAttachmentLimits {
     }
 }
 
+/// Default max side length for a request-image projection.
+pub const DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION: u32 = 2048;
+/// Default max encoded bytes for a request-image projection.
+pub const DEFAULT_NORMALIZED_IMAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Decode, convert to sRGB RGBA, downscale, and JPEG-encode a request image.
+///
+/// Qualities try 85 then 80 when the first encoding exceeds
+/// [`DEFAULT_NORMALIZED_IMAGE_MAX_BYTES`].
+///
+/// # Errors
+/// Decode failure or an encoding that still exceeds the byte cap.
+pub fn request_image(data: &[u8]) -> Result<Vec<u8>, AttachmentError> {
+    request_image_with_limits(
+        data,
+        DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION,
+        DEFAULT_NORMALIZED_IMAGE_MAX_BYTES,
+    )
+}
+
+/// Same as [`request_image`] with explicit caps.
+///
+/// # Errors
+/// Decode failure or an encoding that still exceeds `max_bytes`.
+pub fn request_image_with_limits(
+    data: &[u8],
+    max_dimension: u32,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AttachmentError> {
+    let decoded = image::load_from_memory(data).map_err(|error| {
+        AttachmentError::new(
+            format!("Image could not be decoded: {error}"),
+            "INVALID_IMAGE",
+        )
+    })?;
+    let mut rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let longest = width.max(height);
+    if longest > max_dimension {
+        let scale = f64::from(max_dimension) / f64::from(longest);
+        let next_w = ((f64::from(width) * scale).round() as u32).max(1);
+        let next_h = ((f64::from(height) * scale).round() as u32).max(1);
+        rgba =
+            image::imageops::resize(&rgba, next_w, next_h, image::imageops::FilterType::Triangle);
+    }
+    let rgb = image::DynamicImage::ImageRgba8(rgba).to_rgb8();
+    for quality in [85_u8, 80] {
+        let mut encoded = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality);
+        if encoder
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .is_ok()
+            && encoded.len() <= max_bytes
+        {
+            return Ok(encoded);
+        }
+    }
+    Err(AttachmentError::new(
+        "Normalized request image exceeds the encoded byte cap.",
+        "IMAGE_TOO_LARGE",
+    ))
+}
+
 /// Provide `ctx.attachments` under `$DSH_HOME/attachments/v1`.
 pub fn install(ctx: &Context, config: Config) -> Result<Arc<AttachmentStore>> {
     let home = resolve_dsh_home(config.dsh_home.as_deref());
@@ -532,6 +625,7 @@ pub const TINY_PNG: &[u8] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     fn tmp_home(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -559,6 +653,8 @@ mod tests {
             max_message_image_bytes: DEFAULT_MAX_MESSAGE_IMAGE_BYTES,
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             max_image_dimension: DEFAULT_MAX_IMAGE_DIMENSION,
+            normalized_image_max_dimension: DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION,
+            normalized_image_max_bytes: DEFAULT_NORMALIZED_IMAGE_MAX_BYTES,
         };
         install(&ctx, config).unwrap();
         let store = ctx.service::<AttachmentStore>().unwrap();
@@ -584,6 +680,44 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), TINY_PNG);
         ctx.dispose();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn valid_png(width: u32, height: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(width, height);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([10, 20, 30]);
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    #[test]
+    fn request_image_keeps_tiny_png_under_the_byte_cap() {
+        let encoded = request_image(&valid_png(1, 1)).unwrap();
+        assert!(!encoded.is_empty());
+        assert!(encoded.len() <= DEFAULT_NORMALIZED_IMAGE_MAX_BYTES);
+        let decoded = image::load_from_memory(&encoded).unwrap();
+        assert_eq!(decoded.dimensions(), (1, 1));
+    }
+
+    #[test]
+    fn request_image_downscales_long_edge() {
+        let encoded = request_image(&valid_png(3000, 100)).unwrap();
+        let decoded = image::load_from_memory(&encoded).unwrap();
+        assert!(
+            decoded.width().max(decoded.height()) <= DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION,
+            "{:?}",
+            decoded.dimensions()
+        );
+    }
+
+    #[test]
+    fn request_image_refuses_when_byte_cap_is_tiny() {
+        let err = request_image_with_limits(&valid_png(1, 1), 2048, 1).unwrap_err();
+        assert_eq!(err.code(), "IMAGE_TOO_LARGE");
     }
 
     #[test]

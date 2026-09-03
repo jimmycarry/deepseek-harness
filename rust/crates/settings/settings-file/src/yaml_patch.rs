@@ -33,7 +33,9 @@ pub fn patch_namespace(text: Option<&str>, ns: &str, section: &Value) -> String 
         .into_iter()
         .filter(|node| !matches!(node, Node::Blank) || text.is_some())
         .collect::<Vec<_>>();
-    if nodes.iter().all(|node| matches!(node, Node::Blank | Node::Comment { .. }))
+    if nodes
+        .iter()
+        .all(|node| matches!(node, Node::Blank | Node::Comment { .. }))
         && text.map(str::trim).unwrap_or("").is_empty()
     {
         nodes.clear();
@@ -117,11 +119,7 @@ fn parse_block<'a>(lines: &[&'a str], start: usize, indent: usize) -> (Vec<Node>
         nodes.push(Node::Pair {
             indent: line_indent,
             key,
-            inline: if rest.is_empty() {
-                None
-            } else {
-                Some(rest)
-            },
+            inline: if rest.is_empty() { None } else { Some(rest) },
             children,
         });
         i = next;
@@ -245,8 +243,16 @@ fn split_trailing_comment(text: &str) -> (String, String) {
     (text.to_string(), String::new())
 }
 
-fn patch_nodes(nodes: &mut Vec<Node>, indent: usize, key: &str, current: Option<&Value>, next: &Value) {
-    let position = nodes.iter().position(|node| matches!(node, Node::Pair { key: found, .. } if found == key));
+fn patch_nodes(
+    nodes: &mut Vec<Node>,
+    indent: usize,
+    key: &str,
+    current: Option<&Value>,
+    next: &Value,
+) {
+    let position = nodes
+        .iter()
+        .position(|node| matches!(node, Node::Pair { key: found, .. } if found == key));
     if next.is_null() {
         if let Some(index) = position {
             remove_pair(nodes, index);
@@ -259,9 +265,9 @@ fn patch_nodes(nodes: &mut Vec<Node>, indent: usize, key: &str, current: Option<
             if let Node::Pair { children, .. } = &mut nodes[index] {
                 for child_key in current_map.keys() {
                     if !next_map.contains_key(child_key) {
-                        if let Some(child_index) = children.iter().position(|node| {
-                            matches!(node, Node::Pair { key, .. } if key == child_key)
-                        }) {
+                        if let Some(child_index) = children.iter().position(
+                            |node| matches!(node, Node::Pair { key, .. } if key == child_key),
+                        ) {
                             remove_pair(children, child_index);
                         }
                     }
@@ -327,8 +333,16 @@ fn remove_pair(nodes: &mut Vec<Node>, index: usize) {
 }
 
 fn replace_pair_keeping_leading_comments(nodes: &mut Vec<Node>, index: usize, replacement: Node) {
-    if let (Node::Pair { inline, children, .. }, Node::Pair { inline: next_inline, children: next_children, .. }) =
-        (&nodes[index], &replacement)
+    if let (
+        Node::Pair {
+            inline, children, ..
+        },
+        Node::Pair {
+            inline: next_inline,
+            children: next_children,
+            ..
+        },
+    ) = (&nodes[index], &replacement)
     {
         let _ = (inline, children, next_inline, next_children);
     }

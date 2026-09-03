@@ -26,7 +26,7 @@ pub async fn flush_session(ctx: &Context, session: &Session) -> Result<(), Strin
         return Ok(());
     };
     persistence
-        .save(session)
+        .flush(session)
         .await
         .map_err(|error| error.to_string())
 }

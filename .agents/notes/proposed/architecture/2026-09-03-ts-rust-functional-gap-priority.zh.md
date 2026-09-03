@@ -6,7 +6,7 @@ Status: proposed
 
 ## 问题
 
-Rust 树已经在 [移植 Agent Note](../../implemented/architecture/2026-08-22-rust-harness-port.zh.md) 的 1:1 规则下交付 headless、ACP 与 JSON-RPC profile。TypeScript 仍有 227 个包；Rust 有 112 个 crate。若没有约定顺序，下一个 crate 可以去追 Web UI、打包的 SQLite schema 17，或去改 loop，看起来仍像进展，而已交付的 Linux profile 在 persistence、流式、附件与 settings 上仍然更薄。
+Rust 树已经在 [移植 Agent Note](../../implemented/architecture/2026-08-22-rust-harness-port.zh.md) 的 1:1 规则下交付 headless、ACP 与 JSON-RPC profile。TypeScript 仍有 227 个包；Rust 有 112 个 crate。若没有约定顺序，下一个 crate 可以去追 Web UI、打包的 SQLite schema 17，或去改 loop，看起来仍像进展，而剩余 P0 只是已报告的 finish-chunk 差距，更薄的路径（DeepSeek Files API、session-query FTS、skill 监听）仍开着。
 
 只比叶名也会说谎：`typert/protocol` 不是 `sdk/protocol`。维护者若按「每个缺失文件夹名」移植，会把已经存在于另一 group 下的服务器再做一遍。
 
@@ -22,8 +22,8 @@ P0 是已交付 headless / ACP / JSON-RPC profile 在 Linux 上的正确性。P1
 
 | 档 | 覆盖 | 首批条目 |
 |---|---|---|
-| P0 | 已交付 profile 在 Linux 上的正确性 | persistence 协调器（write-behind、耐久 `commitRepair`、append）；DeepSeek SSE + 图像块；附件栅格归一化；随后的 ACP 图像；settings Service Definition；headless plan 评审；报告 loop 的 finish-chunk 差距 |
-| P1 | 这些 profile 上的耐久性与运维 | `readFrom`；projection cache；session-query FTS；启用 `web-fetch-http`；skill 监听；OTel flush 提示；SDK 客户端助手；外部子代理 provider；`tool-ask-user` |
+| P0 | 已交付 profile 在 Linux 上的正确性 | 第 1–6 项已关闭（persistence 协调器、DeepSeek SSE + 图像块、附件归一化、ACP 图像、settings Service Definition、headless plan 评审）。剩余：报告 loop 的 finish-chunk 差距 |
+| P1 | 这些 profile 上的耐久性与运维 | DeepSeek Files API 上传；projection cache；session-query FTS；启用 `web-fetch-http`；skill 监听；OTel flush 提示；SDK 客户端助手；外部子代理 provider；`tool-ask-user` |
 | P2 | 平台与相邻产品 | 现有 TypeScript SPA 的 Rust 宿主；Typert/API；Seatbelt / `CreateRestrictedToken`；PTY / LSP；JS workflow worker；`llm-pi-ai`；Exa / Perplexity；storage / workspace / presets；Code Mode |
 | P3 | 可选能力 | `schedule`；额外 context；持久 shell；额外 title / query / feedback 包；`skill-badge` |
 | P4 | 实验 / 云 / hook | e2b；agent-team；Claude Code / Codex hook；MCP；动态 Cordis |
@@ -57,4 +57,4 @@ crate 落地后清单会漂移。要在同一个 PR 里更新这些文件，否�
 
 读者仍可能把「缺 crate」当成「必须移植」。skip 表与 Web UI 否决必须留在 P0 列表旁边。
 
-只关闭 persistence 或 SSE、不做附件，会让 ACP 图像继续广告为 false。清单里的关闭顺序考虑了依赖；跳过前提会把 P0 行重新打开。
+ACP 图像仅在挂了附件与 vision 默认模型时广告为 `true`。DeepSeek Files API 上传仍是更薄的路径；内联 `image_url` data-URL 已交付。清单一并记录已关闭的 P0 行，避免后续 PR 把它们重新打开。
