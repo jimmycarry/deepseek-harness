@@ -1,0 +1,16 @@
+[package]
+name = "dsh-repeat-tool-reminder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Consecutive-repeat reminders on the tool chain."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-llm.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-tools.workspace = true
+tokio.workspace = true

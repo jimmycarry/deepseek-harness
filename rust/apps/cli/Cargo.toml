@@ -1,0 +1,33 @@
+[package]
+name = "dsh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "dsh CLI: headless runner and dump-config."
+
+[[bin]]
+name = "dsh"
+path = "src/main.rs"
+
+[dependencies]
+dsh-acp.workspace = true
+dsh-app-boot.workspace = true
+dsh-bundle-headless.workspace = true
+dsh-sdk-server.workspace = true
+dsh-cordis.workspace = true
+dsh-cordis-loader.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+dsh-agent.workspace = true
+dsh-agent-loop.workspace = true
+dsh-agent-spine.workspace = true
+dsh-commands.workspace = true
+dsh-fs.workspace = true
+dsh-llm.workspace = true
+dsh-llm-replay.workspace = true
+dsh-repeat-tool-reminder.workspace = true
+dsh-session.workspace = true
+dsh-tools.workspace = true

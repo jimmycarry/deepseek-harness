@@ -1,0 +1,257 @@
+[workspace]
+resolver = "2"
+members = [
+  "vendor/cordis",
+  "vendor/loader",
+  "crates/util/brand",
+  "crates/util/home-paths",
+  "crates/util/timeout",
+  "crates/util/atomic-write",
+  "crates/core/scope",
+  "crates/core/session",
+  "crates/core/system-prompt",
+  "crates/core/tools",
+  "crates/core/agent",
+  "crates/core/agent-loop",
+  "crates/llm/llm",
+  "crates/llm/llm-replay",
+  "crates/llm/llm-deepseek",
+  "crates/llm/token-meter",
+  "crates/llm/llm-retry",
+  "crates/subprocess/subprocess",
+  "crates/subprocess/subprocess-local",
+  "crates/sandbox/sandbox",
+  "crates/sandbox/sandbox-local",
+  "crates/sandbox/sandbox-windows-acl",
+  "crates/sandbox/sandbox-policy",
+  "crates/shell/shell",
+  "crates/shell/shell-env",
+  "crates/shell/bash-local",
+  "crates/shell/bash-sandbox",
+  "crates/shell/tool-bash",
+  "crates/shell/pwsh-local",
+  "crates/shell/pwsh-sandbox",
+  "crates/shell/tool-pwsh",
+  "crates/fs/fs",
+  "crates/fs/fs-local",
+  "crates/fs/fs-sandbox",
+  "crates/fs/fs-observation-policy",
+  "crates/fs/tool-fs",
+  "crates/fs/tool-fs-search",
+  "crates/fs/tool-str-replace-editor",
+  "crates/terminal/terminal",
+  "crates/terminal/terminal-local",
+  "crates/terminal/tool-terminal",
+  "crates/lsp/lsp",
+  "crates/lsp/lsp-stdio",
+  "crates/lsp/tool-lsp",
+  "crates/context/agent-instructions",
+  "crates/compaction/compaction",
+  "crates/compaction/compaction-basic",
+  "crates/compaction/command-compact",
+  "crates/compaction/tool-result-pruner",
+  "crates/credentials/credentials",
+  "crates/credentials/credentials-local",
+  "crates/credentials/authorization",
+  "crates/identity/anonymous-user-id",
+  "crates/skill/skill",
+  "crates/skill/skill-filesystem",
+  "crates/skill/tool-skill",
+  "crates/web/web",
+  "crates/web/web-fetch-http",
+  "crates/web/web-search-deepseek",
+  "crates/web/tool-web",
+  "crates/jobs/jobs",
+  "crates/jobs/jobs-local",
+  "crates/jobs/tool-jobs",
+  "crates/todo/tool-todo",
+  "crates/plan/plan-mode",
+  "crates/goal/goal",
+  "crates/goal/goal-round-driver",
+  "crates/goal/command-goal",
+  "crates/goal/tool-goal",
+  "crates/subagent/subagent",
+  "crates/subagent/subagent-inprocess",
+  "crates/subagent/tool-subagent",
+  "crates/subagent/tool-subagent-control",
+  "crates/subagent/tool-subagent-report",
+  "crates/workflow/workflow",
+  "crates/workflow/workflow-local",
+  "crates/workflow/tool-workflow",
+  "crates/workflow/tool-ralph",
+  "crates/guard/timeout-policy",
+  "crates/guard/repeat-tool-reminder",
+  "crates/session/session-checkpoint-policy",
+  "crates/session/session-persistence",
+  "crates/session/session-persistence-jsonl",
+  "crates/session/session-title",
+  "crates/session/session-title-first-prompt-llm",
+  "crates/session/session-persistence-sqlite",
+  "crates/session/session-projection",
+  "crates/session/session-telemetry",
+  "crates/session/session-telemetry-otel",
+  "crates/settings/settings-file",
+  "crates/session-query/session-query",
+  "crates/session-query/session-query-sqlite",
+  "crates/attachment/attachment",
+  "crates/attachment/attachment-local",
+  "crates/spill/spill",
+  "crates/spill/spill-local",
+  "crates/spill/spill-policy",
+  "crates/interaction/commands",
+  "crates/feedback/command-feedback",
+  "crates/interaction/user-questions",
+  "crates/interaction/user-approval",
+  "crates/interaction/permission-presets",
+  "crates/sdk/protocol",
+  "crates/sdk/client",
+  "crates/sdk/server",
+  "crates/acp/acp",
+  "crates/boot/app-boot",
+  "crates/bundle/base",
+  "crates/bundle/headless",
+  "crates/bundle/acp",
+  "crates/bundle/jsonrpc",
+  "crates/examples/agent-spine",
+  "crates/host/webserver",
+  "crates/host/apiproxy",
+  "apps/cli",
+  "examples/cordis-smoke",
+  "tests/snapshots",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.1-rc.2"
+rust-version = "1.83"
+authors = ["DeepSeek Harness contributors"]
+
+[workspace.dependencies]
+async-trait = "=0.1.83"
+bytes = "=1.9.0"
+futures = "=0.3.31"
+serde = { version = "=1.0.216", features = ["derive"] }
+serde_json = { version = "=1.0.133", features = ["preserve_order"] }
+thiserror = "=1.0.69"
+tokio = { version = "=1.42.0", features = ["full"] }
+uuid = { version = "=1.11.0", features = ["v4", "serde"] }
+tracing = "=0.1.41"
+sha2 = "=0.10.8"
+image = { version = "=0.25.5", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+
+dsh-brand = { path = "crates/util/brand" }
+dsh-home-paths = { path = "crates/util/home-paths" }
+dsh-timeout = { path = "crates/util/timeout" }
+dsh-atomic-write = { path = "crates/util/atomic-write" }
+dsh-cordis = { path = "vendor/cordis" }
+dsh-cordis-loader = { path = "vendor/loader" }
+dsh-scope = { path = "crates/core/scope" }
+dsh-session = { path = "crates/core/session" }
+dsh-system-prompt = { path = "crates/core/system-prompt" }
+dsh-tools = { path = "crates/core/tools" }
+dsh-agent = { path = "crates/core/agent" }
+dsh-agent-loop = { path = "crates/core/agent-loop" }
+dsh-llm = { path = "crates/llm/llm" }
+dsh-llm-replay = { path = "crates/llm/llm-replay" }
+dsh-llm-deepseek = { path = "crates/llm/llm-deepseek" }
+dsh-token-meter = { path = "crates/llm/token-meter" }
+dsh-llm-retry = { path = "crates/llm/llm-retry" }
+dsh-agent-instructions = { path = "crates/context/agent-instructions" }
+dsh-session-checkpoint-policy = { path = "crates/session/session-checkpoint-policy" }
+dsh-subprocess = { path = "crates/subprocess/subprocess" }
+dsh-subprocess-local = { path = "crates/subprocess/subprocess-local" }
+dsh-sandbox = { path = "crates/sandbox/sandbox" }
+dsh-sandbox-local = { path = "crates/sandbox/sandbox-local" }
+dsh-sandbox-windows-acl = { path = "crates/sandbox/sandbox-windows-acl" }
+dsh-sandbox-policy = { path = "crates/sandbox/sandbox-policy" }
+dsh-shell = { path = "crates/shell/shell" }
+dsh-shell-env = { path = "crates/shell/shell-env" }
+dsh-bash-local = { path = "crates/shell/bash-local" }
+dsh-bash-sandbox = { path = "crates/shell/bash-sandbox" }
+dsh-tool-bash = { path = "crates/shell/tool-bash" }
+dsh-pwsh-local = { path = "crates/shell/pwsh-local" }
+dsh-pwsh-sandbox = { path = "crates/shell/pwsh-sandbox" }
+dsh-tool-pwsh = { path = "crates/shell/tool-pwsh" }
+dsh-fs = { path = "crates/fs/fs" }
+dsh-fs-local = { path = "crates/fs/fs-local" }
+dsh-fs-sandbox = { path = "crates/fs/fs-sandbox" }
+dsh-fs-observation-policy = { path = "crates/fs/fs-observation-policy" }
+dsh-tool-fs = { path = "crates/fs/tool-fs" }
+dsh-tool-fs-search = { path = "crates/fs/tool-fs-search" }
+dsh-tool-str-replace-editor = { path = "crates/fs/tool-str-replace-editor" }
+dsh-terminal = { path = "crates/terminal/terminal" }
+dsh-terminal-local = { path = "crates/terminal/terminal-local" }
+dsh-tool-terminal = { path = "crates/terminal/tool-terminal" }
+dsh-lsp = { path = "crates/lsp/lsp" }
+dsh-lsp-stdio = { path = "crates/lsp/lsp-stdio" }
+dsh-tool-lsp = { path = "crates/lsp/tool-lsp" }
+dsh-compaction = { path = "crates/compaction/compaction" }
+dsh-compaction-basic = { path = "crates/compaction/compaction-basic" }
+dsh-command-compact = { path = "crates/compaction/command-compact" }
+dsh-tool-result-pruner = { path = "crates/compaction/tool-result-pruner" }
+dsh-credentials = { path = "crates/credentials/credentials" }
+dsh-credentials-local = { path = "crates/credentials/credentials-local" }
+dsh-authorization = { path = "crates/credentials/authorization" }
+dsh-skill = { path = "crates/skill/skill" }
+dsh-skill-filesystem = { path = "crates/skill/skill-filesystem" }
+dsh-tool-skill = { path = "crates/skill/tool-skill" }
+dsh-web = { path = "crates/web/web" }
+dsh-web-fetch-http = { path = "crates/web/web-fetch-http" }
+dsh-web-search-deepseek = { path = "crates/web/web-search-deepseek" }
+dsh-tool-web = { path = "crates/web/tool-web" }
+dsh-jobs = { path = "crates/jobs/jobs" }
+dsh-jobs-local = { path = "crates/jobs/jobs-local" }
+dsh-tool-jobs = { path = "crates/jobs/tool-jobs" }
+dsh-tool-todo = { path = "crates/todo/tool-todo" }
+dsh-plan-mode = { path = "crates/plan/plan-mode" }
+dsh-goal = { path = "crates/goal/goal" }
+dsh-goal-round-driver = { path = "crates/goal/goal-round-driver" }
+dsh-command-goal = { path = "crates/goal/command-goal" }
+dsh-tool-goal = { path = "crates/goal/tool-goal" }
+dsh-subagent = { path = "crates/subagent/subagent" }
+dsh-subagent-inprocess = { path = "crates/subagent/subagent-inprocess" }
+dsh-tool-subagent = { path = "crates/subagent/tool-subagent" }
+dsh-tool-subagent-control = { path = "crates/subagent/tool-subagent-control" }
+dsh-tool-subagent-report = { path = "crates/subagent/tool-subagent-report" }
+dsh-workflow = { path = "crates/workflow/workflow" }
+dsh-workflow-local = { path = "crates/workflow/workflow-local" }
+dsh-tool-workflow = { path = "crates/workflow/tool-workflow" }
+dsh-tool-ralph = { path = "crates/workflow/tool-ralph" }
+dsh-timeout-policy = { path = "crates/guard/timeout-policy" }
+dsh-repeat-tool-reminder = { path = "crates/guard/repeat-tool-reminder" }
+dsh-session-persistence = { path = "crates/session/session-persistence" }
+dsh-session-title = { path = "crates/session/session-title" }
+dsh-session-title-first-prompt-llm = { path = "crates/session/session-title-first-prompt-llm" }
+dsh-session-persistence-jsonl = { path = "crates/session/session-persistence-jsonl" }
+dsh-session-persistence-sqlite = { path = "crates/session/session-persistence-sqlite" }
+dsh-session-projection = { path = "crates/session/session-projection" }
+dsh-session-telemetry = { path = "crates/session/session-telemetry" }
+dsh-session-telemetry-otel = { path = "crates/session/session-telemetry-otel" }
+dsh-settings-file = { path = "crates/settings/settings-file" }
+dsh-session-query = { path = "crates/session-query/session-query" }
+dsh-session-query-sqlite = { path = "crates/session-query/session-query-sqlite" }
+dsh-attachment = { path = "crates/attachment/attachment" }
+dsh-attachment-local = { path = "crates/attachment/attachment-local" }
+dsh-spill = { path = "crates/spill/spill" }
+dsh-spill-local = { path = "crates/spill/spill-local" }
+dsh-spill-policy = { path = "crates/spill/spill-policy" }
+dsh-commands = { path = "crates/interaction/commands" }
+dsh-anonymous-user-id = { path = "crates/identity/anonymous-user-id" }
+dsh-command-feedback = { path = "crates/feedback/command-feedback" }
+dsh-user-questions = { path = "crates/interaction/user-questions" }
+dsh-user-approval = { path = "crates/interaction/user-approval" }
+dsh-permission-presets = { path = "crates/interaction/permission-presets" }
+dsh-sdk-protocol = { path = "crates/sdk/protocol" }
+dsh-sdk-client = { path = "crates/sdk/client" }
+dsh-sdk-server = { path = "crates/sdk/server" }
+dsh-acp = { path = "crates/acp/acp" }
+dsh-app-boot = { path = "crates/boot/app-boot" }
+dsh-bundle-base = { path = "crates/bundle/base" }
+dsh-bundle-headless = { path = "crates/bundle/headless" }
+dsh-bundle-acp = { path = "crates/bundle/acp" }
+dsh-bundle-jsonrpc = { path = "crates/bundle/jsonrpc" }
+dsh-agent-spine = { path = "crates/examples/agent-spine" }
+dsh-webserver = { path = "crates/host/webserver" }
+dsh-apiproxy = { path = "crates/host/apiproxy" }

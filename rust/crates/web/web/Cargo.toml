@@ -1,0 +1,17 @@
+[package]
+name = "dsh-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Web seam (ctx.web)."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

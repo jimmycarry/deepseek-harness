@@ -1,0 +1,11 @@
+[package]
+name = "dsh-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Persistent PTY seam (ctx.terminals)."
+
+[dependencies]
+dsh-cordis.workspace = true
+thiserror.workspace = true

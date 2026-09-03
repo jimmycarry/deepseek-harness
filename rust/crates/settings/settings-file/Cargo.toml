@@ -1,0 +1,16 @@
+[package]
+name = "dsh-settings-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "File-backed user settings document ($DSH_HOME/settings.yaml)."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-home-paths.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

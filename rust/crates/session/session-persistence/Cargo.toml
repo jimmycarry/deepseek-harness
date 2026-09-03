@@ -1,0 +1,18 @@
+[package]
+name = "dsh-session-persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Persistence seam (ctx.sessionPersistence)."
+
+[dependencies]
+async-trait.workspace = true
+dsh-brand.workspace = true
+dsh-cordis.workspace = true
+dsh-session.workspace = true
+dsh-timeout.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "dsh-anonymous-user-id"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Harness-home anonymous user id for telemetry and feedback."
+
+[dependencies]
+dsh-home-paths.workspace = true
+uuid.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "dsh-cordis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cordis plugin runtime: Context, Fiber, Service, events, reversible effects."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "dsh-sandbox-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local sandbox provider."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-sandbox.workspace = true
+dsh-sandbox-windows-acl.workspace = true

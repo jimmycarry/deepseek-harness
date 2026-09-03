@@ -1,0 +1,18 @@
+[package]
+name = "dsh-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agent interface, live registry, and agent/* events (ctx.agents)."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-scope.workspace = true
+dsh-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

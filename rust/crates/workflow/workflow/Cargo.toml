@@ -1,0 +1,15 @@
+[package]
+name = "dsh-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Workflow engine (ctx.workflowEngine)."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "dsh-bundle-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "dsh-acp patch layer: the ACP automation server over dsh-base."
+
+[dependencies]
+dsh-cordis-loader.workspace = true

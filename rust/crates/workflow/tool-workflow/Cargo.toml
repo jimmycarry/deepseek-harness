@@ -1,0 +1,22 @@
+[package]
+name = "dsh-tool-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Model-facing workflow tool."
+
+[dependencies]
+async-trait.workspace = true
+dsh-agent.workspace = true
+dsh-cordis.workspace = true
+dsh-session.workspace = true
+dsh-system-prompt.workspace = true
+dsh-tools.workspace = true
+dsh-workflow.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+dsh-llm.workspace = true
+tokio.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "dsh-subagent-inprocess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "In-process spawn/fork subagent providers."
+
+[dependencies]
+async-trait.workspace = true
+dsh-agent.workspace = true
+dsh-agent-loop.workspace = true
+dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+dsh-subagent.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-llm-replay.workspace = true
+dsh-sandbox.workspace = true
+dsh-sandbox-policy.workspace = true
+dsh-system-prompt.workspace = true
+dsh-user-approval.workspace = true
+tokio.workspace = true

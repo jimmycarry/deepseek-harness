@@ -1,0 +1,11 @@
+[package]
+name = "dsh-spill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Spill storage seam (ctx.spillStore)."
+
+[dependencies]
+dsh-cordis.workspace = true
+thiserror.workspace = true

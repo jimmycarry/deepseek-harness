@@ -1,0 +1,25 @@
+[package]
+name = "dsh-permission-presets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Permission presets over sandbox mode and approval policy, plus /permission."
+
+[dependencies]
+async-trait.workspace = true
+dsh-agent.workspace = true
+dsh-commands.workspace = true
+dsh-cordis.workspace = true
+dsh-sandbox.workspace = true
+dsh-sandbox-policy.workspace = true
+dsh-session.workspace = true
+dsh-session-projection.workspace = true
+dsh-shell.workspace = true
+dsh-user-approval.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-sandbox.workspace = true
+dsh-system-prompt.workspace = true
+tokio.workspace = true

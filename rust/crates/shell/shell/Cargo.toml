@@ -1,0 +1,14 @@
+[package]
+name = "dsh-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shell executor seam (ctx.shell)."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-sandbox.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
