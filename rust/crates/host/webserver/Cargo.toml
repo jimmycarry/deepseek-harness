@@ -1,0 +1,15 @@
+[package]
+name = "dsh-webserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP route server (ctx.webServer)."
+
+[dependencies]
+dsh-agent-spine.workspace = true
+dsh-cordis.workspace = true
+dsh-sdk-protocol.workspace = true
+dsh-sdk-server.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

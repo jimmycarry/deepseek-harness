@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.md
+2026-09-03-ts-rust-functional-gap-priority.md: 1b569f6ee014f17026ee6848cb453c606681e7d2
+2026-09-03-ts-rust-functional-gap-priority.zh.md: 082d6a42a8ba1bc5ef2eb0ea6a1159554fc6b2be

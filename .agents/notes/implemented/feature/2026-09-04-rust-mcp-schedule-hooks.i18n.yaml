@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-09-04-rust-mcp-schedule-hooks.md
+2026-09-04-rust-mcp-schedule-hooks.md: 81e01bd992cd5c6db2af15ab1221d40dc6e7925c
+2026-09-04-rust-mcp-schedule-hooks.zh.md: b3408b3894cccd7a8012af22d9e508f3f68a2dc5

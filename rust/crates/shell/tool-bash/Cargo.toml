@@ -1,0 +1,26 @@
+[package]
+name = "dsh-tool-bash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Model-facing bash tool."
+
+[dependencies]
+async-trait.workspace = true
+dsh-agent.workspace = true
+dsh-cordis.workspace = true
+dsh-jobs.workspace = true
+dsh-llm.workspace = true
+dsh-sandbox.workspace = true
+dsh-sandbox-policy.workspace = true
+dsh-session.workspace = true
+dsh-shell.workspace = true
+dsh-shell-env.workspace = true
+dsh-tools.workspace = true
+dsh-user-approval.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-llm.workspace = true
+tokio.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "dsh-tool-pwsh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Model-facing PowerShell tool."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-jobs.workspace = true
+dsh-shell.workspace = true
+dsh-shell-env.workspace = true
+dsh-tool-bash.workspace = true
+dsh-tools.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+dsh-sandbox.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "dsh-web-fetch-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP fetch provider."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-web.workspace = true
+tokio.workspace = true

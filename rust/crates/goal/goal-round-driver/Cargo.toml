@@ -1,0 +1,15 @@
+[package]
+name = "dsh-goal-round-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Same-session goal continuation driver."
+
+[dependencies]
+dsh-agent.workspace = true
+dsh-cordis.workspace = true
+dsh-goal.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+serde_json.workspace = true

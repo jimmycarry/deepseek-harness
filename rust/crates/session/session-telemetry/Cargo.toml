@@ -1,0 +1,16 @@
+[package]
+name = "dsh-session-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Session telemetry capture coordinator and backend sink contract."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-llm.workspace = true

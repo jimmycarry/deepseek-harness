@@ -1,0 +1,20 @@
+[package]
+name = "dsh-agent-instructions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Workspace-instruction context from AGENTS.md / CLAUDE.md."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-home-paths.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsh-agent.workspace = true
+dsh-agent-loop.workspace = true
+dsh-tools.workspace = true
+tokio.workspace = true

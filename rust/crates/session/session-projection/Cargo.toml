@@ -1,0 +1,12 @@
+[package]
+name = "dsh-session-projection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Projection registry (ctx.sessionProjections)."
+
+[dependencies]
+dsh-cordis.workspace = true
+dsh-session.workspace = true
+serde_json.workspace = true

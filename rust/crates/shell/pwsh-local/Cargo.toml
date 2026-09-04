@@ -1,0 +1,17 @@
+[package]
+name = "dsh-pwsh-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local PowerShell provider."
+
+[dependencies]
+async-trait.workspace = true
+dsh-bash-local.workspace = true
+dsh-shell.workspace = true
+dsh-subprocess.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+dsh-subprocess-local.workspace = true

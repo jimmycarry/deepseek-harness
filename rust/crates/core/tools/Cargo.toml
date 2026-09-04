@@ -1,0 +1,17 @@
+[package]
+name = "dsh-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scoped tool registry and guarded execution pipeline (ctx.tools)."
+
+[dependencies]
+async-trait.workspace = true
+dsh-cordis.workspace = true
+dsh-llm.workspace = true
+dsh-session-checkpoint-policy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

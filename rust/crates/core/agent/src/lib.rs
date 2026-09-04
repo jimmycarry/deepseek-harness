@@ -1,0 +1,413 @@
+//! Agent interface, live registry, and `agent/*` events (`ctx.agents`).
+
+use async_trait::async_trait;
+use dsh_cordis::Service;
+use dsh_llm::UserMessage;
+use dsh_session::{Session, SessionEventData, SessionId};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use thiserror::Error;
+
+/// Inbox routing target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxTarget {
+    /// Starts a new turn.
+    NextTurn,
+    /// Continues the current turn at the next step.
+    NextStep,
+}
+
+impl InboxTarget {
+    /// Durable splice target name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NextTurn => "next-turn",
+            Self::NextStep => "next-step",
+        }
+    }
+}
+
+/// Live agent status mirrored on `agent/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// No driver or maintenance task.
+    Idle,
+    /// A turn is running.
+    Running,
+    /// Idle-phase maintenance.
+    Maintenance,
+}
+
+impl AgentStatus {
+    /// TypeScript `AgentStatus` wire value: maintenance publishes as `idle`.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Idle | Self::Maintenance => "idle",
+        }
+    }
+}
+
+/// Why the caller cancelled.
+#[derive(Debug, Clone)]
+pub struct AgentCancelCause {
+    /// Stable caller intent.
+    pub kind: String,
+}
+
+/// Errors from the agent handle.
+#[derive(Debug, Error)]
+pub enum AgentError {
+    /// No factory is registered.
+    #[error("no agent factory is registered")]
+    NoFactory,
+    /// Session is missing.
+    #[error("unknown session")]
+    UnknownSession,
+    /// `resume` ran without a persistence backend.
+    #[error("cannot resume: session persistence is not configured (load a dsh-session-persistence backend)")]
+    NoPersistence,
+    /// `prepare`/`resume` of an id that is already in the live store.
+    #[error("cannot prepare session \"{0}\" while it is live")]
+    LiveSession(String),
+    /// Persistence has no artifact for this id.
+    #[error("session \"{0}\" not found")]
+    SessionNotFound(String),
+    /// Persistence load or seed reconstruction failed.
+    #[error("{0}")]
+    Persistence(String),
+}
+
+/// One queued inbox entry.
+#[derive(Debug, Clone)]
+pub struct InboxEntry {
+    /// Message body.
+    pub message: UserMessage,
+    /// Routing target.
+    pub target: InboxTarget,
+    /// Whether this message wakes the driver.
+    pub wakeup: bool,
+}
+
+/// Agent-owned pending work.
+#[derive(Default)]
+pub struct Inbox {
+    session: Option<Arc<Session>>,
+    next_turn: Mutex<VecDeque<InboxEntry>>,
+    next_step: Mutex<VecDeque<InboxEntry>>,
+}
+
+impl Inbox {
+    /// Inbox that records `agent/inbox/spliced` on the owning session.
+    pub fn for_session(session: Arc<Session>) -> Self {
+        Self {
+            session: Some(session),
+            ..Self::default()
+        }
+    }
+
+    fn queue_len(&self, target: InboxTarget) -> usize {
+        match target {
+            InboxTarget::NextTurn => self.next_turn.lock().expect("inbox").len(),
+            InboxTarget::NextStep => self.next_step.lock().expect("inbox").len(),
+        }
+    }
+
+    fn log_splice(
+        &self,
+        target: InboxTarget,
+        start: u64,
+        removed_count: Option<u32>,
+        inserted: Vec<UserMessage>,
+    ) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let _ = session.append(
+            SessionEventData::AgentInboxSpliced {
+                target: target.as_str().into(),
+                start,
+                removed_count,
+                inserted,
+            },
+            None,
+        );
+    }
+
+    /// Push one entry.
+    pub fn push(&self, entry: InboxEntry) {
+        let start = self.queue_len(entry.target) as u64;
+        self.log_splice(entry.target, start, None, vec![entry.message.clone()]);
+        match entry.target {
+            InboxTarget::NextTurn => self.next_turn.lock().expect("inbox").push_back(entry),
+            InboxTarget::NextStep => self.next_step.lock().expect("inbox").push_back(entry),
+        }
+    }
+
+    /// Claim pending next-step input plus one queued next-turn message.
+    pub fn claim(&self, prefer: InboxTarget) -> Vec<UserMessage> {
+        let step_len = self.queue_len(InboxTarget::NextStep);
+        if step_len > 0 {
+            self.log_splice(InboxTarget::NextStep, 0, Some(step_len as u32), Vec::new());
+        }
+        let mut claimed = Vec::new();
+        {
+            let mut next_step = self.next_step.lock().expect("inbox");
+            while let Some(entry) = next_step.pop_front() {
+                claimed.push(entry.message);
+            }
+        }
+        if prefer == InboxTarget::NextTurn || claimed.is_empty() {
+            if self.queue_len(InboxTarget::NextTurn) > 0 {
+                self.log_splice(InboxTarget::NextTurn, 0, Some(1), Vec::new());
+            }
+            if let Some(entry) = self.next_turn.lock().expect("inbox").pop_front() {
+                claimed.push(entry.message);
+            }
+        }
+        claimed
+    }
+
+    /// Whether any waking work remains.
+    pub fn has_pending(&self) -> bool {
+        !self.next_turn.lock().expect("inbox").is_empty()
+            || self
+                .next_step
+                .lock()
+                .expect("inbox")
+                .iter()
+                .any(|entry| entry.wakeup)
+    }
+
+    /// Whether next-step input is pending.
+    pub fn next_step_pending(&self) -> bool {
+        !self.next_step.lock().expect("inbox").is_empty()
+    }
+}
+
+/// Public live-agent handle.
+#[async_trait]
+pub trait Agent: Send + Sync {
+    /// Identity shared with the session.
+    fn id(&self) -> &SessionId;
+    /// Live session this agent drives.
+    fn session(&self) -> Arc<Session>;
+    /// Inbox.
+    fn inbox(&self) -> Arc<Inbox>;
+    /// Current lifecycle state.
+    fn status(&self) -> AgentStatus;
+    /// Unified send.
+    fn send(&self, message: UserMessage, target: InboxTarget, wakeup: bool);
+    /// `send(..., NextTurn, true)`.
+    fn followup(&self, message: UserMessage) {
+        self.send(message, InboxTarget::NextTurn, true);
+    }
+    /// `send(..., NextStep, true)`.
+    fn steer(&self, message: UserMessage) {
+        self.send(message, InboxTarget::NextStep, true);
+    }
+    /// `send(..., NextStep, false)` — context without waking.
+    fn inject(&self, message: UserMessage) {
+        self.send(message, InboxTarget::NextStep, false);
+    }
+    /// Cancel the active turn.
+    fn cancel(&self, cause: AgentCancelCause);
+    /// Whether `cancel` has already won for this agent.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    /// Resolve after quiescence.
+    async fn when_idle(&self);
+    /// Drive until idle (used by the loop implementation).
+    async fn run(&self) -> Result<(), AgentError>;
+    /// Run idle-phase maintenance (compaction, title). Default is a no-op.
+    async fn run_maintenance(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+/// Factory registered by the loop.
+#[async_trait]
+pub trait AgentFactory: Send + Sync {
+    /// Build a new agent for `session`.
+    fn create(&self, session: Arc<Session>) -> Arc<dyn Agent>;
+    /// Emit `agent/session-start` after the agent is live in the registry.
+    fn announce_start(&self, agent: &dyn Agent, source: &str) {
+        let _ = (agent, source);
+    }
+    /// Load a persisted session by id, seed it, and build an unpublished agent.
+    async fn resume(&self, id: &SessionId) -> Result<Arc<dyn Agent>, AgentError> {
+        let _ = id;
+        Err(AgentError::NoPersistence)
+    }
+}
+
+/// Owner handle.
+pub struct AgentHandle {
+    /// Live agent.
+    pub agent: Arc<dyn Agent>,
+    dispose: Box<dyn FnOnce() + Send>,
+}
+
+impl AgentHandle {
+    /// Build a handle.
+    pub fn new(agent: Arc<dyn Agent>, dispose: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            agent,
+            dispose: Box::new(dispose),
+        }
+    }
+
+    /// Tear the agent down.
+    pub fn dispose(self) {
+        (self.dispose)();
+    }
+}
+
+/// `ctx.agents`.
+pub struct AgentRegistry {
+    factory: Mutex<Option<Arc<dyn AgentFactory>>>,
+    live: Arc<Mutex<HashMap<String, Arc<dyn Agent>>>>,
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self {
+            factory: Mutex::new(None),
+            live: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl AgentRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register the loop factory.
+    pub fn set_factory(&self, factory: Arc<dyn AgentFactory>) {
+        *self.factory.lock().expect("factory") = Some(factory);
+    }
+
+    /// Create an agent under a caller-supplied session.
+    pub fn create(&self, session: Arc<Session>) -> Result<AgentHandle, AgentError> {
+        self.spawn(session, "startup")
+    }
+
+    /// Look up a live agent.
+    pub fn get(&self, id: &SessionId) -> Option<Arc<dyn Agent>> {
+        self.live.lock().expect("live").get(id.as_str()).cloned()
+    }
+
+    /// Live agents in arbitrary map order.
+    pub fn live(&self) -> Vec<Arc<dyn Agent>> {
+        self.live.lock().expect("live").values().cloned().collect()
+    }
+
+    /// Live agents whose session header has no parent — the runtime roots.
+    ///
+    /// A subagent child carries `parentSession` and is excluded. Schedule and
+    /// other root-only consumers use this instead of scanning every live agent.
+    pub fn roots(&self) -> Vec<Arc<dyn Agent>> {
+        self.live()
+            .into_iter()
+            .filter(|agent| agent.session().header().parent_session.is_none())
+            .collect()
+    }
+
+    /// Resume a caller-supplied reconstructed session under a new live agent.
+    pub fn resume(&self, session: Arc<Session>) -> Result<AgentHandle, AgentError> {
+        self.spawn(session, "resume")
+    }
+
+    /// Load a persisted session by id, seed it, and resume an agent on it.
+    pub async fn resume_persisted(&self, id: &SessionId) -> Result<AgentHandle, AgentError> {
+        let factory = self
+            .factory
+            .lock()
+            .expect("factory")
+            .clone()
+            .ok_or(AgentError::NoFactory)?;
+        let agent = factory.resume(id).await?;
+        self.enter(agent, "resume")
+    }
+
+    fn spawn(
+        &self,
+        session: Arc<Session>,
+        source: &'static str,
+    ) -> Result<AgentHandle, AgentError> {
+        let factory = self
+            .factory
+            .lock()
+            .expect("factory")
+            .clone()
+            .ok_or(AgentError::NoFactory)?;
+        let agent = factory.create(Arc::clone(&session));
+        self.enter(agent, source)
+    }
+
+    fn enter(
+        &self,
+        agent: Arc<dyn Agent>,
+        source: &'static str,
+    ) -> Result<AgentHandle, AgentError> {
+        let factory = self.factory.lock().expect("factory").clone();
+        self.live
+            .lock()
+            .expect("live")
+            .insert(agent.id().as_str().to_string(), Arc::clone(&agent));
+        if let Some(factory) = factory {
+            factory.announce_start(agent.as_ref(), source);
+        }
+        let id = agent.id().as_str().to_string();
+        let live = Arc::clone(&self.live);
+        Ok(AgentHandle::new(agent, move || {
+            live.lock().expect("live").remove(&id);
+        }))
+    }
+}
+
+impl Service for AgentRegistry {
+    const KEY: &'static str = "agents";
+}
+
+/// Default model selection for Agents created without a session-specific model (`ctx.agentDefaultModel`).
+pub struct AgentDefaultModel {
+    /// Registered provider route.
+    pub provider: String,
+    /// Provider-owned model id.
+    pub model: String,
+}
+
+impl AgentDefaultModel {
+    /// Build from the composition entry.
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+impl Service for AgentDefaultModel {
+    const KEY: &'static str = "agentDefaultModel";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_does_not_count_as_pending_wake() {
+        let inbox = Inbox::default();
+        inbox.push(InboxEntry {
+            message: UserMessage::from_parts(vec![], dsh_llm::MessageSource::plugin("inject")),
+            target: InboxTarget::NextStep,
+            wakeup: false,
+        });
+        assert!(!inbox.has_pending());
+        assert!(inbox.next_step_pending());
+    }
+}
