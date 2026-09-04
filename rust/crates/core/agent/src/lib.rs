@@ -148,12 +148,7 @@ impl Inbox {
     pub fn claim(&self, prefer: InboxTarget) -> Vec<UserMessage> {
         let step_len = self.queue_len(InboxTarget::NextStep);
         if step_len > 0 {
-            self.log_splice(
-                InboxTarget::NextStep,
-                0,
-                Some(step_len as u32),
-                Vec::new(),
-            );
+            self.log_splice(InboxTarget::NextStep, 0, Some(step_len as u32), Vec::new());
         }
         let mut claimed = Vec::new();
         {
@@ -310,6 +305,17 @@ impl AgentRegistry {
         self.live.lock().expect("live").values().cloned().collect()
     }
 
+    /// Live agents whose session header has no parent — the runtime roots.
+    ///
+    /// A subagent child carries `parentSession` and is excluded. Schedule and
+    /// other root-only consumers use this instead of scanning every live agent.
+    pub fn roots(&self) -> Vec<Arc<dyn Agent>> {
+        self.live()
+            .into_iter()
+            .filter(|agent| agent.session().header().parent_session.is_none())
+            .collect()
+    }
+
     /// Resume a caller-supplied reconstructed session under a new live agent.
     pub fn resume(&self, session: Arc<Session>) -> Result<AgentHandle, AgentError> {
         self.spawn(session, "resume")
@@ -348,10 +354,10 @@ impl AgentRegistry {
         source: &'static str,
     ) -> Result<AgentHandle, AgentError> {
         let factory = self.factory.lock().expect("factory").clone();
-        self.live.lock().expect("live").insert(
-            agent.id().as_str().to_string(),
-            Arc::clone(&agent),
-        );
+        self.live
+            .lock()
+            .expect("live")
+            .insert(agent.id().as_str().to_string(), Arc::clone(&agent));
         if let Some(factory) = factory {
             factory.announce_start(agent.as_ref(), source);
         }

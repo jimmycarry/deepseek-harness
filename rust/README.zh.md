@@ -6,6 +6,8 @@ TypeScript harness 的语义 1:1 移植。`packages/` 下的 TypeScript 树仍�
 
 crate 名为 `dsh-<pkg>`；目录对齐 `packages/<group>/<pkg>/`。
 
+组合树出现 `@deepseek-ai/dsh-schedule`、`@deepseek-ai/dsh-mcp-client`、`@deepseek-ai/dsh-hooks-claude-code` 或 `@deepseek-ai/dsh-hooks-codex` 时，`dsh-app-boot` 通过 `apply_named` 挂上对应插件；默认 headless 树不插入这些行。
+
 ```sh
 cargo test --workspace
 cargo run -p dsh -- --dump-config

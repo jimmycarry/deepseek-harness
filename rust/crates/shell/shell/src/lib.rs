@@ -125,6 +125,10 @@ pub struct ShellSpec {
     pub sandbox_policy: Option<SandboxExecutionPolicy>,
     /// Foreground timeout in milliseconds. [`ShellExecutor::start`] ignores it.
     pub timeout_ms: Option<u64>,
+    /// Bytes written to stdin then closed. `None` leaves stdin `/dev/null`.
+    pub stdin: Option<String>,
+    /// Extra trusted environment entries merged after model-friendly overrides.
+    pub extra_env: Option<BTreeMap<String, String>>,
 }
 
 /// Shell request before resolve.
@@ -140,6 +144,10 @@ pub struct ShellRequest {
     pub sandbox_policy: Option<SandboxExecutionPolicy>,
     /// Optional foreground timeout in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// Bytes written to stdin then closed. `None` leaves stdin `/dev/null`.
+    pub stdin: Option<String>,
+    /// Extra trusted environment entries (`CLAUDE_PROJECT_DIR`, …).
+    pub extra_env: Option<BTreeMap<String, String>>,
 }
 
 /// Copy request fields onto a spec. Executors may fill remaining defaults.
@@ -150,6 +158,8 @@ pub fn resolve(request: ShellRequest) -> ShellSpec {
         dsh_env: request.dsh_env,
         sandbox_policy: request.sandbox_policy,
         timeout_ms: request.timeout_ms,
+        stdin: request.stdin,
+        extra_env: request.extra_env,
     }
 }
 

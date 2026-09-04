@@ -311,17 +311,25 @@ impl ToolRuntime {
         args: Value,
         agent_id: Option<&str>,
     ) -> Result<ToolExecutionResult, ToolError> {
-        let pre = ctx.waterfall(
-            "tools/pre-execute",
-            serde_json::json!({ "name": name, "args": args }),
-            |payload| payload,
-        );
+        let mut pre_payload = serde_json::json!({ "name": name, "args": args });
+        if let Some(id) = agent_id {
+            pre_payload["agentId"] = serde_json::json!(id);
+        }
+        let pre = ctx.waterfall("tools/pre-execute", pre_payload, |payload| payload);
         let denied = matches!(
             pre,
             Ok(ref value) if value.get("deny").and_then(Value::as_bool) == Some(true)
         );
         if denied {
-            let outcome = ToolOutcome::error(ToolError::Denied(name.into()).to_string());
+            let reason = pre.ok().and_then(|value| {
+                value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let outcome = ToolOutcome::error(
+                reason.unwrap_or_else(|| ToolError::Denied(name.into()).to_string()),
+            );
             return Ok(post_execute(ctx, name, &args, agent_id, outcome));
         }
         let Some(tool) = self.get(name).filter(|tool| tool.enabled_for(agent_id)) else {
@@ -372,27 +380,27 @@ impl ToolRuntime {
                 .collect(),
             None,
         )
-            .await
-            .into_iter()
-            .map(|result| match result {
-                Ok(exec) if !exec.outcome.is_error => Ok(exec.outcome),
-                Ok(exec) => {
-                    let text = outcome_text(&exec.outcome);
-                    if text.contains("denied by pre-execute") {
-                        Err(ToolError::Denied(
-                            exec.outcome
-                                .content
-                                .first()
-                                .and_then(|_| Some(String::new()))
-                                .unwrap_or_default(),
-                        ))
-                    } else {
-                        Ok(exec.outcome)
-                    }
+        .await
+        .into_iter()
+        .map(|result| match result {
+            Ok(exec) if !exec.outcome.is_error => Ok(exec.outcome),
+            Ok(exec) => {
+                let text = outcome_text(&exec.outcome);
+                if text.contains("denied by pre-execute") {
+                    Err(ToolError::Denied(
+                        exec.outcome
+                            .content
+                            .first()
+                            .and_then(|_| Some(String::new()))
+                            .unwrap_or_default(),
+                    ))
+                } else {
+                    Ok(exec.outcome)
                 }
-                Err(error) => Err(error),
-            })
-            .collect()
+            }
+            Err(error) => Err(error),
+        })
+        .collect()
     }
 
     /// Run many calls and keep post-execute contexts for the next step.
@@ -424,11 +432,11 @@ impl ToolRuntime {
             let name = scheduled.name;
             let args = scheduled.args;
             let call_id = scheduled.call_id;
-            let pre = ctx.waterfall(
-                "tools/pre-execute",
-                serde_json::json!({ "name": name, "args": args }),
-                |payload| payload,
-            );
+            let mut pre_payload = serde_json::json!({ "name": name, "args": args });
+            if let Some(id) = agent_id {
+                pre_payload["agentId"] = serde_json::json!(id);
+            }
+            let pre = ctx.waterfall("tools/pre-execute", pre_payload, |payload| payload);
             if let Ok(value) = pre {
                 if value.get("deny").and_then(Value::as_bool) == Some(true) {
                     prepared.push(Prepared::Denied { name, args });
@@ -561,11 +569,12 @@ fn post_execute(
                 .cloned()
                 .and_then(|item| serde_json::from_value(item).ok())
                 .unwrap_or(outcome.content);
+            let is_error = value
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(outcome.is_error);
             ToolExecutionResult {
-                outcome: ToolOutcome {
-                    content,
-                    is_error: outcome.is_error,
-                },
+                outcome: ToolOutcome { content, is_error },
                 additional_contexts,
             }
         }
@@ -776,10 +785,7 @@ mod tests {
             )
             .await;
         assert!(results[0].as_ref().unwrap().outcome.content[0] == ContentBlock::text("ok"));
-        assert_eq!(
-            probe.seen.lock().expect("call id").as_deref(),
-            Some("c1")
-        );
+        assert_eq!(probe.seen.lock().expect("call id").as_deref(), Some("c1"));
     }
 
     #[tokio::test]

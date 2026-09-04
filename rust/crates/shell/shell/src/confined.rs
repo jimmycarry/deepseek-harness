@@ -2,8 +2,8 @@
 
 use crate::{ShellChild, ShellChildExit, ShellError, ShellRunResult, ShellSandboxInfo, ShellSpec};
 use dsh_sandbox::{
-    classify_runner_failure, matches_signature, ConfinedArgv, RunnerFailureRule, SandboxEnforcement,
-    SandboxError, SandboxExecutionPolicy, SandboxMode,
+    classify_runner_failure, matches_signature, ConfinedArgv, RunnerFailureRule,
+    SandboxEnforcement, SandboxError, SandboxExecutionPolicy, SandboxMode,
 };
 use std::sync::Mutex;
 
@@ -108,8 +108,10 @@ pub fn map_spawn(
     spec: &ShellSpec,
     mode: SandboxMode,
 ) -> ShellError {
-    if error.is_runner_spawn_failure(confined.argv.first().map(String::as_str), &spawn_workdir(spec))
-    {
+    if error.is_runner_spawn_failure(
+        confined.argv.first().map(String::as_str),
+        &spawn_workdir(spec),
+    ) {
         runner_unavailable(mode, &error.to_string())
     } else {
         error

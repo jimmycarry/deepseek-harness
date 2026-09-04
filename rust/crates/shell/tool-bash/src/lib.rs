@@ -13,8 +13,8 @@ use dsh_sandbox_policy::{resolve_from_context, SandboxPolicyService};
 use dsh_session::session_id;
 use dsh_shell::{
     parse_exit_status, render_process_read, render_shell_result, shell_tool_output_schema,
-    DSH_ENV_PREFIX, ShellChild, ShellChildExit, ShellRequest, ShellRunResult, ShellRuntime,
-    ShellToolOutput,
+    ShellChild, ShellChildExit, ShellRequest, ShellRunResult, ShellRuntime, ShellToolOutput,
+    DSH_ENV_PREFIX,
 };
 use dsh_shell_env::ShellEnvRegistry;
 use dsh_tools::{
@@ -177,8 +177,7 @@ fn present_bash_result(args: &Value, outcome: &ToolOutcome) -> Option<ToolResult
     let dsh_llm::ContentBlock::Text { text } = &outcome.content[0] else {
         return None;
     };
-    let is_background =
-        args.get("run_in_background").and_then(Value::as_bool) == Some(true);
+    let is_background = args.get("run_in_background").and_then(Value::as_bool) == Some(true);
     if is_background || outcome.is_error {
         let trimmed = text.trim_end_matches('\n');
         return Some(ToolResultView::Generic(GenericResultView {
@@ -264,14 +263,15 @@ fn resolve_workdir(model_workdir: Option<&str>, session_cwd: Option<String>) -> 
     }
 }
 
-fn validate_bash_args(
-    args: &Value,
-) -> Result<(String, Option<u64>, Option<String>), String> {
+fn validate_bash_args(args: &Value) -> Result<(String, Option<u64>, Option<String>), String> {
     let command = args.get("command").and_then(Value::as_str).unwrap_or("");
     if command.trim().is_empty() {
         return Err("invalid command: expected a non-empty string".into());
     }
-    let description = args.get("description").and_then(Value::as_str).unwrap_or("");
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if description.trim().is_empty() {
         return Err("invalid description: expected a non-empty string".into());
     }
@@ -327,7 +327,8 @@ impl BashTool {
         enable_run_in_background: bool,
         dialect: ShellToolDialect,
     ) -> Self {
-        let description = (dialect.describe)(enable_run_in_background, shell.sandbox_mode().is_some());
+        let description =
+            (dialect.describe)(enable_run_in_background, shell.sandbox_mode().is_some());
         Self {
             dialect,
             shell,
@@ -570,6 +571,7 @@ impl Tool for BashTool {
             dsh_env,
             sandbox_policy: policy,
             timeout_ms,
+            ..ShellRequest::default()
         };
         if call.args.get("run_in_background").and_then(Value::as_bool) == Some(true) {
             if !self.enable_run_in_background {
@@ -606,7 +608,9 @@ impl Tool for BashTool {
             match self.shell.run(spec).await {
                 Ok(result) => {
                     let output = ShellToolOutput::Foreground { result };
-                    Ok(ToolOutcome::text(output.render(self.advertises_escalation())))
+                    Ok(ToolOutcome::text(
+                        output.render(self.advertises_escalation()),
+                    ))
                 }
                 Err(error) => Ok(ToolOutcome::error(error.to_string())),
             }
@@ -703,10 +707,7 @@ mod tests {
             json!(["workspace-write", "danger-full-access"])
         );
         assert!(tool.description().contains("approval prompt"));
-        assert_eq!(
-            parameters["required"],
-            json!(["command", "description"])
-        );
+        assert_eq!(parameters["required"], json!(["command", "description"]));
         assert!(props.contains_key("timeoutMs"));
         assert!(props.contains_key("workdir"));
         assert_eq!(
@@ -802,12 +803,7 @@ mod tests {
             "invalid command: expected a non-empty string"
         );
         assert_eq!(
-            text(
-                &tool
-                    .execute(json!({ "command": "true" }))
-                    .await
-                    .unwrap()
-            ),
+            text(&tool.execute(json!({ "command": "true" })).await.unwrap()),
             "invalid description: expected a non-empty string"
         );
         assert_eq!(
@@ -849,8 +845,14 @@ mod tests {
             modes: Mutex::new(Vec::new()),
         }))));
         let schema = tool.output_schema().expect("bash declares output schema");
-        assert_eq!(schema["oneOf"][0]["properties"]["kind"]["const"], "background");
-        assert_eq!(schema["oneOf"][1]["properties"]["kind"]["const"], "foreground");
+        assert_eq!(
+            schema["oneOf"][0]["properties"]["kind"]["const"],
+            "background"
+        );
+        assert_eq!(
+            schema["oneOf"][1]["properties"]["kind"]["const"],
+            "foreground"
+        );
     }
 
     #[test]
@@ -907,10 +909,7 @@ mod tests {
         }))));
         let args = json!({ "command": "x", "description": "x" });
         match tool
-            .present_result(
-                &args,
-                &ToolOutcome::text("hi\n\n"),
-            )
+            .present_result(&args, &ToolOutcome::text("hi\n\n"))
             .expect("zero")
         {
             ToolResultView::Terminal(view) => {
@@ -920,10 +919,7 @@ mod tests {
             other => panic!("expected terminal, got {other:?}"),
         }
         match tool
-            .present_result(
-                &args,
-                &ToolOutcome::text("oops\n[exit code: 3]"),
-            )
+            .present_result(&args, &ToolOutcome::text("oops\n[exit code: 3]"))
             .expect("nonzero")
         {
             ToolResultView::Terminal(view) => {
@@ -989,10 +985,13 @@ mod tests {
             other => panic!("expected terminal, got {other:?}"),
         }
         assert!(tool
-            .present_result(&args, &ToolOutcome {
-                content: vec![],
-                is_error: false,
-            })
+            .present_result(
+                &args,
+                &ToolOutcome {
+                    content: vec![],
+                    is_error: false,
+                }
+            )
             .is_none());
     }
 }

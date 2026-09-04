@@ -151,14 +151,31 @@ pub fn spawn_argv_with_env(
         .clone();
     let mut cmd = Command::new(&program);
     cmd.args(&argv[1..])
-        .stdin(Stdio::null())
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
     apply_env_overrides(&mut cmd, spec, extra_env);
-    let mut child = cmd.spawn().map_err(|error| ShellError::from_spawn(program, error))?;
+    if let Some(extra) = &spec.extra_env {
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| ShellError::from_spawn(program, error))?;
+    if let Some(stdin_text) = &spec.stdin {
+        if let Some(mut pipe) = child.stdin.take() {
+            use std::io::Write;
+            let _ = pipe.write_all(stdin_text.as_bytes());
+        }
+    }
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let stdout = Arc::new(Mutex::new(String::new()));
@@ -183,7 +200,10 @@ pub fn spawn_argv_with_env(
     })
 }
 
-fn spawn_reader(mut pipe: impl Read + Send + 'static, dest: Arc<Mutex<String>>) -> std::thread::JoinHandle<()> {
+fn spawn_reader(
+    mut pipe: impl Read + Send + 'static,
+    dest: Arc<Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -200,11 +220,7 @@ fn spawn_reader(mut pipe: impl Read + Send + 'static, dest: Arc<Mutex<String>>) 
 }
 
 /// Apply model-friendly environment overrides plus an optional trusted overlay.
-pub fn apply_env_overrides(
-    command: &mut Command,
-    spec: &ShellSpec,
-    extra_env: &[(&str, &str)],
-) {
+pub fn apply_env_overrides(command: &mut Command, spec: &ShellSpec, extra_env: &[(&str, &str)]) {
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -217,7 +233,11 @@ pub fn apply_env_overrides(
     for (key, value) in extra_env {
         env.insert((*key).into(), (*value).into());
     }
-    env.extend(overlay.iter().map(|(key, value)| (key.clone(), value.clone())));
+    env.extend(
+        overlay
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
     command.env_clear();
     command.envs(env);
 }

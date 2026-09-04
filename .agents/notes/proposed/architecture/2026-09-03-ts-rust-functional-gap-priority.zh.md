@@ -6,7 +6,7 @@ Status: proposed
 
 ## 问题
 
-Rust 树已经在 [移植 Agent Note](../../implemented/architecture/2026-08-22-rust-harness-port.zh.md) 的 1:1 规则下交付 headless、ACP 与 JSON-RPC profile。TypeScript 仍有 227 个包；Rust 有 112 个 crate。若没有约定顺序，下一个 crate 可以去追 Web UI、打包的 SQLite schema 17，或去改 loop，看起来仍像进展，而剩余 P0 只是已报告的 finish-chunk 差距，更薄的路径（DeepSeek Files API、session-query FTS、skill 监听）仍开着。
+Rust 树已经在 [移植 Agent Note](../../implemented/architecture/2026-08-22-rust-harness-port.zh.md) 的 1:1 规则下交付 headless、ACP 与 JSON-RPC profile。TypeScript 仍有 227 个包；Rust 有 117 个 crate。若没有约定顺序，下一个 crate 可以去追 Web UI、打包的 SQLite schema 17，或去改 loop，看起来仍像进展，而剩余 P0 只是已报告的 finish-chunk 差距，更薄的路径（DeepSeek Files API、session-query FTS、skill 监听）仍开着。
 
 只比叶名也会说谎：`typert/protocol` 不是 `sdk/protocol`。维护者若按「每个缺失文件夹名」移植，会把已经存在于另一 group 下的服务器再做一遍。
 
@@ -25,8 +25,8 @@ P0 是已交付 headless / ACP / JSON-RPC profile 在 Linux 上的正确性。P1
 | P0 | 已交付 profile 在 Linux 上的正确性 | 第 1–6 项已关闭（persistence 协调器、DeepSeek SSE + 图像块、附件归一化、ACP 图像、settings Service Definition、headless plan 评审）。剩余：报告 loop 的 finish-chunk 差距 |
 | P1 | 这些 profile 上的耐久性与运维 | DeepSeek Files API 上传；projection cache；session-query FTS；启用 `web-fetch-http`；skill 监听；OTel flush 提示；SDK 客户端助手；外部子代理 provider；`tool-ask-user` |
 | P2 | 平台与相邻产品 | 现有 TypeScript SPA 的 Rust 宿主；Typert/API；Seatbelt / `CreateRestrictedToken`；PTY / LSP；JS workflow worker；`llm-pi-ai`；Exa / Perplexity；storage / workspace / presets；Code Mode |
-| P3 | 可选能力 | `schedule`；额外 context；持久 shell；额外 title / query / feedback 包；`skill-badge` |
-| P4 | 实验 / 云 / hook | e2b；agent-team；Claude Code / Codex hook；MCP；动态 Cordis |
+| P3 | 可选能力 | `schedule` 已关闭（[Rust MCP / schedule / hooks 移植](../../implemented/feature/2026-09-04-rust-mcp-schedule-hooks.zh.md)）。剩余：额外 context；持久 shell；额外 title / query / feedback 包；`skill-badge` |
+| P4 | 实验 / 云 / hook | Claude Code / Codex hook 与 `mcp-client` 已关闭（[Rust MCP / schedule / hooks 移植](../../implemented/feature/2026-09-04-rust-mcp-schedule-hooks.zh.md)）。剩余：e2b；agent-team；动态 Cordis |
 | P5 | 工具库 | `launch-environment`；`native-command`；`output-retention`；仅在有第二个消费者时抽出 `session-title-llm` |
 
 ## 不在范围内
@@ -40,7 +40,7 @@ P0 是已交付 headless / ACP / JSON-RPC profile 在 Linux 上的正确性。P1
 ## 考虑过的替代方案
 
 - **把 Typert、API gateway 与 Web 客户端栈标成 P0** — 这会颠倒已交付 profile，并重开已被否决的「用 Rust 重写 Web UI」替代方案。后续 Rust 宿主可以讲现有客户端协议；那是 P2，排在 headless spine 之后。
-- **把每个仅 TypeScript 的包都当成同等缺失工作** — 123 个叶包含测试 harness、UI 插件与构建期生成器。同等优先级会盖住 Linux 上的产品用户差距。
+- **把每个仅 TypeScript 的包都当成同等缺失工作** — 118 个叶包含测试 harness、UI 插件与构建期生成器。同等优先级会盖住 Linux 上的产品用户差距。
 - **只把本排序折进移植 Agent Note** — 该 note 已经拥有 1:1 规则与已挂载的树。再塞一张 227 行的表会同时淹没决策与清单。清单放在 `rust/docs/`；本 note 只保留顺序。
 - **只生成计数、不定优先级** — 没有 P0–P5 的普查仍让下一个 PR 可以挑最好写的 crate。
 

@@ -1,0 +1,18 @@
+[package]
+name = "dsh-hook-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared hook matcher, codec, merge, events, and runner."
+
+[dependencies]
+dsh-session.workspace = true
+futures.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+dsh-cordis.workspace = true

@@ -8,6 +8,24 @@ use thiserror::Error;
 /// Prefix of every managed `DSH_*` environment key.
 pub const DSH_ENV_PREFIX: &str = "DSH_";
 
+/// Credential-shaped ambient names dropped from every harness child environment.
+pub fn is_sensitive_env_name(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("KEY")
+        || upper.contains("PASSWORD")
+        || upper.contains("SECRET")
+        || upper.contains("TOKEN")
+}
+
+/// Ambient parent environment minus credential-shaped names and all `DSH_*` names.
+pub fn scrubbed_parent_env() -> BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(key, _)| {
+            !is_sensitive_env_name(key) && !key.to_ascii_uppercase().starts_with(DSH_ENV_PREFIX)
+        })
+        .collect()
+}
+
 /// Resolved spawn request. Defaulting happens in `resolve`, never inside `run`.
 #[derive(Debug, Clone, Default)]
 pub struct SpawnSpec {
@@ -94,6 +112,19 @@ impl Service for SubprocessRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrubbed_parent_env_drops_credential_and_dsh_names() {
+        std::env::set_var("DSH_SCRUB_TEST_TOKEN", "secret");
+        std::env::set_var("DSH_SCRUB_TEST_HOME", "/tmp");
+        let env = scrubbed_parent_env();
+        assert!(!env.contains_key("DSH_SCRUB_TEST_TOKEN"));
+        assert!(!env
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("dsh_scrub_test_home")));
+        std::env::remove_var("DSH_SCRUB_TEST_TOKEN");
+        std::env::remove_var("DSH_SCRUB_TEST_HOME");
+    }
 
     #[test]
     fn resolve_does_not_invent_a_cwd() {

@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use uuid::Uuid;
 
 mod delegation;
 
@@ -137,6 +138,8 @@ struct Activation {
     child_id: SessionId,
     parent_id: SessionId,
     handle: AgentHandle,
+    run_id: String,
+    provider: String,
 }
 
 /// `ctx.subagents`.
@@ -214,12 +217,30 @@ impl SubagentRuntime {
             .ok_or_else(|| SubagentError::NoProvider(name.into()))?;
         let parent_id = request.parent_id.clone();
         let result = provider.start(request).await?;
-        self.emit_end(name, &result, &parent_id, true);
+        let run_id = Uuid::new_v4().to_string();
+        self.emit_start(name, &result.id, &run_id, true);
+        self.emit_end(name, &result, &parent_id, true, &run_id);
         self.results
             .lock()
             .expect("subagents")
             .push(result.output.clone());
         Ok(result)
+    }
+
+    /// Publish `subagent/start` after a child identity is known.
+    fn emit_start(&self, provider: &str, child_id: &SessionId, run_id: &str, local: bool) {
+        let Some(ctx) = self.ctx.lock().ok().and_then(|guard| guard.clone()) else {
+            return;
+        };
+        ctx.emit(
+            "subagent/start",
+            serde_json::json!({
+                "runId": run_id,
+                "provider": provider,
+                "id": child_id.as_str(),
+                "local": local,
+            }),
+        );
     }
 
     /// Publish `subagent/end` for an in-process child that has settled.
@@ -229,11 +250,13 @@ impl SubagentRuntime {
         result: &SubagentResult,
         parent_id: &SessionId,
         local: bool,
+        run_id: &str,
     ) {
         let Some(ctx) = self.ctx.lock().ok().and_then(|guard| guard.clone()) else {
             return;
         };
         let mut payload = serde_json::json!({
+            "runId": run_id,
             "id": result.id.as_str(),
             "provider": provider,
             "local": local,
@@ -353,6 +376,8 @@ impl SubagentRuntime {
         let handle = agents
             .create(Arc::clone(&child))
             .map_err(|error| error.to_string())?;
+        let run_id = Uuid::new_v4().to_string();
+        self.emit_start(provider, &child_id, &run_id, true);
         let message = UserMessage::from_parts(prompt, MessageSource::User);
         let message_id = message.id.clone();
         handle.agent.followup(message);
@@ -363,6 +388,8 @@ impl SubagentRuntime {
                 child_id: child_id.clone(),
                 parent_id: parent.id().clone(),
                 handle,
+                run_id,
+                provider: provider.to_string(),
             });
         Ok(ContinuableStart {
             child_id,
@@ -413,6 +440,11 @@ impl SubagentRuntime {
                 let handle = agents
                     .resume(Arc::clone(&child))
                     .map_err(|_| unavailable(child_id))?;
+                let provider = fold_descriptor(child.as_ref())
+                    .map(|descriptor| descriptor.provider)
+                    .unwrap_or_else(|| "spawn".into());
+                let run_id = Uuid::new_v4().to_string();
+                self.emit_start(&provider, child_id, &run_id, true);
                 handle.agent.followup(message);
                 self.activations
                     .lock()
@@ -421,6 +453,8 @@ impl SubagentRuntime {
                         child_id: child_id.clone(),
                         parent_id: parent.id().clone(),
                         handle,
+                        run_id,
+                        provider,
                     });
             }
         }
@@ -700,9 +734,13 @@ impl SubagentRuntime {
                     _ => None,
                 })
                 .unwrap_or(TurnEndReason::Completed);
-            let provider = fold_descriptor(session.as_ref())
-                .map(|descriptor| descriptor.provider)
-                .unwrap_or_else(|| "spawn".into());
+            let provider = if activation.provider.is_empty() {
+                fold_descriptor(session.as_ref())
+                    .map(|descriptor| descriptor.provider)
+                    .unwrap_or_else(|| "spawn".into())
+            } else {
+                activation.provider.clone()
+            };
             let output = session.last_assistant_text().unwrap_or_default();
             self.emit_end(
                 &provider,
@@ -713,6 +751,7 @@ impl SubagentRuntime {
                 },
                 &activation.parent_id,
                 true,
+                &activation.run_id,
             );
             activation.handle.dispose();
             if let Some(parent) = agents.get(&activation.parent_id) {

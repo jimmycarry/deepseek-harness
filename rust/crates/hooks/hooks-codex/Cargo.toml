@@ -1,0 +1,20 @@
+[package]
+name = "dsh-hooks-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Codex command-hook bridge."
+
+[dependencies]
+dsh-agent.workspace = true
+dsh-cordis.workspace = true
+dsh-hook-protocol.workspace = true
+dsh-llm.workspace = true
+dsh-session.workspace = true
+dsh-session-persistence.workspace = true
+dsh-shell.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

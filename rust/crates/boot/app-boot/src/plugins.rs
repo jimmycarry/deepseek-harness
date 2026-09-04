@@ -147,6 +147,12 @@ pub fn apply_named(name: &str, ctx: &Context, config: Option<Value>) -> Result<(
         "@deepseek-ai/dsh-sdk-jsonrpc-server" => {
             dsh_sdk_server::HarnessSdkJsonRpcServer::install(ctx)
         }
+        "@deepseek-ai/dsh-schedule" => dsh_schedule::install(ctx, config.as_ref()),
+        "@deepseek-ai/dsh-mcp-client" => dsh_mcp_client::install(ctx, config.as_ref()),
+        "@deepseek-ai/dsh-hooks-claude-code" => {
+            dsh_hooks_claude_code::install(ctx, config.as_ref())
+        }
+        "@deepseek-ai/dsh-hooks-codex" => dsh_hooks_codex::install(ctx, config.as_ref()),
         _ => Ok(()),
     }
 }

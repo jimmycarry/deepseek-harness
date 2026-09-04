@@ -4,7 +4,7 @@
 
 本页是每条 `packages/<group>/<pkg>` 叶与 `rust/crates/<group>/<pkg>` 的对照清单，以及剩余移植工作的排序。`packages/` 下的 TypeScript 仍是行为真源。本页不改变该规则；它记录 Rust 树在何处更薄、是桩、已改名，或有意缺席。排序决策见 [proposed Agent Note](../../.agents/notes/proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.zh.md)。已交付的 Rust 行为仍以 [rust/README.zh.md](../README.zh.md) 与 [移植 Agent Note](../../.agents/notes/implemented/architecture/2026-08-22-rust-harness-port.zh.md) 为准。
 
-取证日期：2026-09-03。计数：**227** 个 TypeScript 包，`rust/crates/*/*/` 下 **112** 个 crate，**104** 个相同的 `(group, pkg)` 对，**123** 个仅 TypeScript 叶，**8** 个仅 Rust 叶（改名或额外 patch crate）。只比叶名会误报：`typert/protocol` 不是 `sdk/protocol`，`acp/acp` 也不是 `bundle/acp`。
+取证日期：2026-09-04。计数：**227** 个 TypeScript 包，`rust/crates/*/*/` 下 **117** 个 crate，**109** 个相同的 `(group, pkg)` 对，**118** 个仅 TypeScript 叶，**8** 个仅 Rust 叶（改名或额外 patch crate）。只比叶名会误报：`typert/protocol` 不是 `sdk/protocol`，`acp/acp` 也不是 `bundle/acp`。
 
 ## 如何阅读优先级
 
@@ -84,7 +84,7 @@
 
 ### P3 — 可选能力
 
-26. `schedule`、`time-context`、`tmux-context`。
+26. `schedule` — **已关闭。** `time-context`、`tmux-context` 仍缺席。
 27. `tool-session-query`、`session-log-export`、`session-stats`、`session-title-all-prompts-llm`。
 28. 持久 shell 工具（`tool-bash-persistent` / `tool-pwsh-persistent`）。
 29. `skill-badge`（空操作，base 中禁用）。
@@ -94,8 +94,8 @@
 
 31. `e2b` / `fs-e2b` / `subprocess-e2b`。
 32. `experimental/agent-team` + `tool-agent-team`。
-33. `hooks-claude-code` / `hooks-codex` / `hook-protocol`。
-34. `mcp-client`。
+33. `hooks-claude-code` / `hooks-codex` / `hook-protocol` — **已关闭。**
+34. `mcp-client` — **已关闭。**
 35. 动态 Cordis（`tool-cordis`、host/client runner）。
 
 ### P5 — 随第一个消费者走的工具库
@@ -140,7 +140,7 @@
 
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
-| `app-boot` | thinner | headless 树真实挂载；剩余名字空操作；persistence Config（`preparedSessionCacheSize` / `writeBatchMaxDelayMs`）已接通 | P1 空操作见上 |
+| `app-boot` | thinner | headless 树真实挂载；剩余名字空操作；persistence Config（`preparedSessionCacheSize` / `writeBatchMaxDelayMs`）已接通；组合树点名时挂上可选的 `schedule` / `mcp-client` / hook 桥 | P1 空操作见上 |
 | `cmdline` | absent | TypeScript 共享 argv 解析；Rust 把任务旗标内联进 headless 启动 | P2 |
 
 ### bundle
@@ -238,7 +238,11 @@
 
 ### hooks
 
-三个包全部 **absent** / **P4**。
+| 包 | 状态 | 差距 | 优先级 |
+|---|---|---|---|
+| `hook-protocol` | aligned | matcher、codec、merge、`hook/invoked` / `hook/result`、detached drain | remaining（解析 `updatedInput` 但不兑现——与 TypeScript 相同） |
+| `hooks-claude-code` | aligned | SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SubagentStart / SubagentStop；`ask` 走 `ctx.approval`，否则失败闭合 deny | remaining（`updatedInput` / `systemMessage` / `allow` 预批准——与 TypeScript 相同） |
+| `hooks-codex` | aligned | 五个 Codex 事件；跳过 `async: true`；只兑现 deny | remaining（`updatedInput` / `additionalContext`——与 TypeScript 相同） |
 
 ### host
 
@@ -282,7 +286,7 @@
 
 ### mcp
 
-`mcp-client`：**absent** / **P4**。
+`mcp-client`：**aligned**。stdio 与 streamable-http 工具桥、重连监督器、公开名 `mcp__<server>__<raw>`、经路由证明后的图像准入。剩余：MCP Resources / Prompts（TypeScript 同样暂缓）；Rust `ToolOutcome` 没有独立的规范 `{content, structuredContent}` 值（Native 文本对齐）。
 
 ### plan
 
@@ -305,7 +309,7 @@
 
 ### schedule
 
-`schedule`：**absent** / **P3**。
+`schedule`：**aligned**。版本 1 的 `schedule/change` fold、`schedule_create` / `schedule_list` / `schedule_delete`、idle 阶段到期投递。剩余：`time-context` 是单独的 P3 crate；Rust 把三个工具登记为全局工具，并用 `enabled_for` 限制到加载后创建的存活根 owner。
 
 ### sdk
 
@@ -435,7 +439,7 @@
 
 ## 已经对齐（不要再当成差距打开）
 
-凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、persistence write-behind / `append` / 耐久 `commitRepair` / inspect LRU `preparedSessionCacheSize`、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（含可选 `reviewProvider: "auto"`；默认 headless 评审仍失败闭合）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题、附件 `request_image`、在 store + vision 挂载时的 ACP 图像提示、DeepSeek SSE + `image_url` data-URL、settings 的 `register` / `watch` / `revision` / `mutate`。
+凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、persistence write-behind / `append` / 耐久 `commitRepair` / inspect LRU `preparedSessionCacheSize`、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（含可选 `reviewProvider: "auto"`；默认 headless 评审仍失败闭合）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题、附件 `request_image`、在 store + vision 挂载时的 ACP 图像提示、DeepSeek SSE + `image_url` data-URL、settings 的 `register` / `watch` / `revision` / `mutate`、`schedule` 版本 1 工具与 idle 投递、`mcp-client` 工具桥、`hook-protocol` 以及 Claude Code 与 Codex 桥。
 
 ## 验证
 

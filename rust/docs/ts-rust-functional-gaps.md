@@ -4,7 +4,7 @@ English | [中文](ts-rust-functional-gaps.zh.md)
 
 Reference inventory of every `packages/<group>/<pkg>` leaf against `rust/crates/<group>/<pkg>`, plus the ranking for remaining port work. TypeScript under `packages/` remains the behavior source. This page does not change that rule; it records where the Rust tree is thinner, stubbed, remapped, or intentionally absent. The ranking decision lives in [the proposed Agent Note](../../.agents/notes/proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.md). Shipped Rust behavior stays in [rust/README.md](../README.md) and [the port Agent Note](../../.agents/notes/implemented/architecture/2026-08-22-rust-harness-port.md).
 
-Evidence date: 2026-09-03. Counts: **227** TypeScript packages, **112** Rust crates under `rust/crates/*/*/`, **104** same `(group, pkg)` pairs, **123** TypeScript-only leaves, **8** Rust-only leaves (name remaps or extra patch crates). Leaf-name-only matching is wrong: `typert/protocol` is not `sdk/protocol`, and `acp/acp` is not `bundle/acp`.
+Evidence date: 2026-09-04. Counts: **227** TypeScript packages, **117** Rust crates under `rust/crates/*/*/`, **109** same `(group, pkg)` pairs, **118** TypeScript-only leaves, **8** Rust-only leaves (name remaps or extra patch crates). Leaf-name-only matching is wrong: `typert/protocol` is not `sdk/protocol`, and `acp/acp` is not `bundle/acp`.
 
 ## How to read the ranking
 
@@ -84,7 +84,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 
 ### P3 — opt-in capabilities
 
-26. `schedule`, `time-context`, `tmux-context`.
+26. `schedule` — **closed.** `time-context`, `tmux-context` remain.
 27. `tool-session-query`, `session-log-export`, `session-stats`, `session-title-all-prompts-llm`.
 28. Persistent shell tools (`tool-bash-persistent` / `tool-pwsh-persistent`).
 29. `skill-badge` (no-op, disabled in base).
@@ -94,8 +94,8 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 
 31. `e2b` / `fs-e2b` / `subprocess-e2b`.
 32. `experimental/agent-team` + `tool-agent-team`.
-33. `hooks-claude-code` / `hooks-codex` / `hook-protocol`.
-34. `mcp-client`.
+33. `hooks-claude-code` / `hooks-codex` / `hook-protocol` — **closed.**
+34. `mcp-client` — **closed.**
 35. Dynamic Cordis (`tool-cordis`, host/client runners).
 
 ### P5 — utilities with the first consumer
@@ -140,7 +140,7 @@ Status values: **aligned** (headless contract matches), **thinner** (crate exist
 
 | Package | Status | Gap | Pri |
 |---|---|---|---|
-| `app-boot` | thinner | Real mounts for the headless tree; leftover names no-op; persistence Config (`preparedSessionCacheSize` / `writeBatchMaxDelayMs`) wired | P1 no-ops listed above |
+| `app-boot` | thinner | Real mounts for the headless tree; leftover names no-op; persistence Config (`preparedSessionCacheSize` / `writeBatchMaxDelayMs`) wired; opt-in `schedule` / `mcp-client` / hook-bridge names mount when the composition tree names them | P1 no-ops listed above |
 | `cmdline` | absent | TypeScript shared argv parser; Rust inlines task flags on headless startup | P2 |
 
 ### bundle
@@ -238,7 +238,11 @@ All three packages **absent** / **P4**.
 
 ### hooks
 
-All three packages **absent** / **P4**.
+| Package | Status | Gap | Pri |
+|---|---|---|---|
+| `hook-protocol` | aligned | Matcher, codec, merge, `hook/invoked` / `hook/result`, detached drain | remaining (`updatedInput` parsed, not honored — same as TypeScript) |
+| `hooks-claude-code` | aligned | SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SubagentStart / SubagentStop; `ask` uses `ctx.approval` or fail-closed deny | remaining (`updatedInput` / `systemMessage` / `allow` pre-approve — same as TypeScript) |
+| `hooks-codex` | aligned | Five Codex events; `async: true` skipped; deny only | remaining (`updatedInput` / `additionalContext` — same as TypeScript) |
 
 ### host
 
@@ -282,7 +286,7 @@ All three packages **absent** / **P4**.
 
 ### mcp
 
-`mcp-client`: **absent** / **P4**.
+`mcp-client`: **aligned**. stdio and streamable-http tool bridge, reconnect supervisor, public `mcp__<server>__<raw>` names, image admission after route proof. Remaining: MCP Resources / Prompts (TypeScript deferred); Rust `ToolOutcome` has no separate canonical `{content, structuredContent}` value (Native text matches).
 
 ### plan
 
@@ -305,7 +309,7 @@ All three packages **absent** / **P4**.
 
 ### schedule
 
-`schedule`: **absent** / **P3**.
+`schedule`: **aligned**. Version-1 `schedule/change` fold, `schedule_create` / `schedule_list` / `schedule_delete`, idle-phase due delivery. Remaining: `time-context` is a separate P3 crate; Rust registers the three tools globally and gates them with `enabled_for` on live root owners created after load.
 
 ### sdk
 
@@ -435,7 +439,7 @@ All four packages **absent** / **P2**.
 
 ## Already aligned (do not re-open as gaps)
 
-Credentials resolution, `llm-retry` `retryPolicy` + `providerRetryAfterMs` (delay-seconds and HTTP-date, over-cap `normal`/`always`), sandbox-policy / approval / permission-presets, continuable in-process subagents with cold resume and `list_agents` diagnostics, persistence write-behind / `append` / durable `commitRepair` / inspect LRU `preparedSessionCacheSize`, Windows ACL Node runner argv, OTel keepAlive + `Retry-After` HTTP-date, compaction-basic main path, goal / todo / plan tools (including opt-in `reviewProvider: "auto"`; default headless review stays fail-closed), jobs, spill, agent-instructions, fs observation gate, skill catalog tool, token-meter, titles, attachment `request_image`, ACP image prompts when store + vision are mounted, DeepSeek SSE + `image_url` data-URLs, settings `register` / `watch` / `revision` / `mutate`.
+Credentials resolution, `llm-retry` `retryPolicy` + `providerRetryAfterMs` (delay-seconds and HTTP-date, over-cap `normal`/`always`), sandbox-policy / approval / permission-presets, continuable in-process subagents with cold resume and `list_agents` diagnostics, persistence write-behind / `append` / durable `commitRepair` / inspect LRU `preparedSessionCacheSize`, Windows ACL Node runner argv, OTel keepAlive + `Retry-After` HTTP-date, compaction-basic main path, goal / todo / plan tools (including opt-in `reviewProvider: "auto"`; default headless review stays fail-closed), jobs, spill, agent-instructions, fs observation gate, skill catalog tool, token-meter, titles, attachment `request_image`, ACP image prompts when store + vision are mounted, DeepSeek SSE + `image_url` data-URLs, settings `register` / `watch` / `revision` / `mutate`, `schedule` version-1 tools and idle delivery, `mcp-client` tool bridge, `hook-protocol` plus Claude Code and Codex bridges.
 
 ## Verification
 

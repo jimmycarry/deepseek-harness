@@ -88,10 +88,7 @@ fn trailing_exit(text: &str) -> Option<ExitCap> {
         return None;
     }
     let code = inner.parse::<i32>().ok()?;
-    Some(ExitCap {
-        index: start,
-        code,
-    })
+    Some(ExitCap { index: start, code })
 }
 
 fn stream_text(output: &CollectedOutput) -> String {
@@ -122,7 +119,11 @@ pub fn render_shell_result(result: &ShellRunResult, advertises_escalation: bool)
     }
     let mut markers = Vec::new();
     if result.sandbox.as_ref().is_some_and(|info| info.denied) {
-        let mode = result.sandbox.as_ref().expect("denied implies sandbox").mode;
+        let mode = result
+            .sandbox
+            .as_ref()
+            .expect("denied implies sandbox")
+            .mode;
         markers.push(sandbox_denial_marker(mode));
         if advertises_escalation {
             markers.push(escalation_hint_marker("command"));
@@ -255,10 +256,7 @@ pub fn canonical_foreground_json(result: &ShellRunResult) -> Value {
     map.insert("kind".into(), Value::String("foreground".into()));
     map.insert(
         "exitCode".into(),
-        result
-            .exit_code
-            .map(Value::from)
-            .unwrap_or(Value::Null),
+        result.exit_code.map(Value::from).unwrap_or(Value::Null),
     );
     map.insert(
         "signal".into(),
@@ -375,8 +373,14 @@ mod tests {
     fn output_schema_is_a_foreground_background_oneof() {
         let schema = shell_tool_output_schema();
         assert!(schema["oneOf"].as_array().unwrap().len() == 2);
-        assert_eq!(schema["oneOf"][0]["properties"]["kind"]["const"], "background");
-        assert_eq!(schema["oneOf"][1]["properties"]["kind"]["const"], "foreground");
+        assert_eq!(
+            schema["oneOf"][0]["properties"]["kind"]["const"],
+            "background"
+        );
+        assert_eq!(
+            schema["oneOf"][1]["properties"]["kind"]["const"],
+            "foreground"
+        );
     }
 
     #[test]
