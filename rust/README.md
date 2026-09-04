@@ -6,7 +6,7 @@ English | [中文](README.zh.md)
 
 Crate names are `dsh-<pkg>`; directories mirror `packages/<group>/<pkg>/`.
 
-`dsh-app-boot` mounts `@deepseek-ai/dsh-schedule`, `@deepseek-ai/dsh-mcp-client`, `@deepseek-ai/dsh-hooks-claude-code`, and `@deepseek-ai/dsh-hooks-codex` through `apply_named` when the composition tree names those plugins; the default headless tree does not insert those rows.
+`dsh-app-boot` mounts `@deepseek-ai/dsh-schedule`, `@deepseek-ai/dsh-mcp-client`, `@deepseek-ai/dsh-hooks-claude-code`, and `@deepseek-ai/dsh-hooks-codex` through `apply_named` when the composition tree names those plugins; the default headless tree does not insert those rows. MCP success sets `ToolOutcome.value` to `{content, structuredContent?}`. One-shot `subagent/start` is published after the child exists and before its turn settles.
 
 ```sh
 cargo test --workspace

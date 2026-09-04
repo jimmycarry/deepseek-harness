@@ -14,7 +14,7 @@ TypeScript 树已经拥有三组默认 headless patch 不该插入的可选能�
 
 ### MCP client
 
-每个插件实例拥有一个 `serverName`（`/^[A-Za-z0-9_-]{1,32}$/`）。第二个同名存活实例在加载时按 TypeScript 文句失败。线上客户端身份为 `{ name: 'dsh-mcp-client', version: '0.0.1' }`，协议 `2025-03-26`。`callTool` 永远发送 MCP 原始名。公开登记名是 `mcp__<server>__<raw>`；`[A-Za-z0-9_-]` 以外的字符变成 `_`，有损改写再追加 `sha256(server + '\0' + raw)` 的前 12 个十六进制字符。stdio 继承 `scrubbed_parent_env()` 再叠显式 `env`。Streamable HTTP 走 `curl`。重连默认值为 `enabled: true`、`initialDelayMs: 500`、`maxDelayMs: 30000`、`maxAttempts: 10`。`failOnStartupError: true` 以 `mcp-client(<server>): initial connection or tool synchronization failed` 拒绝激活。图像块只有在 `ctx.attachments` 与精确默认模型路由声明图像输入之后才成为耐久附件；被拒绝的图像、音频、嵌入资源与未知块保留 TypeScript 诊断句。受支持的广告 `outputSchema` 成为 `Tool::output_schema` 上的 `structuredContent`；不受支持的词表回退为无约束 JSON。MCP Resources 与 Prompts 仍不桥接。
+每个插件实例拥有一个 `serverName`（`/^[A-Za-z0-9_-]{1,32}$/`）。第二个同名存活实例在加载时按 TypeScript 文句失败。线上客户端身份为 `{ name: 'dsh-mcp-client', version: '0.0.1' }`，协议 `2025-03-26`。`callTool` 永远发送 MCP 原始名。公开登记名是 `mcp__<server>__<raw>`；`[A-Za-z0-9_-]` 以外的字符变成 `_`，有损改写再追加 `sha256(server + '\0' + raw)` 的前 12 个十六进制字符。stdio 继承 `scrubbed_parent_env()` 再叠显式 `env`。Streamable HTTP 走 `curl`。重连默认值为 `enabled: true`、`initialDelayMs: 500`、`maxDelayMs: 30000`、`maxAttempts: 10`。`failOnStartupError: true` 以 `mcp-client(<server>): initial connection or tool synchronization failed` 拒绝激活。图像块只有在 `ctx.attachments` 与精确默认模型路由声明图像输入之后才成为耐久附件；被拒绝的图像、音频、嵌入资源与未知块保留 TypeScript 诊断句。受支持的广告 `outputSchema` 成为 `Tool::output_schema` 上的 `structuredContent`；不受支持的词表回退为无约束 JSON。成功的 `tools/call` 把 `ToolOutcome.value` 设为 `{content, structuredContent?}`。MCP Resources 与 Prompts 仍不桥接。
 
 ### Schedule
 
@@ -28,7 +28,7 @@ TypeScript 树已经拥有三组默认 headless patch 不该插入的可选能�
 
 `dsh-hooks-codex` 映射五个 Codex 事件，跳过 `async: true` hook，stdin 不带尾换行，并且只兑现 deny。`plainStdoutAsContext` 作用于 SessionStart 与 UserPromptSubmit。
 
-Rust waterfall 是同步的。两座桥用 `block_in_place` 加 Tokio handle 跑 hook body。`agent/turn-stopping` 只携带 `{turn}`；每座桥记住最近一次 `agent/pre-step` 的 agent。continuable 子级在 `agents.create` 之后、`followup` 之前发出 `subagent/start`。一次性 `SubagentRuntime::start` 在 `provider.start` 结算之后先发布 `subagent/start` 再发布 `subagent/end`。
+Rust waterfall 是同步的。两座桥用 `block_in_place` 加 Tokio handle 跑 hook body。`agent/turn-stopping` 只携带 `{turn}`；每座桥记住最近一次 `agent/pre-step` 的 agent。continuable 子级在 `agents.create` 之后、`followup` 之前发出 `subagent/start`。一次性 `SubagentProvider::start` 在子级身份已发布后返回 `SubagentRun`；`SubagentRuntime::start` 先发出 `subagent/start`，再等待 `SubagentRun::into_result`，然后发出 `subagent/end`。
 
 ## Alternatives considered
 
@@ -44,4 +44,4 @@ Rust waterfall 是同步的。两座桥用 `block_in_place` 加 Tokio handle 跑
 
 ## Consequences
 
-官方 MCP、schedule 与 hook overlay 可以在 Rust 宿主上加载，且不改 `dsh-agent-loop`、`SESSION_FORMAT_VERSION` 或 SQLite `SCHEMA_VERSION`。除非 overlay 插入这些行，headless dump-config 不含它们。一次性 SubagentStart hook 在子级结算之后运行。Native MCP 结果是 content block；因为 Rust `ToolOutcome` 没有第二个值槽，Code Mode 那份独立的规范 `{content, structuredContent}` 绑定不存在。清单状态见 [ts-rust-functional-gaps.md](../../../../rust/docs/ts-rust-functional-gaps.md)。
+官方 MCP、schedule 与 hook overlay 可以在 Rust 宿主上加载，且不改 `dsh-agent-loop`、`SESSION_FORMAT_VERSION` 或 SQLite `SCHEMA_VERSION`。除非 overlay 插入这些行，headless dump-config 不含它们。一次性 SubagentStart hook 在子级发布之后、其回合结算之前运行。成功的 MCP 工具 body 把规范 `{content, structuredContent?}` 对象放在 `ToolOutcome.value` 上；Native 渲染仍读 `content`。清单状态见 [ts-rust-functional-gaps.md](../../../../rust/docs/ts-rust-functional-gaps.md)。

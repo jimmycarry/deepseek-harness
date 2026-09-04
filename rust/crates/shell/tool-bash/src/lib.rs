@@ -990,6 +990,7 @@ mod tests {
                 &ToolOutcome {
                     content: vec![],
                     is_error: false,
+                    value: None,
                 }
             )
             .is_none());

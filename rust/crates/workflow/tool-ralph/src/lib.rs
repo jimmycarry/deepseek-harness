@@ -468,7 +468,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use dsh_llm::ContentBlock;
-    use dsh_subagent::{SubagentError, SubagentProvider, SubagentResult};
+    use dsh_subagent::{SubagentError, SubagentProvider, SubagentResult, SubagentRun};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -510,7 +510,7 @@ mod tests {
         async fn start(
             &self,
             request: SubagentStartRequest,
-        ) -> std::result::Result<SubagentResult, SubagentError> {
+        ) -> std::result::Result<SubagentRun, SubagentError> {
             self.prompts.lock().expect("prompts").push(request.prompt);
             let reply = self
                 .replies
@@ -519,11 +519,11 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Err("no scripted Ralph reply".into()));
             match reply {
-                Ok(output) => Ok(SubagentResult {
+                Ok(output) => Ok(SubagentRun::ready(SubagentResult {
                     output,
                     id: session_id("child"),
                     stop_reason: "completed".into(),
-                }),
+                })),
                 Err(error) => Err(SubagentError::NoProvider(error)),
             }
         }

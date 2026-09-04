@@ -286,7 +286,7 @@ All three packages **absent** / **P4**.
 
 ### mcp
 
-`mcp-client`: **aligned**. stdio and streamable-http tool bridge, reconnect supervisor, public `mcp__<server>__<raw>` names, image admission after route proof. Remaining: MCP Resources / Prompts (TypeScript deferred); Rust `ToolOutcome` has no separate canonical `{content, structuredContent}` value (Native text matches).
+`mcp-client`: **aligned**. stdio and streamable-http tool bridge, reconnect supervisor, public `mcp__<server>__<raw>` names, image admission after route proof. Successful bodies set `ToolOutcome.value` to `{content, structuredContent?}`. Remaining: MCP Resources / Prompts (TypeScript deferred).
 
 ### plan
 

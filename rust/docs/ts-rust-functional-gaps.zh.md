@@ -286,7 +286,7 @@
 
 ### mcp
 
-`mcp-client`：**aligned**。stdio 与 streamable-http 工具桥、重连监督器、公开名 `mcp__<server>__<raw>`、经路由证明后的图像准入。剩余：MCP Resources / Prompts（TypeScript 同样暂缓）；Rust `ToolOutcome` 没有独立的规范 `{content, structuredContent}` 值（Native 文本对齐）。
+`mcp-client`：**aligned**。stdio 与 streamable-http 工具桥、重连监督器、公开名 `mcp__<server>__<raw>`、经路由证明后的图像准入。成功 body 把 `ToolOutcome.value` 设为 `{content, structuredContent?}`。剩余：MCP Resources / Prompts（TypeScript 同样暂缓）。
 
 ### plan
 

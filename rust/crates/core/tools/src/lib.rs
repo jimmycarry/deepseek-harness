@@ -154,6 +154,9 @@ pub struct ToolOutcome {
     pub content: Vec<ContentBlock>,
     /// Whether the tool reported a failure.
     pub is_error: bool,
+    /// Execution-local canonical value before Native rendering, when the
+    /// tool projects structured output (MCP `{content, structuredContent}`).
+    pub value: Option<Value>,
 }
 
 impl ToolOutcome {
@@ -162,6 +165,7 @@ impl ToolOutcome {
         Self {
             content: vec![ContentBlock::text(text)],
             is_error: false,
+            value: None,
         }
     }
 
@@ -170,6 +174,7 @@ impl ToolOutcome {
         Self {
             content: vec![ContentBlock::text(text)],
             is_error: true,
+            value: None,
         }
     }
 }
@@ -574,7 +579,11 @@ fn post_execute(
                 .and_then(Value::as_bool)
                 .unwrap_or(outcome.is_error);
             ToolExecutionResult {
-                outcome: ToolOutcome { content, is_error },
+                outcome: ToolOutcome {
+                    content,
+                    is_error,
+                    value: outcome.value,
+                },
                 additional_contexts,
             }
         }

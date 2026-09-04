@@ -11,7 +11,9 @@ use dsh_session_persistence::PersistenceRuntime;
 use dsh_session_projection::{subagent_identity_unit, SessionProjectionRegistry};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
@@ -43,6 +45,48 @@ pub struct SubagentResult {
     pub id: SessionId,
     /// Why the child stopped.
     pub stop_reason: String,
+}
+
+/// Published one-shot run. `start` fulfills after the child is published;
+/// [`SubagentRun::into_result`] settles when the child turn ends.
+pub struct SubagentRun {
+    /// Child session id; for a local run this equals the published agent id.
+    pub id: SessionId,
+    /// Whether an in-process child agent was present at publication.
+    pub local: bool,
+    result:
+        Pin<Box<dyn Future<Output = std::result::Result<SubagentResult, SubagentError>> + Send>>,
+}
+
+impl SubagentRun {
+    /// A run whose result is already known.
+    pub fn ready(result: SubagentResult) -> Self {
+        Self::ready_with_local(result, true)
+    }
+
+    /// A run whose result is already known, with an explicit locality snapshot.
+    pub fn ready_with_local(result: SubagentResult, local: bool) -> Self {
+        let id = result.id.clone();
+        Self::from_future(id, local, async move { Ok(result) })
+    }
+
+    /// Wrap a pending one-shot result. The future is polled only after
+    /// `subagent/start` is published.
+    pub fn from_future<F>(id: SessionId, local: bool, future: F) -> Self
+    where
+        F: Future<Output = std::result::Result<SubagentResult, SubagentError>> + Send + 'static,
+    {
+        Self {
+            id,
+            local,
+            result: Box::pin(future),
+        }
+    }
+
+    /// Wait until the child turn settles.
+    pub async fn into_result(self) -> std::result::Result<SubagentResult, SubagentError> {
+        self.result.await
+    }
 }
 
 /// What `start` needs from the parent.
@@ -77,11 +121,12 @@ pub trait SubagentProvider: Send + Sync {
     fn supports_output_schema(&self) -> bool {
         false
     }
-    /// Run one one-shot child.
+    /// Publish one one-shot child and return its handle. The child's turn
+    /// settles through [`SubagentRun::into_result`], not this future.
     async fn start(
         &self,
         request: SubagentStartRequest,
-    ) -> std::result::Result<SubagentResult, SubagentError>;
+    ) -> std::result::Result<SubagentRun, SubagentError>;
 }
 
 /// The current `subagent/descriptor` payload format version.
@@ -216,10 +261,12 @@ impl SubagentRuntime {
             .get_provider(name)
             .ok_or_else(|| SubagentError::NoProvider(name.into()))?;
         let parent_id = request.parent_id.clone();
-        let result = provider.start(request).await?;
+        let run = provider.start(request).await?;
         let run_id = Uuid::new_v4().to_string();
-        self.emit_start(name, &result.id, &run_id, true);
-        self.emit_end(name, &result, &parent_id, true, &run_id);
+        let local = run.local;
+        self.emit_start(name, &run.id, &run_id, local);
+        let result = run.into_result().await?;
+        self.emit_end(name, &result, &parent_id, local, &run_id);
         self.results
             .lock()
             .expect("subagents")
@@ -1228,12 +1275,12 @@ mod tests {
         async fn start(
             &self,
             request: SubagentStartRequest,
-        ) -> std::result::Result<SubagentResult, SubagentError> {
-            Ok(SubagentResult {
+        ) -> std::result::Result<SubagentRun, SubagentError> {
+            Ok(SubagentRun::ready(SubagentResult {
                 output: request.prompt,
                 id: session_id("child"),
                 stop_reason: "completed".into(),
-            })
+            }))
         }
     }
 
@@ -1253,12 +1300,12 @@ mod tests {
         async fn start(
             &self,
             request: SubagentStartRequest,
-        ) -> std::result::Result<SubagentResult, SubagentError> {
-            Ok(SubagentResult {
+        ) -> std::result::Result<SubagentRun, SubagentError> {
+            Ok(SubagentRun::ready(SubagentResult {
                 output: request.prompt,
                 id: session_id("child"),
                 stop_reason: "completed".into(),
-            })
+            }))
         }
     }
 
@@ -1463,6 +1510,145 @@ mod tests {
             .unwrap();
         assert_eq!(result.output, "ping");
         assert_eq!(runtime.results(), vec!["ping".to_string()]);
+    }
+
+    struct Gated {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl SubagentProvider for Gated {
+        fn name(&self) -> &str {
+            "gated"
+        }
+        fn inherits_parent_context(&self) -> bool {
+            false
+        }
+        async fn start(
+            &self,
+            _request: SubagentStartRequest,
+        ) -> std::result::Result<SubagentRun, SubagentError> {
+            let release = Arc::clone(&self.release);
+            Ok(SubagentRun::from_future(
+                session_id("child"),
+                true,
+                async move {
+                    release.notified().await;
+                    Ok(SubagentResult {
+                        output: "done".into(),
+                        id: session_id("child"),
+                        stop_reason: "completed".into(),
+                    })
+                },
+            ))
+        }
+    }
+
+    struct FailingStart;
+
+    #[async_trait]
+    impl SubagentProvider for FailingStart {
+        fn name(&self) -> &str {
+            "failed"
+        }
+        fn inherits_parent_context(&self) -> bool {
+            false
+        }
+        async fn start(
+            &self,
+            _request: SubagentStartRequest,
+        ) -> std::result::Result<SubagentRun, SubagentError> {
+            Err(SubagentError::NoProvider("setup rolled back".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_shot_emits_start_before_the_child_result_settles() {
+        let ctx = Context::new();
+        let runtime = SubagentRuntime::install(&ctx).unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        runtime
+            .register_provider(Arc::new(Gated {
+                release: Arc::clone(&release),
+            }))
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&events);
+        ctx.on("subagent/start", {
+            let seen = Arc::clone(&seen);
+            move |_| seen.lock().expect("events").push("start".into())
+        })
+        .unwrap();
+        ctx.on("subagent/end", {
+            let seen = Arc::clone(&seen);
+            move |_| seen.lock().expect("events").push("end".into())
+        })
+        .unwrap();
+
+        let starting = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .start(
+                        "gated",
+                        SubagentStartRequest {
+                            label: "t".into(),
+                            prompt: "ping".into(),
+                            parent_id: session_id("parent"),
+                            seed: None,
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if events.lock().expect("events").as_slice() == ["start"] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subagent/start before the gated result");
+        assert_eq!(*events.lock().expect("events"), ["start"]);
+        release.notify_waiters();
+        let result = starting.await.unwrap().unwrap();
+        assert_eq!(result.output, "done");
+        assert_eq!(*events.lock().expect("events"), ["start", "end"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_shot_emits_no_lifecycle_when_provider_start_rejects() {
+        let ctx = Context::new();
+        let runtime = SubagentRuntime::install(&ctx).unwrap();
+        runtime.register_provider(Arc::new(FailingStart)).unwrap();
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&events);
+        ctx.on("subagent/start", {
+            let seen = Arc::clone(&seen);
+            move |_| seen.lock().expect("events").push("start".into())
+        })
+        .unwrap();
+        ctx.on("subagent/end", {
+            let seen = Arc::clone(&seen);
+            move |_| seen.lock().expect("events").push("end".into())
+        })
+        .unwrap();
+        let error = runtime
+            .start(
+                "failed",
+                SubagentStartRequest {
+                    label: "t".into(),
+                    prompt: "ping".into(),
+                    parent_id: session_id("parent"),
+                    seed: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("setup rolled back"));
+        assert!(events.lock().expect("events").is_empty());
     }
 
     #[tokio::test]

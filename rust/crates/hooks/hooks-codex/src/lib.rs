@@ -688,3 +688,211 @@ async fn run_point(
     }
     Ok(merge_hook_outputs(&outputs))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use dsh_llm::ContentBlock;
+    use dsh_shell::{CollectedOutput, ShellError, ShellExecutor, ShellRunResult, ShellSpec};
+    use dsh_tools::{ScriptTool, ToolRuntime};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ProcessBash;
+
+    #[async_trait]
+    impl ShellExecutor for ProcessBash {
+        async fn run(&self, spec: ShellSpec) -> std::result::Result<ShellRunResult, ShellError> {
+            tokio::task::spawn_blocking(move || run_bash(spec))
+                .await
+                .map_err(|error| ShellError::Failed(error.to_string()))?
+        }
+    }
+
+    fn run_bash(spec: ShellSpec) -> std::result::Result<ShellRunResult, ShellError> {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-lc", &spec.command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
+        if let Some(env) = &spec.extra_env {
+            for (key, value) in env {
+                command.env(key, value);
+            }
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| ShellError::Failed(error.to_string()))?;
+        if let Some(stdin) = spec.stdin {
+            if let Some(mut pipe) = child.stdin.take() {
+                pipe.write_all(stdin.as_bytes())
+                    .map_err(|error| ShellError::Failed(error.to_string()))?;
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| ShellError::Failed(error.to_string()))?;
+        Ok(ShellRunResult {
+            exit_code: output.status.code(),
+            signal: None,
+            timed_out: false,
+            aborted: false,
+            timeout_ms: spec.timeout_ms.unwrap_or(120_000),
+            stdout: CollectedOutput {
+                text: String::from_utf8_lossy(&output.stdout).into_owned(),
+                truncated: false,
+                spill_path: None,
+            },
+            stderr: CollectedOutput {
+                text: String::from_utf8_lossy(&output.stderr).into_owned(),
+                truncated: false,
+                spill_path: None,
+            },
+            sandbox: None,
+        })
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "dsh-hooks-codex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path.display().to_string()
+    }
+
+    fn write_hooks(dir: &std::path::Path, hooks: Value) -> String {
+        let path = dir.join("hooks.json");
+        std::fs::write(&path, json!({ "hooks": hooks }).to_string()).unwrap();
+        path.display().to_string()
+    }
+
+    fn mount(config_path: &str) -> (Context, Arc<ToolRuntime>) {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(ShellRuntime::new(Arc::new(ProcessBash))))
+            .unwrap();
+        let tools = Arc::new(ToolRuntime::new());
+        ctx.provide(Arc::clone(&tools)).unwrap();
+        install(
+            &ctx,
+            Some(&json!({ "configPath": config_path, "model": "test-model" })),
+        )
+        .unwrap();
+        (ctx, tools)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matching_pre_tool_use_exit_2_denies_as_a_substring() {
+        let dir = temp_dir();
+        let deny = write_script(
+            &dir,
+            "deny.sh",
+            "#!/usr/bin/env bash\necho \"codex blocked it\" >&2\nexit 2\n",
+        );
+        let config = write_hooks(
+            &dir,
+            json!({
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": deny }]
+                }]
+            }),
+        );
+        let (ctx, tools) = mount(&config);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        tools.insert(Arc::new(ScriptTool::new("Bash", "b", move |_| {
+            flag.store(true, Ordering::SeqCst);
+            dsh_tools::ToolOutcome::text("no")
+        })));
+        let denied = tools
+            .execute_for(&ctx, "Bash", json!({ "command": "ls" }), None)
+            .await
+            .unwrap();
+        assert!(denied.outcome.is_error);
+        assert!(denied.outcome.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => text.contains("codex blocked it"),
+            _ => false,
+        }));
+        assert!(!ran.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_true_hooks_are_skipped_so_the_tool_runs() {
+        let dir = temp_dir();
+        let deny = write_script(&dir, "deny.sh", "#!/usr/bin/env bash\nexit 2\n");
+        let config = write_hooks(
+            &dir,
+            json!({
+                "PreToolUse": [{
+                    "hooks": [{ "type": "command", "command": deny, "async": true }]
+                }]
+            }),
+        );
+        let (ctx, tools) = mount(&config);
+        tools.insert(Arc::new(ScriptTool::new("Bash", "b", |_| {
+            dsh_tools::ToolOutcome::text("ok")
+        })));
+        let outcome = tools.execute(&ctx, "Bash", json!({})).await.unwrap();
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.content[0], ContentBlock::text("ok"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_tool_use_stdin_has_no_trailing_newline() {
+        let dir = temp_dir();
+        let stdin_path = dir.join("stdin.txt");
+        let capture = write_script(
+            &dir,
+            "cap.sh",
+            &format!("#!/usr/bin/env bash\ncat > \"{}\"\n", stdin_path.display()),
+        );
+        let config = write_hooks(
+            &dir,
+            json!({
+                "PreToolUse": [{
+                    "hooks": [{ "type": "command", "command": capture }]
+                }]
+            }),
+        );
+        let (ctx, tools) = mount(&config);
+        tools.insert(Arc::new(ScriptTool::new("Bash", "b", |_| {
+            dsh_tools::ToolOutcome::text("ok")
+        })));
+        let _ = tools
+            .execute(&ctx, "Bash", json!({ "command": "ls" }))
+            .await
+            .unwrap();
+        let stdin = std::fs::read_to_string(&stdin_path).unwrap();
+        assert!(
+            !stdin.ends_with('\n'),
+            "Codex stdin is framed without a trailing newline"
+        );
+        let payload: Value = serde_json::from_str(&stdin).unwrap();
+        assert_eq!(payload["tool_name"], "Bash");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

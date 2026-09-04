@@ -8,7 +8,7 @@ use dsh_llm::UserMessage;
 use dsh_session::{event_type_name, SessionEventData, SessionHeader, SessionStore};
 use dsh_subagent::{
     append_delegated_policy_overrides, capture_delegated_policy_overrides, SubagentError,
-    SubagentProvider, SubagentResult, SubagentRuntime, SubagentStartRequest,
+    SubagentProvider, SubagentResult, SubagentRun, SubagentRuntime, SubagentStartRequest,
 };
 use std::sync::Arc;
 
@@ -59,7 +59,7 @@ impl SubagentProvider for InProcessProvider {
     async fn start(
         &self,
         request: SubagentStartRequest,
-    ) -> std::result::Result<SubagentResult, SubagentError> {
+    ) -> std::result::Result<SubagentRun, SubagentError> {
         let store = self
             .ctx
             .get::<SessionStore>()
@@ -99,21 +99,20 @@ impl SubagentProvider for InProcessProvider {
         let handle = agents
             .create(Arc::clone(&child))
             .map_err(|error| SubagentError::NoProvider(error.to_string()))?;
-        run_followup(handle.agent.as_ref(), UserMessage::text(request.prompt))
-            .await
-            .map_err(|error| SubagentError::NoProvider(error.to_string()))?;
-        let output = handle
-            .agent
-            .session()
-            .last_assistant_text()
-            .unwrap_or_default();
-        let id = handle.agent.id().clone();
-        handle.dispose();
-        Ok(SubagentResult {
-            output,
-            id,
-            stop_reason: "completed".into(),
-        })
+        let agent = Arc::clone(&handle.agent);
+        let id = agent.id().clone();
+        Ok(SubagentRun::from_future(id.clone(), true, async move {
+            run_followup(agent.as_ref(), UserMessage::text(request.prompt))
+                .await
+                .map_err(|error| SubagentError::NoProvider(error.to_string()))?;
+            let output = agent.session().last_assistant_text().unwrap_or_default();
+            handle.dispose();
+            Ok(SubagentResult {
+                output,
+                id,
+                stop_reason: "completed".into(),
+            })
+        }))
     }
 }
 
@@ -245,9 +244,7 @@ mod tests {
         ctx
     }
 
-    fn policy_events(
-        session: &dsh_session::Session,
-    ) -> Vec<dsh_session::SessionEvent> {
+    fn policy_events(session: &dsh_session::Session) -> Vec<dsh_session::SessionEvent> {
         session
             .events()
             .into_iter()
@@ -333,7 +330,10 @@ mod tests {
             .expect("runtime context");
         let text: String = message_text(&context);
         assert!(text.contains("You are a delegated subagent"), "{text}");
-        assert!(text.contains("Current DSH file policy: read-only"), "{text}");
+        assert!(
+            text.contains("Current DSH file policy: read-only"),
+            "{text}"
+        );
         assert!(text.contains("Approval prompts are disabled"), "{text}");
     }
 

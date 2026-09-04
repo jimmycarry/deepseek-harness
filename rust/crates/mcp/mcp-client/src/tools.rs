@@ -213,7 +213,18 @@ impl Tool for McpTool {
                 .get("toolResult")
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "(no output)".into());
-            return Ok(ToolOutcome::text(rendered));
+            let mut outcome = ToolOutcome::text(&rendered);
+            outcome.value = Some(json!({ "content": [{ "type": "text", "text": rendered }] }));
+            if let Some(structured) = result.get("structuredContent") {
+                if let Some(object) = outcome.value.as_mut().and_then(Value::as_object_mut) {
+                    object.insert("structuredContent".into(), structured.clone());
+                }
+            }
+            return Ok(outcome);
+        }
+        let mut value = json!({ "content": content });
+        if let Some(structured) = result.get("structuredContent") {
+            value["structuredContent"] = structured.clone();
         }
         let projected = prepare_projection(
             &self.ctx,
@@ -224,6 +235,7 @@ impl Tool for McpTool {
         Ok(ToolOutcome {
             content: projected,
             is_error: false,
+            value: Some(value),
         })
     }
 }

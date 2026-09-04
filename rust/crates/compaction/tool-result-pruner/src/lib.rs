@@ -202,6 +202,7 @@ impl ToolResultPruner {
         ToolOutcome {
             content: self.prune_blocks(&outcome.content),
             is_error: outcome.is_error,
+            value: outcome.value,
         }
     }
 }

@@ -460,4 +460,189 @@ mod tests {
         .unwrap_err()
         .contains("streamable-http transport requires url"));
     }
+
+    const ECHO_SERVER: &str = r#"
+import json
+import sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode().split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    length = int(headers["content-length"])
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode())
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    ident = message.get("id")
+    if method == "initialize":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "echo", "version": "1.0.0"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "result": {
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": "Echo text",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                        },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    {
+                        "name": "fail",
+                        "description": "Always fails",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
+                    {
+                        "name": "admin.reset",
+                        "description": "Dotted name",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
+                ]
+            },
+        })
+    elif method == "tools/call":
+        raw = message["params"]["name"]
+        args = message["params"].get("arguments") or {}
+        if raw == "fail":
+            write_message({
+                "jsonrpc": "2.0",
+                "id": ident,
+                "result": {
+                    "content": [{"type": "text", "text": "Something went wrong"}],
+                    "isError": True,
+                },
+            })
+        elif raw == "admin.reset":
+            write_message({
+                "jsonrpc": "2.0",
+                "id": ident,
+                "result": {"content": [{"type": "text", "text": "reset done"}]},
+            })
+        else:
+            text = args.get("text", "")
+            write_message({
+                "jsonrpc": "2.0",
+                "id": ident,
+                "result": {
+                    "content": [{"type": "text", "text": text}],
+                    "structuredContent": {"ok": True, "echo": text},
+                },
+            })
+    elif ident is not None:
+        write_message({
+            "jsonrpc": "2.0",
+            "id": ident,
+            "error": {"code": -32601, "message": f"Unknown method {method}"},
+        })
+"#;
+
+    fn write_echo_server() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("echo_server.py");
+        std::fs::write(&path, ECHO_SERVER).unwrap();
+        path
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdio_bridge_registers_tools_and_keeps_structured_content() {
+        let script = write_echo_server();
+        let ctx = Context::new();
+        let tools = Arc::new(ToolRuntime::new());
+        ctx.provide(Arc::clone(&tools)).unwrap();
+        install(
+            &ctx,
+            Some(&serde_json::json!({
+                "transport": "stdio",
+                "serverName": "echo",
+                "command": "python3",
+                "args": [script.to_string_lossy()],
+                "failOnStartupError": true,
+                "reconnect": { "enabled": false },
+            })),
+        )
+        .expect("stdio MCP server should connect");
+        assert!(tools.get("mcp__echo__echo").is_some());
+        assert!(tools.get("mcp__echo__fail").is_some());
+        let hashed = crate::public_tool_name("echo", "admin.reset");
+        assert!(hashed.contains('_'));
+        assert!(tools.get(&hashed).is_some());
+
+        let outcome = tools
+            .execute(&ctx, "mcp__echo__echo", serde_json::json!({ "text": "hi" }))
+            .await
+            .unwrap();
+        assert!(!outcome.is_error);
+        assert_eq!(
+            outcome.value,
+            Some(serde_json::json!({
+                "content": [{ "type": "text", "text": "hi" }],
+                "structuredContent": { "ok": true, "echo": "hi" },
+            }))
+        );
+        assert_eq!(outcome.content, vec![dsh_llm::ContentBlock::text("hi")]);
+        assert_eq!(
+            tools
+                .get("mcp__echo__echo")
+                .unwrap()
+                .output_schema()
+                .unwrap()["required"],
+            serde_json::json!(["content", "structuredContent"])
+        );
+
+        let failed = tools
+            .execute_for(&ctx, "mcp__echo__fail", serde_json::json!({}), None)
+            .await
+            .unwrap();
+        assert!(failed.outcome.is_error);
+        assert!(failed.outcome.content.iter().any(|block| match block {
+            dsh_llm::ContentBlock::Text { text } => text.contains("Something went wrong"),
+            _ => false,
+        }));
+        ctx.dispose();
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
 }
