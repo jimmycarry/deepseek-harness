@@ -6,7 +6,7 @@ English | [中文](2026-09-03-ts-rust-functional-gap-priority.zh.md)
 
 ## Problem
 
-The Rust tree already ships headless, ACP, and JSON-RPC profiles under the 1:1 rule in [the port Agent Note](../../implemented/architecture/2026-08-22-rust-harness-port.md). TypeScript still has 227 packages; Rust has 112 crates. Without an agreed order, the next crate can chase Web UI, packed SQLite schema 17, or a loop edit and still look like progress while remaining P0 is the reported finish-chunk gap and remaining thinner paths (DeepSeek Files API, session-query FTS, skill watch) stay open.
+The Rust tree already ships headless, ACP, and JSON-RPC profiles under the 1:1 rule in [the port Agent Note](../../implemented/architecture/2026-08-22-rust-harness-port.md). TypeScript still has 227 packages; Rust has 112 crates. Without an agreed order, the next crate can chase Web UI, packed SQLite schema 17, or a loop edit and still look like progress while remaining P0 is the reported finish-chunk gap and remaining thinner paths (session-query FTS, skill watch) stay open.
 
 Leaf-name matching also lies: `typert/protocol` is not `sdk/protocol`. A maintainer who ports “every missing folder name” will duplicate servers that already exist under another group.
 
@@ -23,7 +23,7 @@ P0 is Linux correctness for the shipped headless / ACP / JSON-RPC profiles. P1 i
 | Band | Owns | First items |
 |---|---|---|
 | P0 | Shipped-profile correctness on Linux | Items 1–6 closed (persistence coordinator, DeepSeek SSE + image blocks, attachment normalize, ACP images, settings Service Definition, headless plan review). Remaining: report the loop finish-chunk gap |
-| P1 | Durability and ops on those profiles | DeepSeek Files API upload; projection cache; session-query FTS; enable `web-fetch-http`; skill watch; OTel flush hint; SDK client helpers; external subagent providers; `tool-ask-user` |
+| P1 | Durability and ops on those profiles | projection cache; session-query FTS; enable `web-fetch-http`; skill watch; OTel flush hint; SDK client helpers; external subagent providers; `tool-ask-user` |
 | P2 | Platforms and adjacent products | Rust host of the existing TypeScript SPA; Typert/API; Seatbelt / `CreateRestrictedToken`; PTY / LSP; JS workflow workers; `llm-pi-ai`; Exa / Perplexity; storage / workspace / presets; Code Mode |
 | P3 | Opt-in capabilities | `schedule`; extra context; persistent shell; extra title / query / feedback packages; `skill-badge` |
 | P4 | Experimental / cloud / hooks | e2b; agent-team; Claude Code / Codex hooks; MCP; dynamic Cordis |
@@ -57,4 +57,4 @@ The inventory will drift when a crate lands. Update the same files in that PR, o
 
 A reader can still treat “absent crate” as “must port.” The skip table and the Web UI rejection have to stay next to the P0 list.
 
-ACP images advertise `true` only when attachments and a vision default model are mounted. DeepSeek Files API upload remains a thinner path; inline `image_url` data-URLs already ship. The inventory records closed P0 rows so a later PR does not reopen them.
+ACP images advertise `true` only when attachments and a vision default model are mounted. DeepSeek Files API upload is closed on the shipped vision path; remaining request-version work stays on [the Files alignment Agent Note](../../implemented/feature/2026-09-12-rust-deepseek-files-api.md). The inventory records closed P0 and Files-upload rows so a later change does not reopen them.

@@ -51,7 +51,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 ### P0 — shipped-profile correctness (Linux)
 
 1. **Session persistence coordinator** — **closed.** `PersistenceRuntime` write-behind (`writeBatchMaxDelayMs`, default 200, not reset by further appends), public `create` / `append` / `prepare` / `readFrom`, and durable `commitRepair` on JSONL (truncate to the last complete `\n`) and SQLite (`DELETE` from the first undecodable or gapped seq). SQLite stays at schema `2`. `inspect` still synthesizes closers in memory ([`rust/crates/session/session-persistence/src/lib.rs`](../crates/session/session-persistence/src/lib.rs)).
-2. **LLM DeepSeek transport** — **closed** for SSE and image blocks. `"stream": true` plus `stream_options.include_usage`; parse `data:` / `[DONE]`; a stream without `[DONE]` is `STREAM_CLOSED`; `finish` / `usage` emit only after `[DONE]`. A vision model (`model` contains `vision`) sends user images as `image_url` data-URLs. Files API upload is not mounted ([`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)).
+2. **LLM DeepSeek transport** — **closed** for SSE, Files API upload, and image blocks. `"stream": true` plus `stream_options.include_usage`; parse `data:` / `[DONE]`; a stream without `[DONE]` is `STREAM_CLOSED`; `finish` / `usage` emit only after `[DONE]`. A vision model (`model` contains `vision`) uploads request images through `POST /files` and sends `{type:"file",file_id}`; a failed or timed-out resolution rebuilds the same request as `image_url` data-URLs. Uploaded ids are indexed at `$DSH_HOME/llm-deepseek/files-v3.json` ([`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)).
 3. **Attachment raster pipeline** — **closed.** `request_image` decodes, longest-edge downscales (`normalizedImageMaxDimension`, default 2048), and JPEG-re-encodes under `normalizedImageMaxBytes` (default 4 MiB). Over-cap after quality 85 then 80 is `IMAGE_TOO_LARGE` ([`rust/crates/attachment/attachment-local/src/lib.rs`](../crates/attachment/attachment-local/src/lib.rs)).
 4. **ACP image prompts** — **closed.** Advertise `image: true` only when `ctx.attachments` and a vision `AgentDefaultModel` are mounted; admit `image` blocks through `save_image`. Default headless stays `image: false` and rejects with `inline image prompts were not advertised by this connection` ([`rust/crates/acp/acp/src/lib.rs`](../crates/acp/acp/src/lib.rs)).
 5. **Settings Service Definition** — **closed** on `settings-file` (`ctx.settings`): `register` / `watch` / `revision` / `mutate` / `describe` plus `settings/updated` (`ns`, `revision`, `value`) and `settings/document-updated` (`revision`). A standalone `settings` crate is still absent.
@@ -107,7 +107,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 
 1. Persistence coordinator, DeepSeek SSE + image blocks, attachment normalization, settings Service Definition, and headless plan-review — **closed** (P0 items 1–6).
 2. Record the loop finish-chunk gap; do not change `dsh-agent-loop` here (P0 item 7, report only).
-3. DeepSeek Files API upload (inline `image_url` data-URLs already ship).
+3. DeepSeek Files API upload — **closed** (file ids, all-inline fallback, `files-v3.json` index, one stale-id retry; [Agent Note](../../.agents/notes/implemented/feature/2026-09-12-rust-deepseek-files-api.md)).
 4. Session-query FTS opt-in, web fetch enablement, skill watching, OTel flush, SDK helpers, external subagents.
 5. Platform sandbox and PTY/LSP only when those headless hosts are in scope.
 6. Rust-as-host for the existing TypeScript Web client only after the headless spine gaps above are closed.
@@ -134,7 +134,7 @@ Status values: **aligned** (headless contract matches), **thinner** (crate exist
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `attachment` | aligned | Store types present | — |
-| `attachment-local` | aligned | Magic-byte admit plus `request_image` JPEG normalization | remaining (Files API is DeepSeek-side) |
+| `attachment-local` | aligned | Magic-byte admit plus `request_image` JPEG normalization | remaining (route `readImageRequest` budgets) |
 
 ### boot
 
@@ -269,7 +269,7 @@ All three packages **absent** / **P4**.
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `llm` | aligned | Chunk tags include `FinishReason::Error` | P0 consumers must honor it |
-| `llm-deepseek` | thinner | SSE + user `image_url` data-URLs aligned; no Files API upload; retry/classify/`Retry-After` aligned | remaining (Files API) |
+| `llm-deepseek` | aligned for Files + SSE | Vision requests upload through `POST /files` and send `file_id`; resolution failure or `filesApiTimeoutMs` rebuilds the same bytes as `image_url` data-URLs; stale chat file ids invalidate and retry once. Remaining: catalog `inputModalities` / `readImageRequest` budgets, offload quanta, tool-result image follow-up | remaining (request-version pipeline) |
 | `llm-retry` / `token-meter` | aligned | `providerRetryAfterMs` over-cap rules | — |
 | `llm-pi-ai` | no-op | Bundle row, no crate | P2 |
 | `llm-replay` | remap | Lives under `llm/` | — |
@@ -435,7 +435,7 @@ All four packages **absent** / **P2**.
 
 ## Already aligned (do not re-open as gaps)
 
-Credentials resolution, `llm-retry` `retryPolicy` + `providerRetryAfterMs` (delay-seconds and HTTP-date, over-cap `normal`/`always`), sandbox-policy / approval / permission-presets, continuable in-process subagents with cold resume and `list_agents` diagnostics, persistence write-behind / `append` / durable `commitRepair` / inspect LRU `preparedSessionCacheSize`, Windows ACL Node runner argv, OTel keepAlive + `Retry-After` HTTP-date, compaction-basic main path, goal / todo / plan tools (including opt-in `reviewProvider: "auto"`; default headless review stays fail-closed), jobs, spill, agent-instructions, fs observation gate, skill catalog tool, token-meter, titles, attachment `request_image`, ACP image prompts when store + vision are mounted, DeepSeek SSE + `image_url` data-URLs, settings `register` / `watch` / `revision` / `mutate`.
+Credentials resolution, `llm-retry` `retryPolicy` + `providerRetryAfterMs` (delay-seconds and HTTP-date, over-cap `normal`/`always`), sandbox-policy / approval / permission-presets, continuable in-process subagents with cold resume and `list_agents` diagnostics, persistence write-behind / `append` / durable `commitRepair` / inspect LRU `preparedSessionCacheSize`, Windows ACL Node runner argv, OTel keepAlive + `Retry-After` HTTP-date, compaction-basic main path, goal / todo / plan tools (including opt-in `reviewProvider: "auto"`; default headless review stays fail-closed), jobs, spill, agent-instructions, fs observation gate, skill catalog tool, token-meter, titles, attachment `request_image`, ACP image prompts when store + vision are mounted, DeepSeek SSE + Files API upload (`file_id`, all-inline fallback, `files-v3.json`, one stale-id retry), settings `register` / `watch` / `revision` / `mutate`.
 
 ## Verification
 

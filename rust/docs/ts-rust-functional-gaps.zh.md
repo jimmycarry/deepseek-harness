@@ -51,7 +51,7 @@
 ### P0 — 已交付 profile 的正确性（Linux）
 
 1. **会话 persistence 协调器** — **已关闭。** `PersistenceRuntime` 的 write-behind（`writeBatchMaxDelayMs`，默认 200，后续 append 不重置窗口）、公开的 `create` / `append` / `prepare` / `readFrom`，以及 JSONL（截到最后一个完整 `\n`）与 SQLite（从第一个无法解码或出现缺口的 seq 起 `DELETE`）上的耐久 `commitRepair`。SQLite 保持 schema `2`。`inspect` 仍在内存中合成 closer（[`rust/crates/session/session-persistence/src/lib.rs`](../crates/session/session-persistence/src/lib.rs)）。
-2. **LLM DeepSeek 传输** — SSE 与图像块 **已关闭。** `"stream": true` 加 `stream_options.include_usage`；解析 `data:` / `[DONE]`；缺少 `[DONE]` 为 `STREAM_CLOSED`；`finish` / `usage` 只在 `[DONE]` 之后发出。vision 模型（`model` 含 `vision`）把用户图像做成 `image_url` data-URL。Files API 上传未挂载（[`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)）。
+2. **LLM DeepSeek 传输** — SSE、Files API 上传与图像块 **已关闭。** `"stream": true` 加 `stream_options.include_usage`；解析 `data:` / `[DONE]`；缺少 `[DONE]` 为 `STREAM_CLOSED`；`finish` / `usage` 只在 `[DONE]` 之后发出。vision 模型（`model` 含 `vision`）经 `POST /files` 上传请求图像并发送 `{type:"file",file_id}`；解析失败或超时则用同一组字节重建为 `image_url` data-URL。上传 id 索引在 `$DSH_HOME/llm-deepseek/files-v3.json`（[`rust/crates/llm/llm-deepseek/src/lib.rs`](../crates/llm/llm-deepseek/src/lib.rs)）。
 3. **附件栅格流水线** — **已关闭。** `request_image` 解码、按最长边缩小（`normalizedImageMaxDimension`，默认 2048），并在 `normalizedImageMaxBytes`（默认 4 MiB）下重编码为 JPEG。质量 85 再 80 后仍超上限则为 `IMAGE_TOO_LARGE`（[`rust/crates/attachment/attachment-local/src/lib.rs`](../crates/attachment/attachment-local/src/lib.rs)）。
 4. **ACP 图像提示** — **已关闭。** 仅当挂了 `ctx.attachments` 且 `AgentDefaultModel` 为 vision 时广告 `image: true`；经 `save_image` 接纳 `image` 块。默认 headless 仍为 `image: false`，并以 `inline image prompts were not advertised by this connection` 拒绝（[`rust/crates/acp/acp/src/lib.rs`](../crates/acp/acp/src/lib.rs)）。
 5. **settings Service Definition** — 在 `settings-file`（`ctx.settings`）上 **已关闭**：`register` / `watch` / `revision` / `mutate` / `describe`，以及 `settings/updated`（`ns`、`revision`、`value`）与 `settings/document-updated`（`revision`）。独立的 `settings` crate 仍缺席。
@@ -107,7 +107,7 @@
 
 1. persistence 协调器、DeepSeek SSE + 图像块、附件归一化、settings Service Definition、headless plan 评审 — **已关闭**（P0 第 1–6 项）。
 2. 记录 loop 的 finish-chunk 差距；此处不改 `dsh-agent-loop`（P0 第 7 项，只报告）。
-3. DeepSeek Files API 上传（内联 `image_url` data-URL 已交付）。
+3. DeepSeek Files API 上传 — **已关闭**（file id、全量 inline 回退、`files-v3.json` 索引、失效 id 重试一次；[Agent Note](../../.agents/notes/implemented/feature/2026-09-12-rust-deepseek-files-api.zh.md)）。
 4. session-query FTS 可选开启、web fetch 启用、skill 监听、OTel flush、SDK 助手、外部子代理。
 5. 仅当那些 headless 宿主进入范围时，再做平台沙箱与 PTY/LSP。
 6. 仅在上面的 headless spine 差距关闭之后，才让 Rust 做现有 TypeScript Web 客户端的宿主。
@@ -134,7 +134,7 @@
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
 | `attachment` | aligned | 存储类型已在 | — |
-| `attachment-local` | aligned | 魔数准入加 `request_image` JPEG 归一化 | remaining（Files API 在 DeepSeek 侧） |
+| `attachment-local` | aligned | 魔数准入加 `request_image` JPEG 归一化 | remaining（路由 `readImageRequest` 预算） |
 
 ### boot
 
@@ -269,7 +269,7 @@
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
 | `llm` | aligned | chunk 标签含 `FinishReason::Error` | P0 消费者必须遵守 |
-| `llm-deepseek` | thinner | SSE + 用户 `image_url` data-URL 已对齐；无 Files API 上传；retry/classify/`Retry-After` 已对齐 | remaining（Files API） |
+| `llm-deepseek` | Files + SSE 已 aligned | vision 请求经 `POST /files` 上传并发送 `file_id`；解析失败或 `filesApiTimeoutMs` 用同一组字节重建为 `image_url` data-URL；chat 报失效 file id 时作废并重试一次。剩余：catalog `inputModalities` / `readImageRequest` 预算、offload 量子、工具结果图像后续消息 | remaining（请求版本流水线） |
 | `llm-retry` / `token-meter` | aligned | `providerRetryAfterMs` 超上限规则 | — |
 | `llm-pi-ai` | no-op | bundle 行，无 crate | P2 |
 | `llm-replay` | remap | 在 `llm/` 下 | — |
@@ -435,7 +435,7 @@
 
 ## 已经对齐（不要再当成差距打开）
 
-凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、persistence write-behind / `append` / 耐久 `commitRepair` / inspect LRU `preparedSessionCacheSize`、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（含可选 `reviewProvider: "auto"`；默认 headless 评审仍失败闭合）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题、附件 `request_image`、在 store + vision 挂载时的 ACP 图像提示、DeepSeek SSE + `image_url` data-URL、settings 的 `register` / `watch` / `revision` / `mutate`。
+凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、persistence write-behind / `append` / 耐久 `commitRepair` / inspect LRU `preparedSessionCacheSize`、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（含可选 `reviewProvider: "auto"`；默认 headless 评审仍失败闭合）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题、附件 `request_image`、在 store + vision 挂载时的 ACP 图像提示、DeepSeek SSE + Files API 上传（`file_id`、全量 inline 回退、`files-v3.json`、失效 id 重试一次）、settings 的 `register` / `watch` / `revision` / `mutate`。
 
 ## 验证
 

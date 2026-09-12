@@ -1,26 +1,43 @@
 //! DeepSeek LLM adapter. Chat uses SSE (`stream: true`); a missing `[DONE]` is
-//! `STREAM_CLOSED`. Vision models send user images as `image_url` data-URLs.
-//! Self-skips with-key tests when `DEEPSEEK_API_KEY` is unset.
+//! `STREAM_CLOSED`. Vision models upload request images through the Files API
+//! and send `{type:"file",file_id}`; a failed or timed-out resolution rebuilds
+//! the same request as `image_url` data-URLs. Self-skips with-key tests when
+//! `DEEPSEEK_API_KEY` is unset.
 
+mod file_store;
+mod files_api;
+mod http;
 mod sse;
 mod translate;
+mod upload_index;
 
+pub use file_store::{
+    DeepSeekFileConnection, DeepSeekFilePolicy, DeepSeekFileReference, DeepSeekFileStore,
+    MAX_CHAT_IMAGE_BYTES,
+};
+pub use files_api::{
+    is_files_quota_error, DeepSeekFileObject, DeepSeekFilePage, DeepSeekFilesClient,
+    DeepSeekFilesError, MAX_FILE_EXPIRY_SECONDS, MAX_FILE_UPLOAD_BYTES, MAX_STORED_FILE_BYTES,
+    MAX_STORED_FILE_COUNT, MIN_FILE_EXPIRY_SECONDS,
+};
 pub use sse::{parse_sse, DONE};
 pub use translate::{map_finish_reason, map_usage, translate};
+pub use upload_index::{deep_seek_file_scope, DeepSeekUploadIndex, DeepSeekUploadRecord};
 
 use async_trait::async_trait;
 use dsh_credentials::{Credential, CredentialsRuntime};
 use dsh_llm::{
     content_has_image, is_context_window_exceeded_error, is_quota_exceeded_error,
     provider_retry_after_ms, ContentBlock, LlmAdapter, LlmError, LlmFailure, LlmModelContext,
-    LlmRequest, LlmResolvedModelInfo, Message, StreamChunk, CONTEXT_WINDOW_EXCEEDED_CODE,
-    QUOTA_EXCEEDED_CODE,
+    LlmRequest, LlmResolvedModelInfo, Message, StreamChunk, APP_IDENTITY,
+    CONTEXT_WINDOW_EXCEEDED_CODE, QUOTA_EXCEEDED_CODE,
 };
+use dsh_timeout::MAX_TIMER_DELAY_MS;
 use futures::stream::{self, BoxStream};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::time::Duration;
 
 /// The single provider route this plugin owns.
 pub const PROVIDER: &str = "deepseek-official";
@@ -30,6 +47,193 @@ pub const DEFAULT_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
 /// Positive context capacity used when a catalog entry has none (TypeScript default).
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 1_000_000;
+/// Default explicit lifetime for uploaded images (seven days).
+pub const DEFAULT_FILE_EXPIRY_SECONDS: u32 = 7 * 24 * 60 * 60;
+/// Default proactive refresh window for indexed file ids (one hour).
+pub const DEFAULT_FILE_REFRESH_MARGIN_SECONDS: u32 = 60 * 60;
+/// Default number of oldest harness-owned files removed on quota recovery.
+pub const DEFAULT_FILE_QUOTA_CLEANUP_BATCH: u32 = 100;
+/// Default deadline for resolving one request image through the Files API.
+pub const DEFAULT_FILES_API_TIMEOUT_MS: u64 = 60_000;
+
+/// Deterministic request-image bytes uploaded or inlined for one attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRequestImage {
+    /// Durable attachment id (`sha256:` + hex).
+    pub attachment_id: String,
+    /// Request-version identity (`sha256:` + hex).
+    pub variant_id: String,
+    /// Media type of `data`.
+    pub media_type: String,
+    /// Exact request bytes.
+    pub data: Vec<u8>,
+    /// Request-image width used in the model-visible handle.
+    pub width: u32,
+    /// Request-image height used in the model-visible handle.
+    pub height: u32,
+}
+
+impl PreparedRequestImage {
+    /// Build a request image and derive `variant_id` from its bytes.
+    #[must_use]
+    pub fn from_bytes(
+        attachment_id: impl Into<String>,
+        media_type: impl Into<String>,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let attachment_id = attachment_id.into();
+        let media_type = media_type.into();
+        let variant_id = request_variant_id(&attachment_id, &media_type, &data);
+        Self {
+            attachment_id,
+            variant_id,
+            media_type,
+            data,
+            width,
+            height,
+        }
+    }
+}
+
+/// SHA-256 identity of one prepared request image.
+#[must_use]
+pub fn request_variant_id(attachment_id: &str, media_type: &str, data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(attachment_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(media_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(data);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Stable model-facing handle for one exact request image.
+#[must_use]
+pub fn request_image_handle_text(attachment_id: &str, width: u32, height: u32) -> String {
+    format!("Image {attachment_id}; request image {width}x{height}px.")
+}
+
+/// Harness `User-Agent` sent on every chat and Files request.
+#[must_use]
+pub fn user_agent() -> String {
+    format!(
+        "{}/{} (+{})",
+        APP_IDENTITY.product, APP_IDENTITY.version, APP_IDENTITY.url
+    )
+}
+
+/// Validated Files timeout and upload policy from plugin or settings config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRuntimeConfig {
+    /// Per-image Files resolution deadline.
+    pub files_api_timeout_ms: u64,
+    /// Upload expiry, refresh, and quota-recovery policy.
+    pub policy: DeepSeekFilePolicy,
+}
+
+impl Default for FileRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            files_api_timeout_ms: DEFAULT_FILES_API_TIMEOUT_MS,
+            policy: DeepSeekFilePolicy::default(),
+        }
+    }
+}
+
+/// Validate Files API timeout and lifetime fields. Omitted keys use TypeScript defaults.
+///
+/// # Errors
+/// A non-positive or over-cap `filesApiTimeoutMs`, an expiry outside 3600–2592000,
+/// a refresh margin that is negative or not below expiry, or a quota batch
+/// outside 1–1000.
+pub fn resolve_file_runtime(config: Option<&Value>) -> Result<FileRuntimeConfig, String> {
+    let files_api_timeout_ms = match config.and_then(|value| value.get("filesApiTimeoutMs")) {
+        None => DEFAULT_FILES_API_TIMEOUT_MS,
+        Some(value) => {
+            let number = value.as_f64().ok_or_else(|| {
+                format!(
+                    "llm-deepseek: filesApiTimeoutMs must be a positive finite number no greater than {MAX_TIMER_DELAY_MS}"
+                )
+            })?;
+            if !number.is_finite() || number <= 0.0 || number > MAX_TIMER_DELAY_MS as f64 {
+                return Err(format!(
+                    "llm-deepseek: filesApiTimeoutMs must be a positive finite number no greater than {MAX_TIMER_DELAY_MS}"
+                ));
+            }
+            number as u64
+        }
+    };
+    let expires_after_seconds = match config.and_then(|value| value.get("fileExpiresAfterSeconds"))
+    {
+        None => DEFAULT_FILE_EXPIRY_SECONDS,
+        Some(value) => {
+            let number = value.as_u64().ok_or_else(|| {
+                "llm-deepseek: fileExpiresAfterSeconds must be an integer from 3600 through 2592000"
+                    .to_string()
+            })?;
+            if !(3_600..=2_592_000).contains(&number) {
+                return Err(
+                    "llm-deepseek: fileExpiresAfterSeconds must be an integer from 3600 through 2592000"
+                        .into(),
+                );
+            }
+            u32::try_from(number).map_err(|_| {
+                "llm-deepseek: fileExpiresAfterSeconds must be an integer from 3600 through 2592000"
+                    .to_string()
+            })?
+        }
+    };
+    let refresh_margin_seconds = match config
+        .and_then(|value| value.get("fileRefreshMarginSeconds"))
+    {
+        None => DEFAULT_FILE_REFRESH_MARGIN_SECONDS,
+        Some(value) => {
+            let number = value.as_u64().ok_or_else(|| {
+                    "llm-deepseek: fileRefreshMarginSeconds must be a non-negative integer below fileExpiresAfterSeconds"
+                        .to_string()
+                })?;
+            if number >= u64::from(expires_after_seconds) {
+                return Err(
+                        "llm-deepseek: fileRefreshMarginSeconds must be a non-negative integer below fileExpiresAfterSeconds"
+                            .into(),
+                    );
+            }
+            u32::try_from(number).map_err(|_| {
+                    "llm-deepseek: fileRefreshMarginSeconds must be a non-negative integer below fileExpiresAfterSeconds"
+                        .to_string()
+                })?
+        }
+    };
+    let quota_cleanup_batch = match config.and_then(|value| value.get("fileQuotaCleanupBatch")) {
+        None => DEFAULT_FILE_QUOTA_CLEANUP_BATCH,
+        Some(value) => {
+            let number = value.as_u64().ok_or_else(|| {
+                "llm-deepseek: fileQuotaCleanupBatch must be an integer from 1 through 1000"
+                    .to_string()
+            })?;
+            if !(1..=1_000).contains(&number) {
+                return Err(
+                    "llm-deepseek: fileQuotaCleanupBatch must be an integer from 1 through 1000"
+                        .into(),
+                );
+            }
+            u32::try_from(number).map_err(|_| {
+                "llm-deepseek: fileQuotaCleanupBatch must be an integer from 1 through 1000"
+                    .to_string()
+            })?
+        }
+    };
+    Ok(FileRuntimeConfig {
+        files_api_timeout_ms,
+        policy: DeepSeekFilePolicy {
+            expires_after_seconds,
+            refresh_margin_seconds,
+            quota_cleanup_batch,
+        },
+    })
+}
 
 /// One advisory catalog entry used by `resolve_model`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,8 +440,14 @@ pub struct DeepSeekAdapter {
     pub base_url: String,
     /// Model id.
     pub model: String,
-    /// Prepared request-image bytes keyed by attachment id.
-    pub images: HashMap<String, Vec<u8>>,
+    /// Prepared request images keyed by attachment id.
+    pub images: HashMap<String, PreparedRequestImage>,
+    /// Upload reuse store. `None` sends inline data-URLs without calling Files.
+    pub files: Option<DeepSeekFileStore>,
+    /// Upload expiry, refresh, and quota-recovery policy.
+    pub file_policy: DeepSeekFilePolicy,
+    /// Per-image Files resolution deadline.
+    pub files_api_timeout_ms: u64,
 }
 
 /// Whether this catalog model accepts image input.
@@ -246,17 +456,133 @@ pub fn model_accepts_image(model: &str) -> bool {
 }
 
 impl DeepSeekAdapter {
+    /// Chat-only adapter with no Files store (inline images if any).
+    #[must_use]
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            model: model.into(),
+            images: HashMap::new(),
+            files: None,
+            file_policy: DeepSeekFilePolicy::default(),
+            files_api_timeout_ms: DEFAULT_FILES_API_TIMEOUT_MS,
+        }
+    }
+
     /// Build from the process environment. Missing key fails loud.
     pub fn from_env() -> Result<Self, LlmError> {
         let api_key = resolve_api_key(None, DEFAULT_API_KEY_ENV)?;
         let base_url = std::env::var("DEEPSEEK_BASE_URL")
             .unwrap_or_else(|_| "https://api.deepseek.com".into());
         Ok(Self {
-            api_key,
-            base_url,
-            model: "deepseek-chat".into(),
-            images: HashMap::new(),
+            files: Some(DeepSeekFileStore::default_store()),
+            ..Self::new(api_key, base_url, "deepseek-chat")
         })
+    }
+
+    async fn complete_chat(&self, url: &str, request: &LlmRequest) -> Result<String, LlmError> {
+        let has_images = request_has_user_image(&request.messages);
+        let mut representation = if has_images && self.files.is_some() {
+            ImageWire::File
+        } else {
+            ImageWire::Base64
+        };
+        let mut file_attempt = 0u8;
+        loop {
+            let (body, used) = match representation {
+                ImageWire::File => match self.resolve_file_ids().await {
+                    Ok(used) => {
+                        let ids = used
+                            .iter()
+                            .map(|item| (item.attachment_id.clone(), item.file_id.clone()))
+                            .collect();
+                        (
+                            request_body(
+                                &self.model,
+                                request,
+                                &self.images,
+                                ImageWireKind::File(ids),
+                            )?,
+                            used,
+                        )
+                    }
+                    Err(error) if is_file_resolution_failure(&error) => {
+                        representation = ImageWire::Base64;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
+                ImageWire::Base64 => (
+                    request_body(&self.model, request, &self.images, ImageWireKind::Base64)?,
+                    Vec::new(),
+                ),
+            };
+            match post_json(url, &self.api_key, &body).await {
+                Ok(raw) => return Ok(raw),
+                Err(failure) => {
+                    let stale = !used.is_empty() && provider_rejected_file_id(&failure.detail);
+                    if stale {
+                        if let Some(store) = &self.files {
+                            let connection = DeepSeekFileConnection {
+                                base_url: self.base_url.clone(),
+                                api_key: self.api_key.clone(),
+                            };
+                            for item in stale_mappings(&used, &failure.detail) {
+                                if let Some(image) = self.images.get(&item.attachment_id) {
+                                    store.invalidate(image, &item.file_id, &connection).await?;
+                                }
+                            }
+                        }
+                        if file_attempt == 0 {
+                            file_attempt = 1;
+                            continue;
+                        }
+                    }
+                    return Err(failure.error);
+                }
+            }
+        }
+    }
+
+    async fn resolve_file_ids(&self) -> Result<Vec<UsedRequestFile>, LlmError> {
+        let store = self
+            .files
+            .as_ref()
+            .expect("file representation requires a file store");
+        let connection = DeepSeekFileConnection {
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+        };
+        let mut used = Vec::new();
+        for image in self.images.values() {
+            let resolved = match tokio::time::timeout(
+                Duration::from_millis(self.files_api_timeout_ms),
+                store.ensure_uploaded(image, &connection, &self.file_policy),
+            )
+            .await
+            {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err(error)) => {
+                    return Err(file_resolution_failure(error));
+                }
+                Err(_deadline) => {
+                    return Err(file_resolution_failure(LlmError::Failure(LlmFailure::new(
+                        "DeepSeek Files API could not resolve a request image.",
+                        "DEEPSEEK_FILES_API_TIMEOUT",
+                    ))));
+                }
+            };
+            used.push(UsedRequestFile {
+                attachment_id: image.attachment_id.clone(),
+                file_id: resolved.record.file_id,
+            });
+        }
+        Ok(used)
     }
 }
 
@@ -273,8 +599,7 @@ impl LlmAdapter for DeepSeekAdapter {
             )));
         }
         let url = join_url(&self.base_url, "/chat/completions");
-        let body = request_body(&self.model, &request, &self.images)?;
-        let raw = post_json(&url, &self.api_key, &body).await?;
+        let raw = self.complete_chat(&url, &request).await?;
         let payloads = parse_sse(&raw)?;
         let chunks = translate(&payloads)?;
         Ok(Box::pin(stream::iter(chunks)))
@@ -295,6 +620,122 @@ impl LlmAdapter for DeepSeekAdapter {
     }
 }
 
+enum ImageWire {
+    File,
+    Base64,
+}
+
+enum ImageWireKind {
+    File(HashMap<String, String>),
+    Base64,
+}
+
+#[derive(Clone)]
+struct UsedRequestFile {
+    attachment_id: String,
+    file_id: String,
+}
+
+struct ChatFailure {
+    error: LlmError,
+    detail: String,
+}
+
+const FILE_RESOLUTION_CODE: &str = "FILE_RESOLUTION_FAILURE";
+
+fn file_resolution_failure(cause: LlmError) -> LlmError {
+    let LlmError::Failure(failure) = cause;
+    LlmError::Failure(LlmFailure {
+        message: "DeepSeek Files API could not resolve a request image.".into(),
+        code: FILE_RESOLUTION_CODE.into(),
+        status: failure.status,
+        provider_retry_after_ms: failure.provider_retry_after_ms,
+        request_id: failure.request_id,
+    })
+}
+
+fn is_file_resolution_failure(error: &LlmError) -> bool {
+    let LlmError::Failure(failure) = error;
+    failure.code == FILE_RESOLUTION_CODE
+}
+
+fn request_has_user_image(messages: &[Message]) -> bool {
+    messages.iter().any(|message| match message {
+        Message::User(user) => content_has_image(&user.content),
+        _ => false,
+    })
+}
+
+fn provider_rejected_file_id(detail: &str) -> bool {
+    let hay = detail.to_ascii_lowercase();
+    let file = hay.contains("file");
+    let missing = hay.contains("expired")
+        || hay.contains("not found")
+        || hay.contains("not_found")
+        || hay.contains("not-found")
+        || hay.contains("deleted")
+        || hay.contains("does not exist")
+        || hay.contains("do not exist")
+        || hay.contains("not created under this account")
+        || hay.contains("not created under your account");
+    let invalid_id = invalid_near_file_id(&hay);
+    file && (missing || invalid_id)
+}
+
+fn invalid_near_file_id(detail: &str) -> bool {
+    let bytes = detail.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = detail[start..].find("invalid") {
+        let index = start + rel;
+        let window = &detail[index.saturating_sub(20)..(index + 27).min(detail.len())];
+        if window.contains("file") {
+            return true;
+        }
+        start = index + 7;
+        if start >= bytes.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn detail_names_file_id(detail: &str, file_id: &str) -> bool {
+    let mut start = 0;
+    while let Some(rel) = detail[start..].find(file_id) {
+        let index = start + rel;
+        let before = index
+            .checked_sub(1)
+            .and_then(|pos| detail[pos..].chars().next());
+        let after = detail[index + file_id.len()..].chars().next();
+        let before_ok = before.is_none_or(|ch| !is_id_char(ch));
+        let after_ok = after.is_none_or(|ch| !is_id_char(ch));
+        if before_ok && after_ok {
+            return true;
+        }
+        start = index + file_id.len();
+        if start >= detail.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn is_id_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn stale_mappings<'a>(files: &'a [UsedRequestFile], detail: &str) -> Vec<&'a UsedRequestFile> {
+    let exact: Vec<&UsedRequestFile> = files
+        .iter()
+        .filter(|file| detail_names_file_id(detail, &file.file_id))
+        .collect();
+    if exact.is_empty() {
+        files.iter().collect()
+    } else {
+        exact
+    }
+}
+
 fn join_url(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -306,7 +747,8 @@ fn join_url(base: &str, path: &str) -> String {
 fn request_body(
     model: &str,
     request: &LlmRequest,
-    images: &HashMap<String, Vec<u8>>,
+    images: &HashMap<String, PreparedRequestImage>,
+    wire: ImageWireKind,
 ) -> Result<String, LlmError> {
     let mut messages = Vec::new();
     if let Some(system) = &request.system {
@@ -317,7 +759,7 @@ fn request_body(
             Message::User(user) => {
                 messages.push(json!({
                     "role": "user",
-                    "content": user_content(&user.content, model, images)?,
+                    "content": user_content(&user.content, model, images, &wire)?,
                 }));
             }
             Message::Assistant(assistant) => {
@@ -360,7 +802,8 @@ fn unsupported_image_role(role: &str) -> LlmError {
 fn user_content(
     blocks: &[ContentBlock],
     model: &str,
-    images: &HashMap<String, Vec<u8>>,
+    images: &HashMap<String, PreparedRequestImage>,
+    wire: &ImageWireKind,
 ) -> Result<Value, LlmError> {
     if !content_has_image(blocks) {
         return Ok(Value::String(blocks_text(blocks)));
@@ -375,10 +818,12 @@ fn user_content(
     for block in blocks {
         match block {
             ContentBlock::Text { text } => {
-                parts.push(json!({ "type": "text", "text": text }));
+                if !text.is_empty() {
+                    parts.push(json!({ "type": "text", "text": text }));
+                }
             }
             ContentBlock::Image { attachment } => {
-                let Some(bytes) = images.get(&attachment.attachment_id) else {
+                let Some(image) = images.get(&attachment.attachment_id) else {
                     return Err(LlmError::Failure(LlmFailure::new(
                         format!(
                             "DeepSeek request image {} was not prepared.",
@@ -387,16 +832,40 @@ fn user_content(
                         "INVALID_REQUEST",
                     )));
                 };
-                parts.push(json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": format!(
-                            "data:{};base64,{}",
-                            attachment.media_type,
-                            encode_base64(bytes)
-                        )
+                let handle =
+                    request_image_handle_text(&attachment.attachment_id, image.width, image.height);
+                let handle = if parts.is_empty() {
+                    handle
+                } else {
+                    format!("\n{handle}")
+                };
+                parts.push(json!({ "type": "text", "text": handle }));
+                match wire {
+                    ImageWireKind::File(ids) => {
+                        let Some(file_id) = ids.get(&attachment.attachment_id) else {
+                            return Err(LlmError::Failure(LlmFailure::new(
+                                format!(
+                                    "DeepSeek request image {} was not prepared.",
+                                    attachment.attachment_id
+                                ),
+                                "INVALID_REQUEST",
+                            )));
+                        };
+                        parts.push(json!({ "type": "file", "file_id": file_id }));
                     }
-                }));
+                    ImageWireKind::Base64 => {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!(
+                                    "data:{};base64,{}",
+                                    image.media_type,
+                                    encode_base64(&image.data)
+                                )
+                            }
+                        }));
+                    }
+                }
             }
             _ => {}
         }
@@ -443,47 +912,63 @@ fn blocks_text(blocks: &[ContentBlock]) -> String {
         .join("")
 }
 
-async fn post_json(url: &str, api_key: &str, body: &str) -> Result<String, LlmError> {
+async fn post_json(url: &str, api_key: &str, body: &str) -> Result<String, ChatFailure> {
     let headers = [
         ("Authorization", format!("Bearer {api_key}")),
-        ("Content-Type", "application/json".into()),
         ("Accept", "text/event-stream".into()),
+        ("User-Agent", user_agent()),
     ];
-    let raw = if url.starts_with("https://") {
-        curl_post(url, &headers, body).await
-    } else if url.starts_with("http://") {
-        tcp_post(url, &headers, body).await
-    } else {
-        Err(format!("unsupported url: {url}"))
-    }
-    .map_err(|message| LlmError::Failure(LlmFailure::new(message, "TRANSPORT")))?;
-    let response = parse_http_response(&raw)
-        .map_err(|message| LlmError::Failure(LlmFailure::new(message, "TRANSPORT")))?;
+    let response = crate::http::http_exchange(
+        "POST",
+        url,
+        &headers,
+        crate::http::HttpBody::Bytes {
+            content_type: "application/json",
+            data: body.as_bytes(),
+        },
+    )
+    .await
+    .map_err(|message| ChatFailure {
+        error: LlmError::Failure(LlmFailure::new(message, "TRANSPORT")),
+        detail: String::new(),
+    })?;
     classify_or_body(response)
 }
 
-fn classify_or_body(response: HttpResponse) -> Result<String, LlmError> {
+fn classify_or_body(response: crate::http::HttpResponse) -> Result<String, ChatFailure> {
     if (200..300).contains(&response.status) {
         return Ok(response.body);
     }
     Err(http_failure(response))
 }
 
-fn http_failure(response: HttpResponse) -> LlmError {
+fn http_failure(response: crate::http::HttpResponse) -> ChatFailure {
     let (provider_message, detail) = parse_wire_error(&response.body);
+    let joined = [
+        detail.as_ref().and_then(|item| item.code.as_deref()),
+        detail.as_ref().and_then(|item| item.r#type.as_deref()),
+        detail.as_ref().and_then(|item| item.message.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
     let message = provider_message
         .unwrap_or_else(|| format!("DeepSeek API error (HTTP {})", response.status));
     let delay = response
         .retry_after
         .as_deref()
         .and_then(|value| provider_retry_after_ms(value, std::time::SystemTime::now()));
-    LlmError::Failure(LlmFailure {
-        message,
-        code: http_error_code(response.status, detail.as_ref()),
-        status: Some(response.status),
-        provider_retry_after_ms: delay,
-        request_id: response.request_id,
-    })
+    ChatFailure {
+        error: LlmError::Failure(LlmFailure {
+            message,
+            code: http_error_code(response.status, detail.as_ref()),
+            status: Some(response.status),
+            provider_retry_after_ms: delay,
+            request_id: response.request_id,
+        }),
+        detail: joined,
+    }
 }
 
 fn parse_wire_error(body: &str) -> (Option<String>, Option<WireErrorDetail>) {
@@ -508,139 +993,6 @@ fn parse_wire_error(body: &str) -> (Option<String>, Option<WireErrorDetail>) {
             .map(str::to_string),
     };
     (detail.message.clone(), Some(detail))
-}
-
-async fn tcp_post(
-    url: &str,
-    headers: &[(impl AsRef<str>, String)],
-    body: &str,
-) -> Result<String, String> {
-    let parsed = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port))
-        .await
-        .map_err(|error| error.to_string())?;
-    let host_header = if parsed.port == 80 {
-        parsed.host.clone()
-    } else {
-        format!("{}:{}", parsed.host, parsed.port)
-    };
-    let mut request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        parsed.path,
-        host_header,
-        body.len()
-    );
-    for (name, value) in headers {
-        request.push_str(&format!("{}: {}\r\n", name.as_ref(), value));
-    }
-    request.push_str("\r\n");
-    request.push_str(body);
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-async fn curl_post(
-    url: &str,
-    headers: &[(impl AsRef<str>, String)],
-    body: &str,
-) -> Result<String, String> {
-    let mut command = tokio::process::Command::new("curl");
-    command
-        .arg("-sS")
-        .arg("--http1.1")
-        .arg("-i")
-        .arg("-X")
-        .arg("POST");
-    for (name, value) in headers {
-        command
-            .arg("-H")
-            .arg(format!("{}: {}", name.as_ref(), value));
-    }
-    command.arg("--data-binary").arg(body).arg(url);
-    let output = command.output().await.map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-struct HttpUrl {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("not an http url: {url}"))?;
-    let (hostport, path) = match rest.split_once('/') {
-        Some((hostport, path)) => (hostport, format!("/{path}")),
-        None => (rest, "/".into()),
-    };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((host, port)) => (
-            host.to_string(),
-            port.parse::<u16>().map_err(|error| error.to_string())?,
-        ),
-        None => (hostport.to_string(), 80),
-    };
-    Ok(HttpUrl { host, port, path })
-}
-
-struct HttpResponse {
-    status: u16,
-    retry_after: Option<String>,
-    request_id: Option<String>,
-    body: String,
-}
-
-fn parse_http_status_line(status_line: &str) -> Option<u16> {
-    status_line.split_whitespace().nth(1)?.parse().ok()
-}
-
-fn parse_http_response(raw: &str) -> Result<HttpResponse, String> {
-    let (header, body) = raw
-        .split_once("\r\n\r\n")
-        .or_else(|| raw.split_once("\n\n"))
-        .ok_or_else(|| "missing HTTP body".to_string())?;
-    let mut lines = header.lines();
-    let status_line = lines.next().unwrap_or("");
-    let status = parse_http_status_line(status_line)
-        .ok_or_else(|| format!("missing HTTP status: {status_line}"))?;
-    let mut retry_after = None;
-    let mut request_id = None;
-    let mut deepseek_request_id = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("retry-after") {
-            retry_after = Some(value.to_string());
-        } else if name.eq_ignore_ascii_case("x-request-id") {
-            request_id = Some(value.to_string());
-        } else if name.eq_ignore_ascii_case("x-deepseek-request-id") {
-            deepseek_request_id = Some(value.to_string());
-        }
-    }
-    Ok(HttpResponse {
-        status,
-        retry_after,
-        request_id: request_id.or(deepseek_request_id),
-        body: body.to_string(),
-    })
 }
 
 #[cfg(test)]
@@ -695,12 +1047,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
             request
         });
-        let adapter = DeepSeekAdapter {
-            api_key: "test-key".into(),
-            base_url: format!("http://{addr}"),
-            model: "deepseek-chat".into(),
-            images: HashMap::new(),
-        };
+        let adapter = DeepSeekAdapter::new("test-key", format!("http://{addr}"), "deepseek-chat");
         let stream = adapter
             .stream(LlmRequest {
                 config: LlmCallConfig::default(),
@@ -778,7 +1125,7 @@ mod tests {
         assert_eq!(merged["baseURL"], "https://plugin.test");
     }
 
-    fn sample_image() -> (ContentBlock, HashMap<String, Vec<u8>>) {
+    fn sample_image() -> (ContentBlock, HashMap<String, PreparedRequestImage>) {
         let id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let block = ContentBlock::Image {
             attachment: dsh_llm::ImageContentRef {
@@ -791,8 +1138,25 @@ mod tests {
             },
         };
         let mut images = HashMap::new();
-        images.insert(id.into(), vec![1, 2, 3, 4]);
+        images.insert(
+            id.into(),
+            PreparedRequestImage::from_bytes(id, "image/png", vec![1, 2, 3, 4], 1, 1),
+        );
         (block, images)
+    }
+
+    fn sample_request(block: ContentBlock) -> LlmRequest {
+        LlmRequest {
+            config: LlmCallConfig::default(),
+            adapter_defaults: None,
+            system: None,
+            messages: vec![Message::User(UserMessage::from_parts(
+                vec![ContentBlock::text("see"), block],
+                MessageSource::User,
+            ))],
+            tools: vec![],
+            purpose: None,
+        }
     }
 
     #[test]
@@ -800,23 +1164,37 @@ mod tests {
         let (block, images) = sample_image();
         let body = request_body(
             "deepseek-v4-flash-vision-exp",
-            &LlmRequest {
-                config: LlmCallConfig::default(),
-                adapter_defaults: None,
-                system: None,
-                messages: vec![Message::User(UserMessage::from_parts(
-                    vec![ContentBlock::text("see"), block],
-                    MessageSource::User,
-                ))],
-                tools: vec![],
-                purpose: None,
-            },
+            &sample_request(block),
             &images,
+            ImageWireKind::Base64,
         )
         .unwrap();
         assert!(body.contains("\"stream\":true"));
         assert!(body.contains("image_url"));
         assert!(body.contains("data:image/png;base64,"));
+        assert!(body.contains(
+            "Image sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; request image 1x1px."
+        ));
+    }
+
+    #[test]
+    fn vision_user_image_uses_file_id_when_resolved() {
+        let (block, images) = sample_image();
+        let mut ids = HashMap::new();
+        ids.insert(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            "file-api-1".into(),
+        );
+        let body = request_body(
+            "deepseek-v4-flash-vision-exp",
+            &sample_request(block),
+            &images,
+            ImageWireKind::File(ids),
+        )
+        .unwrap();
+        assert!(body.contains("\"type\":\"file\""));
+        assert!(body.contains("\"file_id\":\"file-api-1\""));
+        assert!(!body.contains("image_url"));
     }
 
     #[test]
@@ -836,6 +1214,7 @@ mod tests {
                 purpose: None,
             },
             &images,
+            ImageWireKind::Base64,
         )
         .unwrap_err();
         let LlmError::Failure(failure) = err;
@@ -863,6 +1242,7 @@ mod tests {
                 purpose: None,
             },
             &HashMap::new(),
+            ImageWireKind::Base64,
         )
         .unwrap_err();
         let LlmError::Failure(failure) = err;
@@ -892,6 +1272,7 @@ mod tests {
                 purpose: None,
             },
             &images,
+            ImageWireKind::Base64,
         )
         .unwrap_err();
         let LlmError::Failure(failure) = assistant;
@@ -1034,12 +1415,7 @@ mod tests {
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
-        let adapter = DeepSeekAdapter {
-            api_key: "test-key".into(),
-            base_url: format!("http://{addr}"),
-            model: "deepseek-chat".into(),
-            images: HashMap::new(),
-        };
+        let adapter = DeepSeekAdapter::new("test-key", format!("http://{addr}"), "deepseek-chat");
         let error = adapter
             .stream(LlmRequest {
                 config: LlmCallConfig::default(),
@@ -1085,5 +1461,430 @@ mod tests {
             (tod % 3_600) / 60,
             tod % 60
         )
+    }
+
+    #[test]
+    fn file_runtime_defaults_and_rejects_illegal_bounds() {
+        let resolved = resolve_file_runtime(None).unwrap();
+        assert_eq!(resolved.files_api_timeout_ms, DEFAULT_FILES_API_TIMEOUT_MS);
+        assert_eq!(
+            resolved.policy.expires_after_seconds,
+            DEFAULT_FILE_EXPIRY_SECONDS
+        );
+        let err = resolve_file_runtime(Some(&json!({ "filesApiTimeoutMs": 0 }))).unwrap_err();
+        assert!(err.contains("filesApiTimeoutMs must be a positive finite"));
+        let err =
+            resolve_file_runtime(Some(&json!({ "fileExpiresAfterSeconds": 3599 }))).unwrap_err();
+        assert!(err.contains("fileExpiresAfterSeconds must be an integer from 3600"));
+        let err = resolve_file_runtime(Some(&json!({
+            "fileExpiresAfterSeconds": 3600,
+            "fileRefreshMarginSeconds": 3600
+        })))
+        .unwrap_err();
+        assert!(err.contains("fileRefreshMarginSeconds must be a non-negative integer below"));
+        let err = resolve_file_runtime(Some(&json!({ "fileQuotaCleanupBatch": 0 }))).unwrap_err();
+        assert!(err.contains("fileQuotaCleanupBatch must be an integer from 1 through 1000"));
+    }
+
+    #[test]
+    fn classifies_stale_file_provider_messages() {
+        for detail in [
+            "file-api-1 expired",
+            "file_id file-api-10 invalid; file_id file-api-1 expired",
+            "file_not_found",
+            "file_id file-api-1 deleted",
+            "invalid file_id file-api-1",
+            "file reference expired",
+        ] {
+            assert!(provider_rejected_file_id(detail), "{detail}");
+        }
+        assert!(!provider_rejected_file_id("invalid temperature"));
+        assert!(detail_names_file_id(
+            "file_id file-api-1 expired",
+            "file-api-1"
+        ));
+        assert!(!detail_names_file_id(
+            "file_id file-api-10 expired",
+            "file-api-1"
+        ));
+    }
+
+    fn files_store() -> DeepSeekFileStore {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "dsh-files-store-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_nanos()
+            ))
+            .join("files-v3.json");
+        DeepSeekFileStore::new(DeepSeekUploadIndex::new(Some(path)), None)
+    }
+
+    fn sse_ok() -> String {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn http_json(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} ERR\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length = header.lines().find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                });
+                if let Some(length) = content_length {
+                    let start = header_end + 4;
+                    if buf.len() >= start + length {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    async fn write_http(socket: &mut tokio::net::TcpStream, response: &str) {
+        use tokio::io::AsyncWriteExt;
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    fn upload_ok(id: &str, bytes: usize) -> String {
+        let body = serde_json::json!({
+            "id": id,
+            "object": "file",
+            "bytes": bytes,
+            "created_at": 1_700_000_000,
+            "filename": "dsh-aaaaaaaaaaaaaaaa-bbbbbbbb.png",
+            "purpose": "user_data",
+            "expires_at": 1_700_604_800
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn uploads_once_and_sends_file_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                seen.lock().await.push(request.clone());
+                if request.starts_with("POST /files") {
+                    write_http(&mut socket, &upload_ok("file-api-1", 4)).await;
+                } else {
+                    write_http(&mut socket, &sse_ok()).await;
+                }
+            }
+        });
+        let (block, images) = sample_image();
+        let adapter = DeepSeekAdapter {
+            images,
+            files: Some(files_store()),
+            ..DeepSeekAdapter::new(
+                "test-key",
+                format!("http://{addr}"),
+                "deepseek-v4-flash-vision-exp",
+            )
+        };
+        let stream = adapter.stream(sample_request(block)).await.unwrap();
+        let _chunks: Vec<_> = stream.collect().await;
+        let requests = captured.lock().await.clone();
+        assert!(
+            requests.iter().any(|item| item.starts_with("POST /files")),
+            "{requests:?}"
+        );
+        let chat = requests
+            .iter()
+            .find(|item| item.contains("POST /chat/completions"))
+            .expect("chat");
+        assert!(chat.contains("\"file_id\":\"file-api-1\""));
+        assert!(!chat.contains("image_url"));
+        assert!(chat.contains("User-Agent:"));
+        assert!(requests.iter().any(|item| {
+            item.starts_with("POST /files")
+                && item.contains("purpose")
+                && item.contains("user_data")
+        }));
+    }
+
+    #[tokio::test]
+    async fn files_failure_falls_back_to_all_base64() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                seen.lock().await.push(request.clone());
+                if request.starts_with("POST /files") {
+                    write_http(
+                        &mut socket,
+                        &http_json(503, r#"{"error":{"message":"files down"}}"#),
+                    )
+                    .await;
+                } else {
+                    write_http(&mut socket, &sse_ok()).await;
+                }
+            }
+        });
+        let (block, images) = sample_image();
+        let adapter = DeepSeekAdapter {
+            images,
+            files: Some(files_store()),
+            ..DeepSeekAdapter::new(
+                "test-key",
+                format!("http://{addr}"),
+                "deepseek-v4-flash-vision-exp",
+            )
+        };
+        let stream = adapter.stream(sample_request(block)).await.unwrap();
+        let _: Vec<_> = stream.collect().await;
+        let requests = captured.lock().await.clone();
+        let chat = requests
+            .iter()
+            .find(|item| item.contains("POST /chat/completions"))
+            .expect("chat");
+        assert!(chat.contains("image_url"));
+        assert!(!chat.contains("file_id"));
+    }
+
+    #[tokio::test]
+    async fn files_deadline_falls_back_without_aborting_chat() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                if request.starts_with("POST /files") {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    write_http(&mut socket, &upload_ok("file-api-late", 4)).await;
+                } else {
+                    write_http(&mut socket, &sse_ok()).await;
+                }
+            }
+        });
+        let (block, images) = sample_image();
+        let adapter = DeepSeekAdapter {
+            images,
+            files: Some(files_store()),
+            files_api_timeout_ms: 50,
+            ..DeepSeekAdapter::new(
+                "test-key",
+                format!("http://{addr}"),
+                "deepseek-v4-flash-vision-exp",
+            )
+        };
+        let stream = adapter.stream(sample_request(block)).await.unwrap();
+        let chunks: Vec<_> = stream.collect().await;
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::TextDelta { text, .. } if text == "pong"
+        )));
+    }
+
+    #[tokio::test]
+    async fn generic_chat_error_does_not_switch_to_base64() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chats = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = chats.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                if request.starts_with("POST /files") {
+                    write_http(&mut socket, &upload_ok("file-api-1", 4)).await;
+                } else {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    write_http(
+                        &mut socket,
+                        &http_json(503, r#"{"error":{"message":"come back later"}}"#),
+                    )
+                    .await;
+                }
+            }
+        });
+        let (block, images) = sample_image();
+        let adapter = DeepSeekAdapter {
+            images,
+            files: Some(files_store()),
+            ..DeepSeekAdapter::new(
+                "test-key",
+                format!("http://{addr}"),
+                "deepseek-v4-flash-vision-exp",
+            )
+        };
+        let error = adapter.stream(sample_request(block)).await.err().unwrap();
+        let LlmError::Failure(failure) = error;
+        assert_eq!(failure.code, "SERVER");
+        assert_eq!(chats.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_file_id_reuploads_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chats = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen = chats.clone();
+        let uploads = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let upload_count = uploads.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                if request.starts_with("POST /files") {
+                    let n = upload_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    write_http(&mut socket, &upload_ok(&format!("file-api-{n}"), 4)).await;
+                } else if request.starts_with("POST /chat") {
+                    seen.lock().await.push(request);
+                    let attempt = seen.lock().await.len();
+                    if attempt == 1 {
+                        write_http(
+                            &mut socket,
+                            &http_json(
+                                400,
+                                r#"{"error":{"message":"file_id file-api-1 expired"}}"#,
+                            ),
+                        )
+                        .await;
+                    } else {
+                        write_http(&mut socket, &sse_ok()).await;
+                    }
+                } else {
+                    write_http(&mut socket, &http_json(404, "{}")).await;
+                }
+            }
+        });
+        let (block, images) = sample_image();
+        let adapter = DeepSeekAdapter {
+            images,
+            files: Some(files_store()),
+            ..DeepSeekAdapter::new(
+                "test-key",
+                format!("http://{addr}"),
+                "deepseek-v4-flash-vision-exp",
+            )
+        };
+        let stream = adapter.stream(sample_request(block)).await.unwrap();
+        let _: Vec<_> = stream.collect().await;
+        let chats = chats.lock().await;
+        assert_eq!(chats.len(), 2);
+        assert!(chats[0].contains("file-api-1"));
+        assert!(chats[1].contains("file-api-2"));
+        assert_eq!(uploads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn second_stale_rejection_is_returned() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                if request.starts_with("POST /files") {
+                    write_http(&mut socket, &upload_ok("file-api-1", 4)).await;
+                } else {
+                    write_http(
+                        &mut socket,
+                        &http_json(400, r#"{"error":{"message":"file_id file-api-1 expired"}}"#),
+                    )
+                    .await;
+                }
+            }
+        });
+        let (block, images) = sample_image();
+        let adapter = DeepSeekAdapter {
+            images,
+            files: Some(files_store()),
+            ..DeepSeekAdapter::new(
+                "test-key",
+                format!("http://{addr}"),
+                "deepseek-v4-flash-vision-exp",
+            )
+        };
+        let error = adapter.stream(sample_request(block)).await.err().unwrap();
+        let LlmError::Failure(failure) = error;
+        assert_eq!(failure.code, "INVALID_REQUEST");
+        assert!(failure.message.contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_oversize_and_illegal_expiry_without_io() {
+        let client = DeepSeekFilesClient::new("http://127.0.0.1:1", "key");
+        let oversized = vec![0u8; MAX_FILE_UPLOAD_BYTES + 1];
+        let err = client
+            .upload(
+                &oversized,
+                "image/png",
+                "dsh-a.png",
+                DEFAULT_FILE_EXPIRY_SECONDS,
+            )
+            .await
+            .unwrap_err();
+        let LlmError::Failure(failure) = err.error;
+        assert_eq!(failure.code, "INVALID_REQUEST");
+        assert_eq!(
+            failure.message,
+            "DeepSeek Files API upload exceeds 128 MiB."
+        );
+        let err = client
+            .upload(&[1, 2, 3], "image/png", "dsh-a.png", 3_599)
+            .await
+            .unwrap_err();
+        let LlmError::Failure(failure) = err.error;
+        assert_eq!(
+            failure.message,
+            "DeepSeek file expiry must be between 3600 and 2592000 seconds."
+        );
     }
 }
