@@ -1,6 +1,6 @@
 //! DeepSeek Files API upload reuse, invalidation, and quota recovery.
 
-use crate::files_api::DeepSeekFilesClient;
+use crate::files_api::{is_files_quota_error, DeepSeekFilesClient, DeepSeekFilesError};
 use crate::upload_index::{deep_seek_file_scope, DeepSeekUploadIndex, DeepSeekUploadRecord};
 use crate::PreparedRequestImage;
 use dsh_llm::{LlmError, LlmFailure};
@@ -250,29 +250,19 @@ async fn upload_or_quota(
 ) -> Result<DeepSeekUploadRecord, LlmError> {
     match upload_record(client, version, connection, policy).await {
         Ok(record) => Ok(record),
-        Err(error) => {
-            if !matches_quota(&error) {
-                return Err(error);
-            }
+        Err(error) if is_files_quota_error(&error) => {
             let deleted = store
                 .reclaim_oldest_owned(connection, policy.quota_cleanup_batch)
                 .await?;
             if deleted == 0 {
-                return Err(error);
+                return Err(error.into());
             }
-            upload_record(client, version, connection, policy).await
+            upload_record(client, version, connection, policy)
+                .await
+                .map_err(LlmError::from)
         }
+        Err(error) => Err(error.into()),
     }
-}
-
-fn matches_quota(error: &LlmError) -> bool {
-    let LlmError::Failure(failure) = error;
-    let hay = format!("{} {}", failure.code, failure.message).to_ascii_lowercase();
-    hay.contains("quota")
-        || hay.contains("storage")
-        || hay.contains("stored files")
-        || hay.contains("file count")
-        || hay.contains("too many files")
 }
 
 async fn upload_record(
@@ -280,30 +270,22 @@ async fn upload_record(
     version: &PreparedRequestImage,
     connection: &DeepSeekFileConnection,
     policy: &DeepSeekFilePolicy,
-) -> Result<DeepSeekUploadRecord, LlmError> {
-    let remote = match client
+) -> Result<DeepSeekUploadRecord, DeepSeekFilesError> {
+    let remote = client
         .upload(
             &version.data,
             &version.media_type,
             &owned_filename(version),
             policy.expires_after_seconds,
         )
-        .await
-    {
-        Ok(remote) => remote,
-        Err(error) => return Err(error),
-    };
+        .await?;
     if remote.bytes != version.data.len() as u64 {
-        return Err(LlmError::Failure(LlmFailure::new(
+        return Err(response_files_error(
             "DeepSeek Files API upload response does not match the submitted image.",
-            "INVALID_RESPONSE",
-        )));
+        ));
     }
     let expires_at = remote.expires_at.ok_or_else(|| {
-        LlmError::Failure(LlmFailure::new(
-            "DeepSeek Files API returned an invalid upload response.",
-            "INVALID_RESPONSE",
-        ))
+        response_files_error("DeepSeek Files API returned an invalid upload response.")
     })?;
     Ok(DeepSeekUploadRecord {
         scope: deep_seek_file_scope(&connection.base_url, &connection.api_key),
@@ -314,6 +296,13 @@ async fn upload_record(
         created_at: remote.created_at.saturating_mul(1_000),
         expires_at: expires_at.saturating_mul(1_000),
     })
+}
+
+fn response_files_error(message: &str) -> DeepSeekFilesError {
+    DeepSeekFilesError {
+        error: LlmError::Failure(LlmFailure::new(message, "INVALID_RESPONSE")),
+        detail: String::new(),
+    }
 }
 
 fn owned_filename(version: &PreparedRequestImage) -> String {
@@ -370,5 +359,219 @@ mod tests {
     #[test]
     fn chat_image_cap_message() {
         assert_eq!(MAX_CHAT_IMAGE_BYTES, 32 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn reclaims_owned_file_after_quota_and_retries_upload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let uploads = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = uploads.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                if request.starts_with("POST /files") {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        write_http(
+                            &mut socket,
+                            &http_json(
+                                400,
+                                r#"{"error":{"message":"stored file quota exceeded","code":"file_quota"}}"#,
+                            ),
+                        )
+                        .await;
+                    } else {
+                        write_http(&mut socket, &upload_ok("file-api-recovered", 3)).await;
+                    }
+                } else if request.starts_with("DELETE /files/") {
+                    write_http(
+                        &mut socket,
+                        &http_json(
+                            200,
+                            r#"{"id":"file-api-old","object":"file","deleted":true}"#,
+                        ),
+                    )
+                    .await;
+                } else {
+                    write_http(&mut socket, &list_ok("file-api-old", "dsh-old.png")).await;
+                }
+            }
+        });
+        let store = test_store();
+        let image = sample_image(3);
+        let resolved = store
+            .ensure_uploaded(
+                &image,
+                &DeepSeekFileConnection {
+                    base_url: format!("http://{addr}"),
+                    api_key: "key".into(),
+                },
+                &DeepSeekFilePolicy {
+                    quota_cleanup_batch: 1,
+                    ..DeepSeekFilePolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.record.file_id, "file-api-recovered");
+        assert!(resolved.uploaded);
+        assert_eq!(uploads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn preserves_quota_error_when_no_owned_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                if request.starts_with("POST /files") {
+                    write_http(
+                        &mut socket,
+                        &http_json(
+                            400,
+                            r#"{"error":{"message":"file count quota exceeded","code":"file_quota"}}"#,
+                        ),
+                    )
+                    .await;
+                } else {
+                    write_http(&mut socket, &list_ok("file-api-foreign", "foreign.png")).await;
+                }
+            }
+        });
+        let store = test_store();
+        let image = sample_image(3);
+        let error = store
+            .ensure_uploaded(
+                &image,
+                &DeepSeekFileConnection {
+                    base_url: format!("http://{addr}"),
+                    api_key: "key".into(),
+                },
+                &DeepSeekFilePolicy::default(),
+            )
+            .await
+            .unwrap_err();
+        let LlmError::Failure(failure) = error;
+        assert_eq!(failure.code, "FILES_API");
+    }
+
+    fn test_store() -> DeepSeekFileStore {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "dsh-files-quota-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_nanos()
+            ))
+            .join("files-v3.json");
+        DeepSeekFileStore::new(DeepSeekUploadIndex::new(Some(path)), None)
+    }
+
+    fn sample_image(bytes: usize) -> PreparedRequestImage {
+        PreparedRequestImage::from_bytes(
+            format!("sha256:{}", "ab".repeat(32)),
+            "image/png",
+            vec![1u8; bytes],
+            1,
+            1,
+        )
+    }
+
+    fn http_json(status: u16, body: &str) -> String {
+        let reason = if (200..300).contains(&status) {
+            "OK"
+        } else {
+            "ERR"
+        };
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn upload_ok(id: &str, bytes: usize) -> String {
+        let body = serde_json::json!({
+            "id": id,
+            "object": "file",
+            "bytes": bytes,
+            "created_at": 1_700_000_000,
+            "filename": "dsh-recovered.png",
+            "purpose": "user_data",
+            "expires_at": 1_700_604_800
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn list_ok(id: &str, filename: &str) -> String {
+        let body = serde_json::json!({
+            "object": "list",
+            "data": [{
+                "id": id,
+                "object": "file",
+                "bytes": 3,
+                "created_at": 1_700_000_000,
+                "filename": filename,
+                "purpose": "user_data"
+            }],
+            "first_id": id,
+            "last_id": id,
+            "has_more": false
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length = header.lines().find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                });
+                if let Some(length) = content_length {
+                    let start = header_end + 4;
+                    if buf.len() >= start + length {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    async fn write_http(socket: &mut tokio::net::TcpStream, response: &str) {
+        use tokio::io::AsyncWriteExt;
+        socket.write_all(response.as_bytes()).await.unwrap();
     }
 }

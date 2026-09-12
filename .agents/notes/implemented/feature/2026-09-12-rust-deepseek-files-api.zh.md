@@ -40,7 +40,7 @@ Rust 的 `variant_id` 是对 `attachment-local::request_image` 已产出 JPEG �
 
 ## 验证
 
-`dsh-llm-deepseek` crate 测试覆盖 multipart 上传加 chat `file_id`、Files HTTP 503 与 `filesApiTimeoutMs` 的整请求回退、普通 chat 503 不切换传输、失效 id 重传一次、第二次失效拒绝、索引的 `commit` / `get` / `remove`、损坏索引当空缓存，以及超限或非法 expiry 不发网络请求。
+`dsh-llm-deepseek` crate 测试覆盖 multipart 上传加 chat `file_id`、Files HTTP 503 与 `filesApiTimeoutMs` 的整请求回退、普通 chat 503 不切换传输、失效 id 重传一次、第二次失效拒绝、配额回收后重试上传一次、没有 harness 自有文件时保留配额错误、索引的 `commit` / `get` / `remove`、损坏索引当空缓存，以及超限或非法 expiry 不发网络请求。
 
 ## 后果
 

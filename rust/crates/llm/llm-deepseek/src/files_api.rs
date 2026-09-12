@@ -138,26 +138,27 @@ impl DeepSeekFilesClient {
     /// Upload one image with an explicit expiry. The response must include `expires_at`.
     ///
     /// # Errors
-    /// Oversize or illegal expiry (`INVALID_REQUEST`), transport failure, or an
-    /// incomplete upload object (`INVALID_RESPONSE`).
+    /// Oversize or illegal expiry (`INVALID_REQUEST`), transport or provider
+    /// failure (quota detail stays on [`DeepSeekFilesError`]), or an incomplete
+    /// upload object (`INVALID_RESPONSE`).
     pub async fn upload(
         &self,
         data: &[u8],
         media_type: &str,
         filename: &str,
         expires_after_seconds: u32,
-    ) -> Result<DeepSeekFileObject, LlmError> {
+    ) -> Result<DeepSeekFileObject, DeepSeekFilesError> {
         if data.len() > MAX_FILE_UPLOAD_BYTES {
-            return Err(LlmError::Failure(LlmFailure::new(
+            return Err(local_files_error(
                 "DeepSeek Files API upload exceeds 128 MiB.",
                 "INVALID_REQUEST",
-            )));
+            ));
         }
         if !(MIN_FILE_EXPIRY_SECONDS..=MAX_FILE_EXPIRY_SECONDS).contains(&expires_after_seconds) {
-            return Err(LlmError::Failure(LlmFailure::new(
+            return Err(local_files_error(
                 "DeepSeek file expiry must be between 3600 and 2592000 seconds.",
                 "INVALID_REQUEST",
-            )));
+            ));
         }
         let value = self
             .request(
@@ -170,11 +171,10 @@ impl DeepSeekFilesClient {
                     file: data,
                 }),
             )
-            .await
-            .map_err(LlmError::from)?;
-        let file = parse_file_object(&value, "upload")?;
+            .await?;
+        let file = parse_file_object(&value, "upload").map_err(files_error_from_llm)?;
         if file.expires_at.is_none() {
-            return Err(invalid_response("upload"));
+            return Err(files_error_from_llm(invalid_response("upload")));
         }
         Ok(file)
     }
@@ -243,6 +243,20 @@ fn files_http_error_code(status: u16) -> String {
         "SERVER".into()
     } else {
         "FILES_API".into()
+    }
+}
+
+fn local_files_error(message: &str, code: &str) -> DeepSeekFilesError {
+    DeepSeekFilesError {
+        error: LlmError::Failure(LlmFailure::new(message, code)),
+        detail: String::new(),
+    }
+}
+
+fn files_error_from_llm(error: LlmError) -> DeepSeekFilesError {
+    DeepSeekFilesError {
+        error,
+        detail: String::new(),
     }
 }
 

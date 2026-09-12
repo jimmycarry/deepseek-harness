@@ -435,7 +435,7 @@
 
 ## 已经对齐（不要再当成差距打开）
 
-凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、persistence write-behind / `append` / 耐久 `commitRepair` / inspect LRU `preparedSessionCacheSize`、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（含可选 `reviewProvider: "auto"`；默认 headless 评审仍失败闭合）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题、附件 `request_image`、在 store + vision 挂载时的 ACP 图像提示、DeepSeek SSE + `image_url` data-URL、settings 的 `register` / `watch` / `revision` / `mutate`。
+凭据解析、`llm-retry` 的 `retryPolicy` + `providerRetryAfterMs`（delay-seconds 与 HTTP-date，超上限的 `normal`/`always`）、sandbox-policy / approval / permission-presets、带冷 resume 与 `list_agents` 诊断的 continuable 进程内子代理、persistence write-behind / `append` / 耐久 `commitRepair` / inspect LRU `preparedSessionCacheSize`、Windows ACL 的 Node runner argv、OTel keepAlive + `Retry-After` HTTP-date、compaction-basic 主路径、goal / todo / plan 工具（含可选 `reviewProvider: "auto"`；默认 headless 评审仍失败闭合）、jobs、spill、agent-instructions、fs 观察门、skill catalog 工具、token-meter、标题、附件 `request_image`、在 store + vision 挂载时的 ACP 图像提示、DeepSeek SSE + Files API 上传（`file_id`、全量 inline 回退、`files-v3.json`、失效 id 重试一次）、settings 的 `register` / `watch` / `revision` / `mutate`。
 
 ## 验证
 

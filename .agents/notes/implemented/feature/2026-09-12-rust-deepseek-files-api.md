@@ -40,7 +40,7 @@ Rust `variant_id` is SHA-256 of `attachment_id + NUL + media_type + NUL + data` 
 
 ## Verification
 
-`dsh-llm-deepseek` crate tests cover multipart upload plus chat `file_id`, Files HTTP 503 and `filesApiTimeoutMs` whole-request fallback, generic chat 503 without a transport switch, one stale-id re-upload, a second stale rejection, index `commit` / `get` / `remove`, a corrupt index as an empty cache, and oversize or illegal expiry without a network call.
+`dsh-llm-deepseek` crate tests cover multipart upload plus chat `file_id`, Files HTTP 503 and `filesApiTimeoutMs` whole-request fallback, generic chat 503 without a transport switch, one stale-id re-upload, a second stale rejection, quota reclaim then one upload retry, a quota error kept when no harness-owned file exists, index `commit` / `get` / `remove`, a corrupt index as an empty cache, and oversize or illegal expiry without a network call.
 
 ## Consequences
 

@@ -1871,7 +1871,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let LlmError::Failure(failure) = err;
+        let LlmError::Failure(failure) = err.error;
         assert_eq!(failure.code, "INVALID_REQUEST");
         assert_eq!(
             failure.message,
@@ -1881,7 +1881,7 @@ mod tests {
             .upload(&[1, 2, 3], "image/png", "dsh-a.png", 3_599)
             .await
             .unwrap_err();
-        let LlmError::Failure(failure) = err;
+        let LlmError::Failure(failure) = err.error;
         assert_eq!(
             failure.message,
             "DeepSeek file expiry must be between 3600 and 2592000 seconds."
