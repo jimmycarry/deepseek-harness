@@ -789,12 +789,18 @@ name = "dsh-llm-deepseek"
 version = "0.1.1-rc.2"
 dependencies = [
  "async-trait",
+ "dsh-atomic-write",
  "dsh-cordis",
  "dsh-credentials",
+ "dsh-home-paths",
  "dsh-llm",
+ "dsh-timeout",
  "futures",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

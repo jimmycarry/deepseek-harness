@@ -830,6 +830,7 @@ fn apply_llm_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
     }
     let catalog =
         dsh_llm_deepseek::resolve_catalog(config.as_ref()).map_err(CordisError::Validation)?;
+    dsh_llm_deepseek::resolve_file_runtime(config.as_ref()).map_err(CordisError::Validation)?;
     let retry_policy = resolve_retry_policy(
         config.as_ref().and_then(|value| value.get("retryPolicy")),
         "llm-deepseek.retryPolicy",
@@ -842,6 +843,7 @@ fn apply_llm_deepseek(ctx: &Context, config: Option<Value>) -> Result<()> {
         plugin_config: config,
         last_good: Mutex::new(Some(catalog)),
         retry_policy,
+        files: dsh_llm_deepseek::DeepSeekFileStore::default_store(),
     }))))
 }
 
@@ -852,6 +854,7 @@ struct LiveDeepSeekAdapter {
     plugin_config: Option<Value>,
     last_good: Mutex<Option<(u32, Vec<dsh_llm_deepseek::CatalogModel>)>>,
     retry_policy: dsh_llm::RetryPolicy,
+    files: dsh_llm_deepseek::DeepSeekFileStore,
 }
 
 fn resolve_deepseek(
@@ -924,11 +927,23 @@ impl LlmAdapter for LiveDeepSeekAdapter {
             resolve_deepseek(self.settings.as_deref(), self.plugin_config.as_ref());
         let api_key = dsh_llm_deepseek::resolve_api_key(self.credentials.as_deref(), &api_key_env)?;
         let images = collect_request_images(&request, self.attachments.as_deref())?;
+        let section = dsh_llm_deepseek::merge_connection_config(
+            self.plugin_config.as_ref(),
+            self.settings
+                .as_ref()
+                .and_then(|settings| settings.section("llm-deepseek"))
+                .as_ref(),
+        );
+        let file_runtime = dsh_llm_deepseek::resolve_file_runtime(Some(&section))
+            .unwrap_or_else(|_| dsh_llm_deepseek::FileRuntimeConfig::default());
         dsh_llm_deepseek::DeepSeekAdapter {
             api_key,
             base_url,
             model,
             images,
+            files: Some(self.files.clone()),
+            file_policy: file_runtime.policy,
+            files_api_timeout_ms: file_runtime.files_api_timeout_ms,
         }
         .stream(request)
         .await
@@ -1014,7 +1029,10 @@ fn apply_llm_replay(ctx: &Context, config: Option<Value>) -> Result<()> {
 fn collect_request_images(
     request: &LlmRequest,
     store: Option<&AttachmentStore>,
-) -> std::result::Result<std::collections::HashMap<String, Vec<u8>>, LlmError> {
+) -> std::result::Result<
+    std::collections::HashMap<String, dsh_llm_deepseek::PreparedRequestImage>,
+    LlmError,
+> {
     let mut images = std::collections::HashMap::new();
     for message in &request.messages {
         let blocks: &[ContentBlock] = match message {
@@ -1028,11 +1046,8 @@ fn collect_request_images(
             };
             let Some(store) = store else {
                 return Err(LlmError::Failure(LlmFailure::new(
-                    format!(
-                        "DeepSeek request image {} was not prepared.",
-                        attachment.attachment_id
-                    ),
-                    "INVALID_REQUEST",
+                    "DeepSeek image conversion requires the durable attachment service.",
+                    "UNSUPPORTED_CONTENT",
                 )));
             };
             let media_type = dsh_attachment::ImageMediaType::parse(&attachment.media_type)
@@ -1060,7 +1075,16 @@ fn collect_request_images(
             let prepared = dsh_attachment_local::request_image(&stored.data).map_err(|error| {
                 LlmError::Failure(LlmFailure::new(error.to_string(), error.code()))
             })?;
-            images.insert(attachment.attachment_id.clone(), prepared);
+            images.insert(
+                attachment.attachment_id.clone(),
+                dsh_llm_deepseek::PreparedRequestImage::from_bytes(
+                    attachment.attachment_id.clone(),
+                    "image/jpeg",
+                    prepared,
+                    attachment.width,
+                    attachment.height,
+                ),
+            );
         }
     }
     Ok(images)
