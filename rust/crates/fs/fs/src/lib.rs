@@ -275,32 +275,49 @@ pub struct FsWriteOutcome {
 pub struct FsObservationActor {
     /// Session id of the calling agent, when the loop supplied one.
     pub session_id: Option<String>,
+    /// Model-facing tool name (`write`, `edit`, `read`, …) when the emitter is a tool.
+    pub name: Option<String>,
 }
 
 impl FsObservationActor {
     /// Actor for a tool call's `agent_id` (the session id).
     pub fn from_agent_id(agent_id: Option<&str>) -> Self {
+        Self::from_tool(None, agent_id)
+    }
+
+    /// Actor for a named filesystem tool and its `agent_id`.
+    pub fn from_tool(name: Option<&str>, agent_id: Option<&str>) -> Self {
         Self {
             session_id: agent_id.filter(|id| !id.is_empty()).map(str::to_string),
+            name: name.filter(|value| !value.is_empty()).map(str::to_string),
         }
     }
 
-    /// JSON `actor` object. Missing session yields `{}` so the policy sees no owner.
+    /// JSON `actor` object. Missing session yields `{}` or `{name}` so the policy sees no owner.
     pub fn to_value(&self) -> Value {
-        match &self.session_id {
-            Some(id) => json!({ "agent": { "session": { "id": id } } }),
-            None => json!({}),
+        let mut object = serde_json::Map::new();
+        if let Some(name) = &self.name {
+            object.insert("name".into(), json!(name));
         }
+        if let Some(id) = &self.session_id {
+            object.insert("agent".into(), json!({ "session": { "id": id } }));
+        }
+        Value::Object(object)
     }
 
-    /// Parse an actor; only `agent.session.id` is the owner key.
+    /// Parse an actor; `agent.session.id` is the owner key and `name` is the tool.
     pub fn from_value(value: Option<&Value>) -> Self {
         let session_id = value
             .and_then(|value| value.pointer("/agent/session/id"))
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_string);
-        Self { session_id }
+        let name = value
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        Self { session_id, name }
     }
 
     /// Observed-state owner, when one can be derived.
@@ -506,12 +523,21 @@ mod tests {
 
     #[test]
     fn remediates_guarded_codes_once() {
-        let error = FsError::not_observed(r#"cannot overwrite existing "/x" without reading it first"#);
+        let error =
+            FsError::not_observed(r#"cannot overwrite existing "/x" without reading it first"#);
         let remediated = error.clone().remediate();
-        assert!(remediated.to_string().contains(" — read the file, then retry"));
-        assert_eq!(remediated.clone().remediate().to_string(), remediated.to_string());
-        let stale = FsError::stale(r#"cannot write "/x": file changed since it was read"#).remediate();
-        assert!(stale.to_string().contains(" — re-read the file, then retry"));
+        assert!(remediated
+            .to_string()
+            .contains(" — read the file, then retry"));
+        assert_eq!(
+            remediated.clone().remediate().to_string(),
+            remediated.to_string()
+        );
+        let stale =
+            FsError::stale(r#"cannot write "/x": file changed since it was read"#).remediate();
+        assert!(stale
+            .to_string()
+            .contains(" — re-read the file, then retry"));
     }
 
     #[test]
@@ -524,6 +550,22 @@ mod tests {
         assert_eq!(
             FsObservationActor::from_value(Some(&json!({ "agent": {} }))).owner(),
             None
+        );
+    }
+
+    #[test]
+    fn actor_carries_tool_name() {
+        let actor = FsObservationActor::from_tool(Some("write"), Some("sess-1"));
+        assert_eq!(actor.name.as_deref(), Some("write"));
+        assert_eq!(
+            actor.to_value(),
+            json!({ "name": "write", "agent": { "session": { "id": "sess-1" } } })
+        );
+        assert_eq!(
+            FsObservationActor::from_value(Some(&json!({ "name": "edit" })))
+                .name
+                .as_deref(),
+            Some("edit")
         );
     }
 }

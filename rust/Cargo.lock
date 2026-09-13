@@ -1231,6 +1231,7 @@ name = "dsh-skill-filesystem"
 version = "0.1.1-rc.2"
 dependencies = [
  "dsh-cordis",
+ "dsh-home-paths",
  "dsh-skill",
  "serde_json",
 ]
