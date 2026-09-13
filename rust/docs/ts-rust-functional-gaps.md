@@ -65,7 +65,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 10. `session-projection-cache` (no crate).
 11. Session-query FTS (`openAt: never` in [`rust/crates/bundle/base/cordis.patch.yml`](../crates/bundle/base/cordis.patch.yml); SQLite FTS schema 1 vs TypeScript 8).
 12. Enable `web-fetch-http` in profiles that need URL retrieval (crate exists; base `fetch: false`).
-13. Skill filesystem watch / poll-until-root (Rust rescans on `agent/pre-step` and `fs/observed` only).
+13. Skill filesystem watch / poll-until-root — **closed** on interval polling of existing roots and missing-root ancestors (no Chokidar / `notify`); `write`/`edit` `fs/observed` remains the first-party fast path ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)).
 14. OTel seam flush hint (metrics stay skip).
 15. SDK client helpers (`Session.run`, descendant notification merge) versus the thin stdio wrapper.
 16. External subagent providers (ACP / Codex / Claude / `dsh-sdk`).
@@ -108,7 +108,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 1. Persistence coordinator, DeepSeek SSE + image blocks, attachment normalization, settings Service Definition, and headless plan-review — **closed** (P0 items 1–6).
 2. Record the loop finish-chunk gap; do not change `dsh-agent-loop` here (P0 item 7, report only).
 3. DeepSeek Files API upload — **closed** (file ids, all-inline fallback, `files-v3.json` index, one stale-id retry; [Agent Note](../../.agents/notes/implemented/feature/2026-09-12-rust-deepseek-files-api.md)).
-4. Session-query FTS opt-in, web fetch enablement, skill watching, OTel flush, SDK helpers, external subagents.
+4. Session-query FTS opt-in, web fetch enablement, OTel flush, SDK helpers, external subagents. Skill watching is **closed** on the poll adapter ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)).
 5. Platform sandbox and PTY/LSP only when those headless hosts are in scope.
 6. Rust-as-host for the existing TypeScript Web client only after the headless spine gaps above are closed.
 
@@ -359,7 +359,7 @@ All three packages **absent** / **P4**.
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `skill` / `tool-skill` | aligned | Catalog messages + `<skill_content>` | — |
-| `skill-filesystem` | thinner | Rescan on `agent/pre-step` and skill-path `fs/observed`; no Chokidar / poll | P1 |
+| `skill-filesystem` | aligned for watch | Interval poll of catalog-relevant roots and missing-root ancestors; `write`/`edit` `fs/observed` fast path; no Chokidar. Incomplete last-good catalog still thinner (flat `ctx.skills` has no completeness bit) | remaining (incomplete snapshot) |
 | `skill-badge` | no-op | Disabled in base | P3 |
 
 ### spill

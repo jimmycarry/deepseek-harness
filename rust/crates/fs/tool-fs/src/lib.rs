@@ -5,8 +5,8 @@ mod sandbox;
 use async_trait::async_trait;
 use dsh_cordis::Context;
 use dsh_fs::{
-    error_from_event, fs_event_payload, FsObservation, FsObservationActor, FsRuntime, FsWriteIntent,
-    FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
+    error_from_event, fs_event_payload, FsObservation, FsObservationActor, FsRuntime,
+    FsWriteIntent, FS_EDIT_INTENT, FS_OBSERVED, FS_WRITE_INTENT,
 };
 use dsh_tools::{Tool, ToolCall, ToolError, ToolOutcome};
 use serde_json::{json, Value};
@@ -24,10 +24,7 @@ pub struct ReadTool {
 impl ReadTool {
     /// Bind to `ctx.fs` and the plugin context used for `fs/observed`.
     pub fn new(fs: Arc<FsRuntime>, ctx: Context) -> Self {
-        Self {
-            fallback: fs,
-            ctx,
-        }
+        Self { fallback: fs, ctx }
     }
 
     fn fs(&self) -> Arc<FsRuntime> {
@@ -204,7 +201,11 @@ impl Tool for WriteTool {
             Ok(path) => path,
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
-        let content = call.args.get("content").and_then(Value::as_str).unwrap_or("");
+        let content = call
+            .args
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let policy = match self
             .sandbox
             .resolve_policy("write", &call.args, call.agent_id.as_deref())
@@ -214,7 +215,7 @@ impl Tool for WriteTool {
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
         let fence = policy.as_ref().map(sandbox::write_policy_from);
-        let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
+        let actor = FsObservationActor::from_tool(Some("write"), call.agent_id.as_deref());
         let fs = self.fs();
         let target = match fs.resolve(&path).await {
             Ok(target) => target,
@@ -357,7 +358,7 @@ impl Tool for EditTool {
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
         let fence = policy.as_ref().map(sandbox::write_policy_from);
-        let actor = FsObservationActor::from_agent_id(call.agent_id.as_deref());
+        let actor = FsObservationActor::from_tool(Some("edit"), call.agent_id.as_deref());
         let fs = self.fs();
         let target = match fs.resolve(&input.file_path).await {
             Ok(target) => target,
@@ -372,12 +373,11 @@ impl Tool for EditTool {
                 if let Some(error) = error_from_event(&value) {
                     return Ok(ToolOutcome::error(error.remediate().to_string()));
                 }
-                value
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .map(|version| FsWriteIntent::ReplaceIfVersion {
+                value.get("version").and_then(Value::as_str).map(|version| {
+                    FsWriteIntent::ReplaceIfVersion {
                         version: version.to_string(),
-                    })
+                    }
+                })
             }
             Err(error) => return Ok(ToolOutcome::error(error.to_string())),
         };
@@ -385,8 +385,13 @@ impl Tool for EditTool {
             Ok(text) => text,
             Err(error) => return Ok(ToolOutcome::error(error.to_string())),
         };
-        let after = match apply_edit(&before, &input.old_string, &input.new_string, input.replace_all, &target.display_path)
-        {
+        let after = match apply_edit(
+            &before,
+            &input.old_string,
+            &input.new_string,
+            input.replace_all,
+            &target.display_path,
+        ) {
             Ok(text) => text,
             Err(message) => return Ok(ToolOutcome::error(message)),
         };
@@ -527,9 +532,7 @@ pub fn format_read_output(
             .join("\n");
         format!("{numbered}\n\n{footer}")
     };
-    format!(
-        "<path>{display_path}</path>\n<type>file</type>\n<content>\n{body}\n</content>"
-    )
+    format!("<path>{display_path}</path>\n<type>file</type>\n<content>\n{body}\n</content>")
 }
 
 /// Format a write outcome as the TypeScript Created/Updated envelope.
@@ -698,9 +701,8 @@ mod tests {
             Ok(_) => panic!("expected fail-loud without sandboxPolicy"),
             Err(err) => err,
         };
-        assert!(err.contains(
-            "tool-fs: the mounted filesystem confines but ctx.sandboxPolicy is missing"
-        ));
+        assert!(err
+            .contains("tool-fs: the mounted filesystem confines but ctx.sandboxPolicy is missing"));
     }
 
     #[test]
