@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.md
+2026-09-14-rust-session-query-lineage.md: a586e171f521a94478eab88300083474afd254da
+2026-09-14-rust-session-query-lineage.zh.md: 6bd79d8cf976ad61dedfa1c983ce9ed20d9e4818
