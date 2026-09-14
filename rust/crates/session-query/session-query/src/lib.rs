@@ -403,7 +403,7 @@ impl SessionQueryEngine {
             })?;
             for header in headers {
                 records.insert(
-                    header.id.clone(),
+                    header.id.as_str().to_string(),
                     SessionRecord {
                         header,
                         live: false,
@@ -414,12 +414,13 @@ impl SessionQueryEngine {
         }
         for session in self.sessions.live() {
             let header = session.header().clone();
-            if let Some(durable) = records.get(&header.id) {
+            let id = header.id.as_str().to_string();
+            if let Some(durable) = records.get(&id) {
                 assert_session_headers_compatible(&header, &durable.header)?;
             }
-            let persisted = records.contains_key(&header.id);
+            let persisted = records.contains_key(&id);
             records.insert(
-                header.id.clone(),
+                id,
                 SessionRecord {
                     header,
                     live: true,
@@ -497,11 +498,11 @@ fn trace_session(
     records: &[SessionRecord],
     session_id: &SessionId,
 ) -> Result<SessionLineageTrace, SessionQueryError> {
-    let by_id: HashMap<SessionId, &SessionRecord> = records
+    let by_id: HashMap<&str, &SessionRecord> = records
         .iter()
-        .map(|record| (record.header.id.clone(), record))
+        .map(|record| (record.header.id.as_str(), record))
         .collect();
-    let target = by_id.get(session_id).copied().ok_or_else(|| {
+    let target = by_id.get(session_id.as_str()).copied().ok_or_else(|| {
         SessionQueryError::new(
             format!("session \"{}\" not found", session_id.as_str()),
             SessionQueryErrorCode::SessionNotFound,
@@ -510,11 +511,11 @@ fn trace_session(
 
     let mut ancestors = Vec::new();
     let mut ancestry_seen = HashSet::new();
-    ancestry_seen.insert(session_id.clone());
+    ancestry_seen.insert(session_id.as_str().to_string());
     let mut unresolved_parent_id = None;
     let mut parent_id = target.header.parent_session.clone();
     while let Some(current) = parent_id {
-        if !ancestry_seen.insert(current.clone()) {
+        if !ancestry_seen.insert(current.as_str().to_string()) {
             return Err(SessionQueryError::new(
                 format!(
                     "session lineage contains a cycle at \"{}\"",
@@ -523,7 +524,7 @@ fn trace_session(
                 SessionQueryErrorCode::InvalidLineage,
             ));
         }
-        match by_id.get(&current) {
+        match by_id.get(current.as_str()) {
             Some(parent) => {
                 ancestors.push((*parent).clone());
                 parent_id = parent.header.parent_session.clone();
@@ -557,11 +558,11 @@ fn trace_session(
 }
 
 fn build_descendants(records: &[SessionRecord], session_id: &SessionId) -> Vec<SessionLineageNode> {
-    let mut children_by_parent: HashMap<SessionId, Vec<SessionRecord>> = HashMap::new();
+    let mut children_by_parent: HashMap<&str, Vec<SessionRecord>> = HashMap::new();
     for record in records {
         if let Some(parent) = &record.header.parent_session {
             children_by_parent
-                .entry(parent.clone())
+                .entry(parent.as_str())
                 .or_default()
                 .push(record.clone());
         }
@@ -577,7 +578,7 @@ fn build_descendants(records: &[SessionRecord], session_id: &SessionId) -> Vec<S
 
     let mut drafts = Vec::new();
     let mut pending = Vec::new();
-    let Some(roots) = children_by_parent.get(session_id) else {
+    let Some(roots) = children_by_parent.get(session_id.as_str()) else {
         return Vec::new();
     };
     for child in roots {
@@ -594,8 +595,8 @@ fn build_descendants(records: &[SessionRecord], session_id: &SessionId) -> Vec<S
     while cursor < pending.len() {
         let index = pending[cursor];
         cursor += 1;
-        let child_id = drafts[index].session.header.id.clone();
-        let Some(children) = children_by_parent.get(&child_id) else {
+        let child_id = drafts[index].session.header.id.as_str().to_string();
+        let Some(children) = children_by_parent.get(child_id.as_str()) else {
             continue;
         };
         let mut child_indexes = Vec::with_capacity(children.len());
