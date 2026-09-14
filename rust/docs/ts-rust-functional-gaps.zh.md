@@ -108,7 +108,7 @@
 1. persistence 协调器、DeepSeek SSE + 图像块、附件归一化、settings Service Definition、headless plan 评审 — **已关闭**（P0 第 1–6 项）。
 2. 记录 loop 的 finish-chunk 差距；此处不改 `dsh-agent-loop`（P0 第 7 项，只报告）。
 3. DeepSeek Files API 上传 — **已关闭**（file id、全量 inline 回退、`files-v3.json` 索引、失效 id 重试一次；[Agent Note](../../.agents/notes/implemented/feature/2026-09-12-rust-deepseek-files-api.zh.md)）。
-4. session-query FTS 可选开启、web fetch 启用、OTel flush、SDK 助手、外部子代理。skill 监听已在轮询适配器上 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。session-query 精确列表与谱系已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)）。skill 不完整 last-good 已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.zh.md)）。
+4. session-query FTS 可选开启、web fetch 启用、OTel flush、外部子代理。skill 监听已在轮询适配器上 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。session-query 精确列表与谱系已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)）。skill 不完整 last-good 已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.zh.md)）。SDK `Session.run` 与后代合并已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-sdk-session-run.zh.md)）。
 5. 仅当那些 headless 宿主进入范围时，再做平台沙箱与 PTY/LSP。
 6. 仅在上面的 headless spine 差距关闭之后，才让 Rust 做现有 TypeScript Web 客户端的宿主。
 
