@@ -36,14 +36,32 @@ impl Skill {
     }
 }
 
+/// One catalog observation plus whether discovery completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCatalogSnapshot {
+    /// Model-invocable skills in name order from the current registry.
+    pub skills: Vec<Skill>,
+    /// Whether the last filesystem observation finished without unexpected I/O.
+    pub complete: bool,
+}
+
 /// `ctx.skills`.
-#[derive(Default)]
 pub struct SkillRuntime {
     skills: Arc<Mutex<HashMap<String, Skill>>>,
+    complete: Mutex<bool>,
+}
+
+impl Default for SkillRuntime {
+    fn default() -> Self {
+        Self {
+            skills: Arc::new(Mutex::new(HashMap::new())),
+            complete: Mutex::new(true),
+        }
+    }
 }
 
 impl SkillRuntime {
-    /// Create an empty registry.
+    /// Create an empty complete registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -92,6 +110,24 @@ impl SkillRuntime {
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         entries
     }
+
+    /// Whether the last provider observation finished without unexpected I/O.
+    pub fn is_complete(&self) -> bool {
+        *self.complete.lock().expect("skills complete")
+    }
+
+    /// Record whether the latest observation may be published as authoritative.
+    pub fn set_complete(&self, complete: bool) {
+        *self.complete.lock().expect("skills complete") = complete;
+    }
+
+    /// Catalog view plus the current completeness bit.
+    pub fn snapshot(&self) -> SkillCatalogSnapshot {
+        SkillCatalogSnapshot {
+            skills: self.catalog(),
+            complete: self.is_complete(),
+        }
+    }
 }
 
 impl Service for SkillRuntime {
@@ -127,6 +163,12 @@ mod tests {
         let catalog = skills.catalog();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "review");
+        let snapshot = skills.snapshot();
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.skills.len(), 1);
+        skills.set_complete(false);
+        assert!(!skills.snapshot().complete);
+        assert_eq!(skills.snapshot().skills[0].name, "review");
     }
 
     #[test]
