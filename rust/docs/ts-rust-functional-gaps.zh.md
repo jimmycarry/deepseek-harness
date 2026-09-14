@@ -63,7 +63,7 @@
 8. 从插件 `install` Config 接通 `preparedSessionCacheSize` / `writeBatchMaxDelayMs` — 随 P0-1 **已关闭**（`dsh-app-boot` / `PersistenceRuntime`）。
 9. `readFrom` / 后缀读取 — 随 P0-1 **已关闭**（`PersistenceRuntime::read_from`）。
 10. `session-projection-cache`（无 crate）。
-11. session-query FTS（[`rust/crates/bundle/base/cordis.patch.yml`](../crates/bundle/base/cordis.patch.yml) 里 `openAt: never`；SQLite FTS schema 1 对 TypeScript 8）。最新优先列表、live/persisted 位、header 冲突与父子谱系已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)）。
+11. session-query FTS（[`rust/crates/bundle/base/cordis.patch.yml`](../crates/bundle/base/cordis.patch.yml) 里 `openAt: never`；SQLite FTS schema 1 对 TypeScript 8）。最新优先列表、live/persisted 位、header 冲突与父子谱系已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)）。`readSurface` / `listEvents` / `traceEvent` / `filterSessions` / `filterEvents` 已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-surface.zh.md)）。
 12. 在需要取 URL 的 profile 里启用 `web-fetch-http`（crate 已在；base 为 `fetch: false`）。
 13. skill 文件系统监听 / 轮询到根出现 — 已在对已有根与缺失根祖先的间隔轮询上 **关闭**（无 Chokidar / `notify`）；`write`/`edit` 的 `fs/observed` 仍是第一方快路径（[Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。
 14. OTel seam 的 flush 提示（metrics 保持 skip）。
@@ -108,7 +108,7 @@
 1. persistence 协调器、DeepSeek SSE + 图像块、附件归一化、settings Service Definition、headless plan 评审 — **已关闭**（P0 第 1–6 项）。
 2. 记录 loop 的 finish-chunk 差距；此处不改 `dsh-agent-loop`（P0 第 7 项，只报告）。
 3. DeepSeek Files API 上传 — **已关闭**（file id、全量 inline 回退、`files-v3.json` 索引、失效 id 重试一次；[Agent Note](../../.agents/notes/implemented/feature/2026-09-12-rust-deepseek-files-api.zh.md)）。
-4. session-query FTS 可选开启、web fetch 启用、OTel flush、外部子代理。skill 监听已在轮询适配器上 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。session-query 精确列表与谱系已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)）。skill 不完整 last-good 已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.zh.md)）。SDK `Session.run` 与后代合并已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-sdk-session-run.zh.md)）。
+4. session-query FTS 可选开启、web fetch 启用、OTel flush、外部子代理。skill 监听已在轮询适配器上 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。session-query 精确列表与谱系已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)）。session-query 表面追踪与过滤已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-surface.zh.md)）。skill 不完整 last-good 已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.zh.md)）。SDK `Session.run` 与后代合并已 **关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-sdk-session-run.zh.md)）。
 5. 仅当那些 headless 宿主进入范围时，再做平台沙箱与 PTY/LSP。
 6. 仅在上面的 headless spine 差距关闭之后，才让 Rust 做现有 TypeScript Web 客户端的宿主。
 
@@ -334,7 +334,7 @@
 
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
-| `session-query` | thinner | 精确读取、最新优先列表与谱系追踪；默认禁用搜索 | P1（FTS） |
+| `session-query` | thinner | 精确读取、最新优先列表、谱系、表面追踪与过滤；默认禁用搜索 | P1（FTS） |
 | `session-query-sqlite` | thinner | FTS schema 1；`openAt: never` | P1 |
 | `session-log-export` | absent | ZIP 导出命令 | P3 |
 | `tool-session-query` | absent | 模型搜索/读取工具 | P3 |

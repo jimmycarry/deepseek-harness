@@ -15,8 +15,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod repair;
+mod surface;
 
 pub use repair::{interrupted_turn_closers, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN};
+pub use surface::{fold_surface, SurfaceFoldReplacement, SurfaceFoldResult};
 
 /// Firehose invoked after a store-backed append commits.
 pub type SessionEventSink = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
@@ -777,6 +779,9 @@ pub enum SessionError {
     /// Replace cited a seq that is not on the current surface.
     #[error("replace range is not on the current surface")]
     InvalidReplace,
+    /// A detached log violated surface eligibility, provenance, or rewrite rules.
+    #[error("{0}")]
+    InvalidSurface(String),
     /// Required-on-read event type this build does not know.
     #[error("unknown required-on-read event type `{0}`")]
     UnknownRequiredEvent(String),

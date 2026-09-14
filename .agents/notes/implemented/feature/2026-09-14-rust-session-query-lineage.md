@@ -18,7 +18,7 @@ Returned records are `{header, live, persisted}`. Titles stay on `read_title` / 
 
 `trace_session` consumes that same listing. Ancestors walk from the immediate parent outward. A target-connected cycle fails with `SESSION_QUERY_INVALID_LINEAGE` and `session lineage contains a cycle at "{id}"`. A missing parent returns `SessionLineageTrace::Incomplete` with `unresolved_parent_id`. A complete chain returns `SessionLineageTrace::Complete` whose `root` is the outermost ancestor, or the target when it has no parent. Descendants are built with an explicit stack so a deep child chain does not recurse. Direct children sort by `createdAt` ascending, then `id`. A missing target fails with `session "{id}" not found` / `SESSION_QUERY_SESSION_NOT_FOUND`.
 
-`read_session`, `read_event`, `read_title`, and disabled search stay as they were. `openAt` stays `never`. SQLite FTS stays schema 1. `filterSessions`, `listEvents`, `readSurface`, and `traceEvent` stay thinner. `dsh-agent-loop` is unchanged. `SESSION_FORMAT_VERSION` stays `0`.
+`read_session`, `read_event`, `read_title`, and disabled search stay as they were. `openAt` stays `never`. SQLite FTS stays schema 1. `filterSessions`, `listEvents`, `readSurface`, and `traceEvent` are closed in [the surface alignment Agent Note](2026-09-14-rust-session-query-surface.md). `dsh-agent-loop` is unchanged. `SESSION_FORMAT_VERSION` stays `0`.
 
 [The TypeScript tracing decision](2026-07-13-session-query-tracing.md) still owns relationship semantics. [The port Agent Note](../architecture/2026-08-22-rust-harness-port.md) still owns the 1:1 rule. TypeScript remains the behavior source.
 
@@ -38,4 +38,4 @@ Returned records are `{header, live, persisted}`. Titles stay on `read_title` / 
 
 ## Consequences
 
-Shipped profiles can list sessions newest-first and recover parent/child trees without opening FTS. A mounted persistence outage still fails list and lineage even when the target is live, matching TypeScript cross-corpus semantics. Exact event-surface traces, filters, and FTS remain thinner and stay on [the remaining-work ranking](../../proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.md).
+Shipped profiles can list sessions newest-first and recover parent/child trees without opening FTS. A mounted persistence outage still fails list and lineage even when the target is live, matching TypeScript cross-corpus semantics. Exact event-surface traces and filters are closed in [the surface alignment Agent Note](2026-09-14-rust-session-query-surface.md). FTS remains thinner and stays on [the remaining-work ranking](../../proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.md).

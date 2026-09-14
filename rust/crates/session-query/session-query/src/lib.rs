@@ -1,8 +1,13 @@
-//! Combined session-history reads, traces, and full-text search (`ctx.sessionQuery`).
+//! Combined session-history reads, traces, filters, and full-text search (`ctx.sessionQuery`).
 //!
-//! Exact reads, titles, newest-first listing, and lineage traces are
-//! backend-independent. A search backend implements `search_sessions` /
-//! `search_events` on the same service.
+//! Exact reads, titles, newest-first listing, lineage traces, surface traces,
+//! and provider-independent filters are backend-independent. A search backend
+//! implements `search_sessions` / `search_events` on the same service.
+
+mod documents;
+mod extraction;
+mod filters;
+mod tracing;
 
 use async_trait::async_trait;
 use dsh_cordis::Service;
@@ -14,6 +19,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
+
+pub use documents::{
+    build_session_event_records, build_session_event_search_documents, SessionEventSearchDocument,
+};
+pub use extraction::extract_session_event_text;
+pub use filters::{
+    compile_session_text_filter, filter_session_event_documents, filter_session_results,
+    materialize_session_event_result_filters, materialize_session_result_filters,
+    unknown_filter_kind, SessionEventResultFilter, SessionResultFilter, SessionTextFilter,
+};
+pub use tracing::{current_surface_events, event_records, trace_event};
 
 /// Default maximum `before`/`after` raw-event window.
 pub const SESSION_QUERY_READ_WINDOW_MAX: usize = 50;
@@ -35,6 +51,10 @@ pub enum SessionQueryErrorCode {
     SourceConflict,
     /// A parent chain connected to the target contains a cycle.
     InvalidLineage,
+    /// A loaded log failed the canonical surface fold.
+    InvalidSurface,
+    /// A filter clause failed validation.
+    InvalidFilter,
 }
 
 /// Typed session-query failure.
@@ -66,6 +86,8 @@ impl SessionQueryError {
             SessionQueryErrorCode::PersistenceFailed => "SESSION_QUERY_PERSISTENCE_FAILED",
             SessionQueryErrorCode::SourceConflict => "SESSION_QUERY_SOURCE_CONFLICT",
             SessionQueryErrorCode::InvalidLineage => "SESSION_QUERY_INVALID_LINEAGE",
+            SessionQueryErrorCode::InvalidSurface => "SESSION_QUERY_INVALID_SURFACE",
+            SessionQueryErrorCode::InvalidFilter => "SESSION_QUERY_INVALID_FILTER",
         }
     }
 }
@@ -79,6 +101,99 @@ pub struct SessionRecord {
     pub live: bool,
     /// Whether the active persistence backend currently materializes the id.
     pub persisted: bool,
+}
+
+/// Source availability predicates understood by logical-session filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionAvailability {
+    /// The id currently exists in `ctx.sessions`.
+    Live,
+    /// The active persistence backend currently materializes the id.
+    Persisted,
+}
+
+/// Whether an event is current model context, replaced context, or raw-log-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionEventSurface {
+    /// Present on the folded current surface.
+    Current,
+    /// Removed from the surface by a later replacement.
+    Shadowed,
+    /// Never a surface node.
+    #[serde(rename = "log-only")]
+    LogOnly,
+}
+
+/// Inclusive numeric interval used by time and sequence filters.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SessionResultRange {
+    /// Inclusive lower bound.
+    pub from: Option<f64>,
+    /// Inclusive upper bound.
+    pub to: Option<f64>,
+}
+
+/// Detached source selected for one exact read.
+#[derive(Debug, Clone)]
+pub struct LogicalSession {
+    /// Cloned source header.
+    pub header: SessionHeader,
+    /// Cloned raw event log.
+    pub events: Vec<SessionEvent>,
+}
+
+/// One atomic live-preferred observation of a session's current model surface.
+#[derive(Debug, Clone)]
+pub struct SessionSurfaceSnapshot {
+    /// Cloned session header selected from the same corpus observation as `events`.
+    pub session: SessionHeader,
+    /// Highest raw-log seq included in the observation, or `None` for an empty log.
+    pub captured_through_seq: Option<u64>,
+    /// Cloned current surface events in model-history order.
+    pub events: Vec<SessionEvent>,
+}
+
+/// Lightweight metadata for one event within a logical session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionEventRecord {
+    /// Session that owns the event.
+    pub session_id: SessionId,
+    /// Monotonic event seq within the session.
+    pub seq: u64,
+    /// Discriminant of the session event.
+    pub type_name: String,
+    /// Event timestamp in Unix epoch milliseconds.
+    pub time: u64,
+    /// Event placement in the folded session surface.
+    pub surface: SessionEventSurface,
+}
+
+/// Direct surface replacements and relationships to cited source events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionEventTrace {
+    /// Lightweight target record.
+    pub target: SessionEventRecord,
+    /// Immediate positional replacement event, when the target was shadowed.
+    pub replaced_by: Option<u64>,
+    /// Positional replacers from the immediate replacement to the final replacement.
+    pub replacement_chain: Vec<u64>,
+    /// Surface nodes directly removed when the target itself performed a replacement.
+    pub replaced_event_seqs: Vec<u64>,
+    /// Earlier events cited directly as sources, in their recorded order.
+    pub source_event_seqs: Vec<u64>,
+    /// Later events that directly cite the target as a source, in log order.
+    pub derived_event_seqs: Vec<u64>,
+}
+
+/// Event relationships bound to the same session-header observation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionEventTraceObservation {
+    /// Cloned header selected with the event log used for the trace.
+    pub session: SessionHeader,
+    /// Direct surface replacements and cited source-event links.
+    pub trace: SessionEventTrace,
 }
 
 /// Complete detached session log.
@@ -370,6 +485,79 @@ impl SessionQueryEngine {
         trace_session(&records, id)
     }
 
+    /// Filter the complete logical corpus with provider-independent predicates.
+    ///
+    /// @param filters - ANDed session metadata and availability clauses.
+    /// @returns matching cloned records in deterministic newest-first order.
+    pub async fn filter_sessions(
+        &self,
+        filters: &[SessionResultFilter],
+    ) -> Result<Vec<SessionRecord>, SessionQueryError> {
+        let filters = materialize_session_result_filters(filters)?;
+        filter_session_results(&self.observe_corpus().await?, &filters)
+    }
+
+    /// List lightweight raw-log event records for one logical session.
+    ///
+    /// @param id - live-preferred session id to read.
+    /// @returns event records in ascending seq order.
+    pub async fn list_events(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<SessionEventRecord>, SessionQueryError> {
+        let loaded = self.load_logical(id).await?;
+        crate::event_records(id, &loaded.events)
+    }
+
+    /// Scan first-party semantic event documents with provider-independent filters.
+    ///
+    /// @param id - live-preferred session id to scan.
+    /// @param filters - ANDed metadata and literal-text predicates.
+    /// @returns matching semantic documents in ascending seq order.
+    pub async fn filter_events(
+        &self,
+        id: &SessionId,
+        filters: &[SessionEventResultFilter],
+    ) -> Result<Vec<SessionEventSearchDocument>, SessionQueryError> {
+        let filters = materialize_session_event_result_filters(filters)?;
+        let loaded = self.load_logical(id).await?;
+        let documents = build_session_event_search_documents(id, &loaded.events)?;
+        filter_session_event_documents(&documents, &filters)
+    }
+
+    /// Read one session's complete current model surface from one corpus observation.
+    ///
+    /// @param id - live-preferred session id to read.
+    /// @returns cloned header, current surface, and the last sequence number included in the raw-log capture.
+    pub async fn read_surface(
+        &self,
+        id: &SessionId,
+    ) -> Result<SessionSurfaceSnapshot, SessionQueryError> {
+        let loaded = self.load_logical(id).await?;
+        Ok(SessionSurfaceSnapshot {
+            session: loaded.header,
+            captured_through_seq: loaded.events.last().map(|event| event.seq),
+            events: crate::current_surface_events(id, &loaded.events)?,
+        })
+    }
+
+    /// Trace one event's direct positional replacements and cited source events.
+    ///
+    /// @param id - target session id.
+    /// @param seq - target event seq.
+    /// @returns source header, direct links, and the target's positional replacement chain.
+    pub async fn trace_event(
+        &self,
+        id: &SessionId,
+        seq: u64,
+    ) -> Result<SessionEventTraceObservation, SessionQueryError> {
+        let loaded = self.load_logical(id).await?;
+        Ok(SessionEventTraceObservation {
+            session: loaded.header,
+            trace: crate::tracing::trace_event(id, &loaded.events, seq)?,
+        })
+    }
+
     /// Search the live-preferred logical corpus.
     ///
     /// @param query - trimmed literal phrase.
@@ -395,12 +583,7 @@ impl SessionQueryEngine {
     async fn observe_corpus(&self) -> Result<Vec<SessionRecord>, SessionQueryError> {
         let mut records = HashMap::new();
         if let Some(persistence) = &self.persistence {
-            let headers = persistence.list_headers().await.map_err(|error| {
-                SessionQueryError::new(
-                    format!("session persistence listing failed: {error}"),
-                    SessionQueryErrorCode::PersistenceFailed,
-                )
-            })?;
+            let headers = persistence.list_headers().await.map_err(listing_failed)?;
             for header in headers {
                 records.insert(
                     header.id.as_str().to_string(),
@@ -442,10 +625,35 @@ impl SessionQueryEngine {
                 SessionQueryError::new(error.to_string(), SessionQueryErrorCode::SessionNotFound)
             });
         }
-        Err(SessionQueryError::new(
-            format!("session \"{}\" not found", id.as_str()),
-            SessionQueryErrorCode::SessionNotFound,
-        ))
+        Err(not_found(id))
+    }
+
+    async fn load_logical(&self, id: &SessionId) -> Result<LogicalSession, SessionQueryError> {
+        if let Some(live) = self.sessions.get(id) {
+            return Ok(snapshot_live(&live));
+        }
+        let Some(persistence) = &self.persistence else {
+            return Err(not_found(id));
+        };
+        let listed = persistence.list_headers().await.map_err(listing_failed)?;
+        let listed = listed
+            .into_iter()
+            .find(|header| header.id.as_str() == id.as_str())
+            .ok_or_else(|| not_found(id))?;
+        let loaded = persistence.inspect(id).await.map_err(|error| {
+            SessionQueryError::new(
+                format!("failed to inspect session \"{}\": {error}", id.as_str()),
+                SessionQueryErrorCode::PersistenceFailed,
+            )
+        })?;
+        if let Some(live) = self.sessions.get(id) {
+            return Ok(snapshot_live(&live));
+        }
+        assert_session_headers_compatible(&loaded.meta, &listed)?;
+        Ok(LogicalSession {
+            header: loaded.meta,
+            events: loaded.events,
+        })
     }
 
     fn read_window(&self, name: &str, value: Option<usize>) -> Result<usize, SessionQueryError> {
@@ -476,6 +684,27 @@ pub fn disabled_engine(sessions: Arc<SessionStore>) -> SessionQueryEngine {
         None,
         SESSION_QUERY_READ_WINDOW_MAX,
         Arc::new(DisabledSearch),
+    )
+}
+
+fn snapshot_live(session: &Session) -> LogicalSession {
+    LogicalSession {
+        header: session.header().clone(),
+        events: session.events(),
+    }
+}
+
+fn listing_failed(error: impl std::fmt::Display) -> SessionQueryError {
+    SessionQueryError::new(
+        format!("session persistence listing failed: {error}"),
+        SessionQueryErrorCode::PersistenceFailed,
+    )
+}
+
+fn not_found(id: &SessionId) -> SessionQueryError {
+    SessionQueryError::new(
+        format!("session \"{}\" not found", id.as_str()),
+        SessionQueryErrorCode::SessionNotFound,
     )
 }
 
@@ -641,46 +870,87 @@ fn build_descendants(records: &[SessionRecord], session_id: &SessionId) -> Vec<S
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use dsh_session::{session_id, SessionEventData, SESSION_FORMAT_VERSION};
-    use dsh_session_persistence::{PersistenceError, PersistenceRuntime, SessionStoreBackend};
+    use dsh_llm::{AssistantMessage, ContentBlock, StreamChunk, UserMessage};
+    use dsh_session::{
+        session_id, SessionEvent, SessionEventData, SurfaceOp, SESSION_FORMAT_VERSION,
+    };
+    use dsh_session_persistence::{
+        PersistenceError, PersistenceRuntime, SessionInspection, SessionStoreBackend,
+    };
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    struct MemoryEntry {
+        header: SessionHeader,
+        events: Vec<SessionEvent>,
+    }
+
     #[derive(Default)]
     struct MemoryBackend {
-        headers: Mutex<HashMap<String, SessionHeader>>,
+        entries: Mutex<HashMap<String, MemoryEntry>>,
         list_error: Mutex<Option<String>>,
+        inspect_error: Mutex<Option<String>>,
+        inspect_meta: Mutex<Option<SessionHeader>>,
     }
 
     impl MemoryBackend {
         fn insert(&self, header: SessionHeader) {
-            self.headers
-                .lock()
-                .expect("memory headers")
-                .insert(header.id.as_str().to_string(), header);
+            self.insert_raw(header, Vec::new());
+        }
+
+        fn insert_raw(&self, header: SessionHeader, events: Vec<SessionEvent>) {
+            self.entries.lock().expect("memory entries").insert(
+                header.id.as_str().to_string(),
+                MemoryEntry { header, events },
+            );
         }
 
         fn fail_list(&self, message: impl Into<String>) {
             *self.list_error.lock().expect("list error") = Some(message.into());
+        }
+
+        fn fail_inspect(&self, message: impl Into<String>) {
+            *self.inspect_error.lock().expect("inspect error") = Some(message.into());
+        }
+
+        fn patch_inspect_meta(&self, header: SessionHeader) {
+            *self.inspect_meta.lock().expect("inspect meta") = Some(header);
         }
     }
 
     #[async_trait]
     impl SessionStoreBackend for MemoryBackend {
         async fn save(&self, session: &Session) -> Result<(), PersistenceError> {
-            self.insert(session.header().clone());
+            self.insert_raw(session.header().clone(), session.events());
             Ok(())
         }
 
         async fn load(&self, id: &SessionId) -> Result<Session, PersistenceError> {
-            let header = self
-                .headers
-                .lock()
-                .expect("memory headers")
+            let inspection = self.inspect(id).await?;
+            if inspection.events.is_empty() {
+                return Ok(Session::with_header(inspection.meta));
+            }
+            inspection.into_session()
+        }
+
+        async fn inspect(&self, id: &SessionId) -> Result<SessionInspection, PersistenceError> {
+            if let Some(message) = self.inspect_error.lock().expect("inspect error").clone() {
+                return Err(PersistenceError::Format(message));
+            }
+            let entries = self.entries.lock().expect("memory entries");
+            let entry = entries
                 .get(id.as_str())
-                .cloned()
                 .ok_or_else(|| PersistenceError::NotFound(id.as_str().to_string()))?;
-            Ok(Session::with_header(header))
+            let mut meta = entry.header.clone();
+            if let Some(patch) = self.inspect_meta.lock().expect("inspect meta").clone() {
+                if patch.id.as_str() == id.as_str() {
+                    meta = patch;
+                }
+            }
+            Ok(SessionInspection {
+                meta,
+                events: entry.events.clone(),
+            })
         }
 
         async fn list_ids(&self) -> Result<Vec<SessionId>, PersistenceError> {
@@ -688,9 +958,9 @@ mod tests {
                 return Err(PersistenceError::Format(message));
             }
             Ok(self
-                .headers
+                .entries
                 .lock()
-                .expect("memory headers")
+                .expect("memory entries")
                 .keys()
                 .map(|id| session_id(id.clone()))
                 .collect())
@@ -701,11 +971,11 @@ mod tests {
                 return Err(PersistenceError::Format(message));
             }
             Ok(self
-                .headers
+                .entries
                 .lock()
-                .expect("memory headers")
+                .expect("memory entries")
                 .values()
-                .cloned()
+                .map(|entry| entry.header.clone())
                 .collect())
         }
     }
@@ -733,6 +1003,90 @@ mod tests {
             SESSION_QUERY_READ_WINDOW_MAX,
             Arc::new(DisabledSearch),
         )
+    }
+
+    fn raw_user(seq: u64, sources: Option<Vec<u64>>) -> SessionEvent {
+        SessionEvent {
+            seq,
+            time: seq + 1,
+            data: SessionEventData::UserMessage(UserMessage::text(format!("event {seq}"))),
+            source_event_seqs: sources,
+            surface_op: Some(SurfaceOp::Append),
+            ignorable: false,
+        }
+    }
+
+    fn append_trace_events(session: &Session) {
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        session
+            .append(SessionEventData::StepStart { turn: 1, step: 1 }, None)
+            .unwrap();
+        session
+            .append(
+                SessionEventData::AssistantChunk {
+                    turn: 1,
+                    step: 1,
+                    chunk: StreamChunk::TextDelta {
+                        index: 0,
+                        text: "draft".into(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        session
+            .append_cited(
+                SessionEventData::UserMessage(UserMessage::text("original")),
+                SurfaceOp::Append,
+                vec![2],
+            )
+            .unwrap();
+        session
+            .append_cited(
+                SessionEventData::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    message: AssistantMessage::model(
+                        vec![ContentBlock::text("summary one")],
+                        "mock",
+                        "mock",
+                    ),
+                    usage: None,
+                },
+                SurfaceOp::Replace { start: 3, end: 3 },
+                vec![3, 2],
+            )
+            .unwrap();
+        session
+            .append(
+                SessionEventData::UserMessage(UserMessage::notice("test", "context", "context")),
+                Some(SurfaceOp::Append),
+            )
+            .unwrap();
+        session
+            .append(SessionEventData::StepEnd { turn: 1, step: 1 }, None)
+            .unwrap();
+        session
+            .append(SessionEventData::StepStart { turn: 1, step: 2 }, None)
+            .unwrap();
+        session
+            .append_cited(
+                SessionEventData::AssistantMessage {
+                    turn: 1,
+                    step: 2,
+                    message: AssistantMessage::model(
+                        vec![ContentBlock::text("summary two")],
+                        "mock",
+                        "mock",
+                    ),
+                    usage: None,
+                },
+                SurfaceOp::Replace { start: 4, end: 4 },
+                vec![2, 4],
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1052,5 +1406,445 @@ mod tests {
             node = current.descendants.first();
         }
         assert!(node.is_none());
+    }
+
+    #[tokio::test]
+    async fn classifies_current_shadowed_and_log_only_events() {
+        let store = Arc::new(SessionStore::new());
+        let session = store.publish(Session::with_header(header("surface", 1, None, None)));
+        session
+            .append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        session
+            .append(SessionEventData::StepStart { turn: 1, step: 1 }, None)
+            .unwrap();
+        let first = session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text("first")),
+                Some(SurfaceOp::Append),
+            )
+            .unwrap();
+        session
+            .append(
+                SessionEventData::AssistantChunk {
+                    turn: 1,
+                    step: 1,
+                    chunk: StreamChunk::TextDelta {
+                        index: 0,
+                        text: "draft".into(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        session
+            .append_cited(
+                SessionEventData::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    message: AssistantMessage::model(
+                        vec![ContentBlock::text("replacement")],
+                        "mock",
+                        "mock",
+                    ),
+                    usage: None,
+                },
+                SurfaceOp::Replace {
+                    start: first.seq,
+                    end: first.seq,
+                },
+                vec![first.seq],
+            )
+            .unwrap();
+        let records = disabled_engine(store)
+            .list_events(&session_id("surface"))
+            .await
+            .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .skip(2)
+                .map(|record| record.surface)
+                .collect::<Vec<_>>(),
+            vec![
+                SessionEventSurface::Shadowed,
+                SessionEventSurface::LogOnly,
+                SessionEventSurface::Current,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_current_surface_and_empty_capture_boundary() {
+        let store = Arc::new(SessionStore::new());
+        let session = store.publish(Session::with_header(header(
+            "surface-snapshot",
+            1,
+            None,
+            Some("/work"),
+        )));
+        let first = session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text("old")),
+                Some(SurfaceOp::Append),
+            )
+            .unwrap();
+        session
+            .append(
+                SessionEventData::AssistantChunk {
+                    turn: 1,
+                    step: 1,
+                    chunk: StreamChunk::TextDelta {
+                        index: 0,
+                        text: "draft".into(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        session
+            .append_cited(
+                SessionEventData::UserMessage(UserMessage::notice(
+                    "compact",
+                    "checkpoint",
+                    "checkpoint",
+                )),
+                SurfaceOp::Replace {
+                    start: first.seq,
+                    end: first.seq,
+                },
+                vec![first.seq],
+            )
+            .unwrap();
+        let retained = session
+            .append(
+                SessionEventData::UserMessage(UserMessage::text("retained tail")),
+                Some(SurfaceOp::Append),
+            )
+            .unwrap();
+        session
+            .append_cited(
+                SessionEventData::UserMessage(UserMessage::notice(
+                    "compact",
+                    "latest checkpoint",
+                    "latest checkpoint",
+                )),
+                SurfaceOp::Replace {
+                    start: 2,
+                    end: retained.seq,
+                },
+                vec![2, retained.seq],
+            )
+            .unwrap();
+        session
+            .append(
+                SessionEventData::AssistantMessage {
+                    turn: 2,
+                    step: 1,
+                    message: AssistantMessage::model(
+                        vec![ContentBlock::text("latest answer")],
+                        "mock",
+                        "mock",
+                    ),
+                    usage: None,
+                },
+                Some(SurfaceOp::Append),
+            )
+            .unwrap();
+        let engine = disabled_engine(Arc::clone(&store));
+        let snapshot = engine
+            .read_surface(&session_id("surface-snapshot"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.session.cwd.as_deref(), Some("/work"));
+        assert_eq!(snapshot.captured_through_seq, Some(5));
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+
+        let empty = store.publish(Session::with_header(header("empty-surface", 2, None, None)));
+        let empty_snapshot = engine.read_surface(empty.id()).await.unwrap();
+        assert_eq!(empty_snapshot.captured_through_seq, None);
+        assert!(empty_snapshot.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn traces_replacement_chain_and_cited_sources() {
+        let store = Arc::new(SessionStore::new());
+        let session = store.publish(Session::with_header(header("trace", 1, None, None)));
+        append_trace_events(&session);
+        let engine = disabled_engine(store);
+
+        let original = engine.trace_event(&session_id("trace"), 3).await.unwrap();
+        assert_eq!(original.trace.target.seq, 3);
+        assert_eq!(original.trace.target.surface, SessionEventSurface::Shadowed);
+        assert_eq!(original.trace.replaced_by, Some(4));
+        assert_eq!(original.trace.replacement_chain, vec![4, 8]);
+        assert!(original.trace.replaced_event_seqs.is_empty());
+        assert_eq!(original.trace.source_event_seqs, vec![2]);
+        assert_eq!(original.trace.derived_event_seqs, vec![4]);
+
+        let mid = engine.trace_event(&session_id("trace"), 4).await.unwrap();
+        assert_eq!(mid.trace.replaced_by, Some(8));
+        assert_eq!(mid.trace.replacement_chain, vec![8]);
+        assert_eq!(mid.trace.replaced_event_seqs, vec![3]);
+        assert_eq!(mid.trace.source_event_seqs, vec![3, 2]);
+        assert_eq!(mid.trace.derived_event_seqs, vec![8]);
+
+        let chunk = engine.trace_event(&session_id("trace"), 2).await.unwrap();
+        assert_eq!(chunk.trace.target.surface, SessionEventSurface::LogOnly);
+        assert!(chunk.trace.replacement_chain.is_empty());
+        assert!(chunk.trace.source_event_seqs.is_empty());
+        assert_eq!(chunk.trace.derived_event_seqs, vec![3, 4, 8]);
+
+        let latest = engine.trace_event(&session_id("trace"), 8).await.unwrap();
+        assert!(latest.trace.replacement_chain.is_empty());
+        assert_eq!(latest.trace.replaced_event_seqs, vec![4]);
+        assert_eq!(latest.trace.source_event_seqs, vec![2, 4]);
+        assert!(latest.trace.derived_event_seqs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_logical_prefers_live_and_preserves_list_inspect_failures() {
+        let durable = header("shared", 1, None, Some("/same"));
+        let backend = Arc::new(MemoryBackend::default());
+        backend.insert_raw(durable.clone(), vec![raw_user(0, None)]);
+        let persistence = Arc::new(PersistenceRuntime::new(
+            Arc::clone(&backend) as Arc<dyn SessionStoreBackend>
+        ));
+        let store = Arc::new(SessionStore::new());
+        let engine = engine_with(Arc::clone(&store), Some(Arc::clone(&persistence)));
+
+        let persisted = engine.trace_event(&session_id("shared"), 0).await.unwrap();
+        assert_eq!(persisted.trace.target.surface, SessionEventSurface::Current);
+
+        let live = store.publish(Session::with_header(durable.clone()));
+        live.append(SessionEventData::TurnStart { turn: 1 }, None)
+            .unwrap();
+        live.append(
+            SessionEventData::UserMessage(UserMessage::notice("test", "live", "live")),
+            Some(SurfaceOp::Append),
+        )
+        .unwrap();
+        backend.fail_list("list unavailable");
+        backend.fail_inspect("inspect unavailable");
+        let live_trace = engine.trace_event(&session_id("shared"), 1).await.unwrap();
+        assert_eq!(live_trace.trace.target.type_name, "user/message");
+
+        let failed_store = Arc::new(SessionStore::new());
+        let failed_backend = Arc::new(MemoryBackend::default());
+        failed_backend.insert_raw(durable.clone(), vec![raw_user(0, None)]);
+        let failed_engine = engine_with(
+            failed_store,
+            Some(Arc::new(PersistenceRuntime::new(
+                Arc::clone(&failed_backend) as Arc<dyn SessionStoreBackend>,
+            ))),
+        );
+        failed_backend.fail_list("list unavailable");
+        let list_error = failed_engine
+            .trace_event(&session_id("shared"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(list_error.code, SessionQueryErrorCode::PersistenceFailed);
+        assert_eq!(
+            list_error.message,
+            "session persistence listing failed: list unavailable"
+        );
+        *failed_backend.list_error.lock().expect("list error") = None;
+        failed_backend.fail_inspect("inspect unavailable");
+        let inspect_error = failed_engine
+            .trace_event(&session_id("shared"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(inspect_error.code, SessionQueryErrorCode::PersistenceFailed);
+        assert_eq!(
+            inspect_error.message,
+            "failed to inspect session \"shared\": inspect unavailable"
+        );
+        *failed_backend.inspect_error.lock().expect("inspect error") = None;
+        let mut changed = durable.clone();
+        changed.cwd = Some("/changed".into());
+        failed_backend.patch_inspect_meta(changed);
+        let conflict = failed_engine
+            .trace_event(&session_id("shared"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, SessionQueryErrorCode::SourceConflict);
+    }
+
+    #[tokio::test]
+    async fn checks_target_existence_before_surface_analysis() {
+        let backend = Arc::new(MemoryBackend::default());
+        backend.insert_raw(
+            header("bad-target", 1, None, None),
+            vec![
+                raw_user(0, None),
+                SessionEvent {
+                    seq: 1,
+                    time: 2,
+                    data: SessionEventData::AssistantMessage {
+                        turn: 1,
+                        step: 1,
+                        message: AssistantMessage::model(vec![], "mock", "mock"),
+                        usage: None,
+                    },
+                    source_event_seqs: Some(vec![]),
+                    surface_op: Some(SurfaceOp::Replace { start: 9, end: 9 }),
+                    ignorable: false,
+                },
+            ],
+        );
+        let engine = engine_with(
+            Arc::new(SessionStore::new()),
+            Some(Arc::new(PersistenceRuntime::new(
+                backend as Arc<dyn SessionStoreBackend>,
+            ))),
+        );
+        let missing = engine
+            .trace_event(&session_id("bad-target"), 9)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, SessionQueryErrorCode::EventNotFound);
+        assert_eq!(
+            missing.message,
+            "session \"bad-target\" has no event at seq 9"
+        );
+        let invalid = engine
+            .trace_event(&session_id("bad-target"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, SessionQueryErrorCode::InvalidSurface);
+        assert!(invalid.message.starts_with("invalid session surface:"));
+        assert_eq!(invalid.code_str(), "SESSION_QUERY_INVALID_SURFACE");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_persisted_surfaces_on_list_and_trace() {
+        let cases: Vec<(&str, Vec<SessionEvent>)> = vec![
+            (
+                "non-surface sources",
+                vec![SessionEvent {
+                    seq: 0,
+                    time: 1,
+                    data: SessionEventData::TurnStart { turn: 1 },
+                    source_event_seqs: Some(vec![0]),
+                    surface_op: None,
+                    ignorable: false,
+                }],
+            ),
+            ("empty sources", vec![raw_user(0, Some(vec![]))]),
+            (
+                "duplicate sources",
+                vec![raw_user(0, None), raw_user(1, Some(vec![0, 0]))],
+            ),
+            (
+                "future source",
+                vec![raw_user(0, Some(vec![1])), raw_user(1, None)],
+            ),
+            (
+                "replacement without sources",
+                vec![
+                    raw_user(0, None),
+                    SessionEvent {
+                        seq: 1,
+                        time: 2,
+                        data: SessionEventData::UserMessage(UserMessage::text("next")),
+                        source_event_seqs: None,
+                        surface_op: Some(SurfaceOp::Replace { start: 0, end: 0 }),
+                        ignorable: false,
+                    },
+                ],
+            ),
+            (
+                "surfaceOp on non-surface",
+                vec![SessionEvent {
+                    seq: 0,
+                    time: 1,
+                    data: SessionEventData::TurnStart { turn: 1 },
+                    source_event_seqs: None,
+                    surface_op: Some(SurfaceOp::Append),
+                    ignorable: false,
+                }],
+            ),
+        ];
+        for (name, events) in cases {
+            let backend = Arc::new(MemoryBackend::default());
+            backend.insert_raw(header(name, 1, None, None), events);
+            let engine = engine_with(
+                Arc::new(SessionStore::new()),
+                Some(Arc::new(PersistenceRuntime::new(
+                    backend as Arc<dyn SessionStoreBackend>,
+                ))),
+            );
+            let id = session_id(name);
+            let traced = engine.trace_event(&id, 0).await.unwrap_err();
+            assert_eq!(traced.code, SessionQueryErrorCode::InvalidSurface, "{name}");
+            let listed = engine.list_events(&id).await.unwrap_err();
+            assert_eq!(listed.code, SessionQueryErrorCode::InvalidSurface, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn filters_sessions_and_events() {
+        let durable = header("durable-filter", 1, None, None);
+        let backend = Arc::new(MemoryBackend::default());
+        backend.insert_raw(durable.clone(), vec![raw_user(0, None)]);
+        let store = Arc::new(SessionStore::new());
+        let live = store.publish(Session::with_header(header("live-filter", 2, None, None)));
+        live.append(
+            SessionEventData::UserMessage(UserMessage::text("live")),
+            Some(SurfaceOp::Append),
+        )
+        .unwrap();
+        let engine = engine_with(
+            store,
+            Some(Arc::new(PersistenceRuntime::new(
+                backend as Arc<dyn SessionStoreBackend>,
+            ))),
+        );
+        let filtered = engine
+            .filter_sessions(&[SessionResultFilter::Id {
+                values: vec!["durable-filter".into()],
+            }])
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].header.id.as_str(), "durable-filter");
+        assert!(!filtered[0].live);
+        assert!(filtered[0].persisted);
+
+        let events = engine
+            .filter_events(
+                &session_id("live-filter"),
+                &[SessionEventResultFilter::Surface {
+                    values: vec![SessionEventSurface::Current],
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "live");
+        assert_eq!(events[0].surface, SessionEventSurface::Current);
+
+        let text = engine
+            .filter_events(
+                &session_id("live-filter"),
+                &[SessionEventResultFilter::Text {
+                    text: "live".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(text[0].seq, 0);
+
+        let unknown = unknown_filter_kind("future");
+        assert_eq!(unknown.code, SessionQueryErrorCode::InvalidFilter);
+        assert_eq!(unknown.code_str(), "SESSION_QUERY_INVALID_FILTER");
+        assert_eq!(unknown.message, "session unknown filter kind \"future\"");
     }
 }

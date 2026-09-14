@@ -63,7 +63,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 8. Wire `preparedSessionCacheSize` / `writeBatchMaxDelayMs` from plugin `install` Config — **closed** with P0-1 (`dsh-app-boot` / `PersistenceRuntime`).
 9. `readFrom` / suffix reads — **closed** with P0-1 (`PersistenceRuntime::read_from`).
 10. `session-projection-cache` (no crate).
-11. Session-query FTS (`openAt: never` in [`rust/crates/bundle/base/cordis.patch.yml`](../crates/bundle/base/cordis.patch.yml); SQLite FTS schema 1 vs TypeScript 8). Newest-first list, live/persisted bits, header conflict, and parent/child traces are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.md)).
+11. Session-query FTS (`openAt: never` in [`rust/crates/bundle/base/cordis.patch.yml`](../crates/bundle/base/cordis.patch.yml); SQLite FTS schema 1 vs TypeScript 8). Newest-first list, live/persisted bits, header conflict, and parent/child traces are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.md)). `readSurface` / `listEvents` / `traceEvent` / `filterSessions` / `filterEvents` are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-surface.md)).
 12. Enable `web-fetch-http` in profiles that need URL retrieval (crate exists; base `fetch: false`).
 13. Skill filesystem watch / poll-until-root — **closed** on interval polling of existing roots and missing-root ancestors (no Chokidar / `notify`); `write`/`edit` `fs/observed` remains the first-party fast path ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)).
 14. OTel seam flush hint (metrics stay skip).
@@ -108,7 +108,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 1. Persistence coordinator, DeepSeek SSE + image blocks, attachment normalization, settings Service Definition, and headless plan-review — **closed** (P0 items 1–6).
 2. Record the loop finish-chunk gap; do not change `dsh-agent-loop` here (P0 item 7, report only).
 3. DeepSeek Files API upload — **closed** (file ids, all-inline fallback, `files-v3.json` index, one stale-id retry; [Agent Note](../../.agents/notes/implemented/feature/2026-09-12-rust-deepseek-files-api.md)).
-4. Session-query FTS opt-in, web fetch enablement, OTel flush, external subagents. Skill watching is **closed** on the poll adapter ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)). Session-query exact list and lineage are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.md)). Skill incomplete last-good is **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.md)). SDK `Session.run` and descendant merge are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-sdk-session-run.md)).
+4. Session-query FTS opt-in, web fetch enablement, OTel flush, external subagents. Skill watching is **closed** on the poll adapter ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)). Session-query exact list and lineage are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.md)). Session-query surface traces and filters are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-surface.md)). Skill incomplete last-good is **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.md)). SDK `Session.run` and descendant merge are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-sdk-session-run.md)).
 5. Platform sandbox and PTY/LSP only when those headless hosts are in scope.
 6. Rust-as-host for the existing TypeScript Web client only after the headless spine gaps above are closed.
 
@@ -334,7 +334,7 @@ All three packages **absent** / **P4**.
 
 | Package | Status | Gap | Pri |
 |---|---|---|---|
-| `session-query` | thinner | Exact reads, newest-first list, and lineage traces; search disabled by default | P1 (FTS) |
+| `session-query` | thinner | Exact reads, newest-first list, lineage, surface traces, and filters; search disabled by default | P1 (FTS) |
 | `session-query-sqlite` | thinner | FTS schema 1; `openAt: never` | P1 |
 | `session-log-export` | absent | ZIP export command | P3 |
 | `tool-session-query` | absent | Model search/read tools | P3 |
