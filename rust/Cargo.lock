@@ -997,7 +997,9 @@ version = "0.1.1-rc.2"
 dependencies = [
  "dsh-sdk-protocol",
  "serde_json",
+ "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

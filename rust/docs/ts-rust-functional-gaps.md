@@ -67,7 +67,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 12. Enable `web-fetch-http` in profiles that need URL retrieval (crate exists; base `fetch: false`).
 13. Skill filesystem watch / poll-until-root — **closed** on interval polling of existing roots and missing-root ancestors (no Chokidar / `notify`); `write`/`edit` `fs/observed` remains the first-party fast path ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)).
 14. OTel seam flush hint (metrics stay skip).
-15. SDK client helpers (`Session.run`, descendant notification merge) versus the thin stdio wrapper.
+15. SDK client helpers (`Session.run`, descendant notification merge) versus the thin stdio wrapper — **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-sdk-session-run.md)). Request timeout and EOF→SIGTERM→SIGKILL dispose stay thinner.
 16. External subagent providers (ACP / Codex / Claude / `dsh-sdk`).
 17. `tool-ask-user` Consumer over the existing `user-questions` service.
 
@@ -312,7 +312,7 @@ All three packages **absent** / **P4**.
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `protocol` / `server` | aligned | stdio JSON-RPC identity `deepseek-harness-sdk-runtime` | — |
-| `client` | thinner | `initialize` / `prompt` / `shutdown` + notification drain; no `Session.run` helpers | P1 |
+| `client` | thinner | `Session.run` receipt-to-idle and descendant merge **closed**; request timeout and EOF→SIGTERM→SIGKILL dispose remain | remaining (dispose / timeout) |
 
 ### session
 

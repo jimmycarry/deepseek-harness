@@ -67,7 +67,7 @@
 12. 在需要取 URL 的 profile 里启用 `web-fetch-http`（crate 已在；base 为 `fetch: false`）。
 13. skill 文件系统监听 / 轮询到根出现 — 已在对已有根与缺失根祖先的间隔轮询上 **关闭**（无 Chokidar / `notify`）；`write`/`edit` 的 `fs/observed` 仍是第一方快路径（[Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。
 14. OTel seam 的 flush 提示（metrics 保持 skip）。
-15. SDK 客户端助手（`Session.run`、后代通知合并）对比瘦的 stdio 包装。
+15. SDK 客户端助手（`Session.run`、后代通知合并）对比瘦的 stdio 包装 — **已关闭**（[Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-sdk-session-run.zh.md)）。请求超时与 EOF→SIGTERM→SIGKILL 释放仍更薄。
 16. 外部子代理 provider（ACP / Codex / Claude / `dsh-sdk`）。
 17. 盖在现有 `user-questions` 服务上的 `tool-ask-user` Consumer。
 
@@ -312,7 +312,7 @@
 | 包 | 状态 | 差距 | 优先级 |
 |---|---|---|---|
 | `protocol` / `server` | aligned | stdio JSON-RPC 身份 `deepseek-harness-sdk-runtime` | — |
-| `client` | thinner | `initialize` / `prompt` / `shutdown` + 通知排空；无 `Session.run` 助手 | P1 |
+| `client` | thinner | `Session.run` 回执到 idle 与后代合并已 **关闭**；请求超时与 EOF→SIGTERM→SIGKILL 释放仍在 | remaining（释放 / 超时） |
 
 ### session
 

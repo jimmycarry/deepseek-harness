@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.md
-2026-09-03-ts-rust-functional-gap-priority.md: 83cba5d2c355fb8aec19b47f2f22dfabe4cb2549
-2026-09-03-ts-rust-functional-gap-priority.zh.md: 22f915b9639cae5cf09c90dd3387bc0ec5826f41
+2026-09-03-ts-rust-functional-gap-priority.md: 3592d588c1890ed56b33d669432bf96f7191358b
+2026-09-03-ts-rust-functional-gap-priority.zh.md: 0fcc5ceb6fea9271e0857f3202df80f8bb51374c
