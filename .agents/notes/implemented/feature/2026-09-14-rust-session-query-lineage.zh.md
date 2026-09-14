@@ -18,7 +18,7 @@ Headless、ACP 与 JSON-RPC 都会挂上 `openAt: never` 的 `ctx.sessionQuery`�
 
 `trace_session` 消费同一份列表。祖先从直接父级向外走。与目标相连的环以 `SESSION_QUERY_INVALID_LINEAGE` 失败，文句为 `session lineage contains a cycle at "{id}"`。缺失父级返回带 `unresolved_parent_id` 的 `SessionLineageTrace::Incomplete`。完整链返回 `SessionLineageTrace::Complete`，其 `root` 是最外层祖先，若无父级则是目标本身。后代用显式栈构建，深子链不会递归。直接子级按 `createdAt` 升序，再按 `id` 排序。缺失目标以 `session "{id}" not found` / `SESSION_QUERY_SESSION_NOT_FOUND` 失败。
 
-`read_session`、`read_event`、`read_title` 与禁用搜索保持原样。`openAt` 仍为 `never`。SQLite FTS 仍为 schema 1。`filterSessions`、`listEvents`、`readSurface` 与 `traceEvent` 仍更薄。`dsh-agent-loop` 不变。`SESSION_FORMAT_VERSION` 保持 `0`。
+`read_session`、`read_event`、`read_title` 与禁用搜索保持原样。`openAt` 仍为 `never`。SQLite FTS 仍为 schema 1。`filterSessions`、`listEvents`、`readSurface` 与 `traceEvent` 已在 [表面对齐 Agent Note](2026-09-14-rust-session-query-surface.zh.md) 关闭。`dsh-agent-loop` 不变。`SESSION_FORMAT_VERSION` 保持 `0`。
 
 [TypeScript 追踪决策](2026-07-13-session-query-tracing.zh.md) 仍然拥有关系语义。[移植 Agent Note](../architecture/2026-08-22-rust-harness-port.zh.md) 仍然拥有 1:1 规则。行为真源仍是 TypeScript。
 
@@ -38,4 +38,4 @@ Headless、ACP 与 JSON-RPC 都会挂上 `openAt: never` 的 `ctx.sessionQuery`�
 
 ## 后果
 
-已交付 profile 可以按最新优先列出会话并恢复父子树，而无需打开 FTS。已挂载的持久化中断仍会使列表与谱系失败，即使目标是实时会话，这也匹配 TypeScript 的跨语料语义。精确的事件表面追踪、过滤与 FTS 仍更薄，归属 [剩余工作排序](../../proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.zh.md)。
+已交付 profile 可以按最新优先列出会话并恢复父子树，而无需打开 FTS。已挂载的持久化中断仍会使列表与谱系失败，即使目标是实时会话，这也匹配 TypeScript 的跨语料语义。精确的事件表面追踪与过滤已在 [表面对齐 Agent Note](2026-09-14-rust-session-query-surface.zh.md) 关闭。FTS 仍更薄，归属 [剩余工作排序](../../proposed/architecture/2026-09-03-ts-rust-functional-gap-priority.zh.md)。
