@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use watch::WatchManager;
 
-pub use scan::{load_dir, scan};
+pub use scan::{load_dir, scan, SkillScan};
 
 const DEFAULT_WATCH_STABILITY_THRESHOLD_MS: u64 = 200;
 const DEFAULT_WATCH_POLL_INTERVAL_MS: u64 = 100;
@@ -286,7 +286,7 @@ pub fn name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scan::{is_potential_skill_path, parse_frontmatter, SkillRoot};
+    use scan::{apply_scan, is_potential_skill_path, parse_frontmatter, SkillRoot};
     use serde_json::json;
     use std::time::{Duration, Instant};
 
@@ -433,8 +433,9 @@ mod tests {
         let mut config = test_config(&project);
         config.agents_home = agents;
         let skills = scan(&config);
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "shared");
+        assert!(skills.complete);
+        assert_eq!(skills.skills.len(), 1);
+        assert_eq!(skills.skills[0].name, "shared");
         let _ = std::fs::remove_dir_all(project);
     }
 
@@ -448,7 +449,8 @@ mod tests {
         let mut config = test_config(&nested);
         config.project_root = nested;
         let skills = scan(&config);
-        assert_eq!(skills[0].name, "from-git");
+        assert!(skills.complete);
+        assert_eq!(skills.skills[0].name, "from-git");
         let _ = std::fs::remove_dir_all(project);
     }
 
@@ -789,5 +791,70 @@ mod tests {
             &root,
             Path::new("/home/.dsh/skills/.system/SKILL.md")
         ));
+    }
+
+    #[test]
+    fn missing_root_is_complete_empty() {
+        let project = scratch("missing-root");
+        let mut config = test_config(&project);
+        config.include_default_roots = false;
+        config.custom_skill_dirs = vec![project.join("absent").to_string_lossy().into_owned()];
+        let observation = scan(&config);
+        assert!(observation.complete);
+        assert!(observation.skills.is_empty());
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn unexpected_root_io_is_incomplete_and_keeps_last_good() {
+        let project = scratch("incomplete-root");
+        let agents = project.join(".unused-agents").join("skills");
+        write_bundle(&agents, "stable", "keep me", "body");
+        let blocked = project.join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let mut config = test_config(&project);
+        let skills = SkillRuntime::new();
+        let owned = Mutex::new(HashSet::new());
+        apply_scan(&skills, &config, &owned);
+        assert!(skills.snapshot().complete);
+        assert_eq!(skills.get("stable").unwrap().body, "body");
+
+        config.custom_skill_dirs = vec![blocked.to_string_lossy().into_owned()];
+        let observation = scan(&config);
+        assert!(!observation.complete);
+        apply_scan(&skills, &config, &owned);
+        let snapshot = skills.snapshot();
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.skills[0].name, "stable");
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn skill_file_that_is_a_directory_is_incomplete() {
+        let project = scratch("skill-md-dir");
+        let root = project.join(".unused-agents").join("skills");
+        std::fs::create_dir_all(root.join("broken").join("SKILL.md")).unwrap();
+        let config = test_config(&project);
+        let observation = scan(&config);
+        assert!(!observation.complete);
+        assert!(observation.skills.is_empty());
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn confirmed_removal_replaces_last_good() {
+        let project = scratch("removed-skill");
+        let agents = project.join(".unused-agents").join("skills");
+        write_bundle(&agents, "gone", "temp", "body");
+        let config = test_config(&project);
+        let skills = SkillRuntime::new();
+        let owned = Mutex::new(HashSet::new());
+        apply_scan(&skills, &config, &owned);
+        assert!(skills.get("gone").is_some());
+        let _ = std::fs::remove_dir_all(agents.join("gone"));
+        apply_scan(&skills, &config, &owned);
+        assert!(skills.snapshot().complete);
+        assert!(skills.get("gone").is_none());
+        let _ = std::fs::remove_dir_all(project);
     }
 }

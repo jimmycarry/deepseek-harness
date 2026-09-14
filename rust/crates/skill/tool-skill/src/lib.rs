@@ -173,6 +173,9 @@ pub fn install(ctx: &Context, config: Config) -> dsh_cordis::Result<()> {
         if agent_id.is_empty() {
             return payload;
         }
+        if !skills.is_complete() {
+            return payload;
+        }
         let entries: Vec<SkillCatalogEntry> = skills
             .catalog()
             .into_iter()
@@ -362,5 +365,29 @@ mod tests {
         assert_eq!(config.catalog_description_max_length, 500);
         assert_eq!(truncate_description("abcdef", 4), "abc…");
         assert_eq!(truncate_description("ab", 4), "ab");
+    }
+
+    #[test]
+    fn catalog_skips_publish_while_discovery_is_incomplete() {
+        let ctx = Context::new();
+        ctx.provide(Arc::new(ToolRuntime::new())).unwrap();
+        let skills = runtime_with(Skill::new("review", "do reviews", "body"));
+        ctx.provide(Arc::clone(&skills)).unwrap();
+        install(&ctx, Config::resolve(None).unwrap()).unwrap();
+        let payload = serde_json::json!({
+            "agentId": "a1",
+            "messages": [],
+            "turn": 1,
+        });
+        let first = ctx
+            .waterfall("agent/pre-step", payload.clone(), |payload| payload)
+            .unwrap();
+        assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+        skills.set_complete(false);
+        skills.register(Skill::new("extra", "another skill", "x"));
+        let second = ctx
+            .waterfall("agent/pre-step", payload, |payload| payload)
+            .unwrap();
+        assert_eq!(second["messages"].as_array().unwrap().len(), 0);
     }
 }

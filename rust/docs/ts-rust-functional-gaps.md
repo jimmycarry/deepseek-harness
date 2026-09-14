@@ -108,7 +108,7 @@ These Rust directories do not share the TypeScript folder name. They are not mis
 1. Persistence coordinator, DeepSeek SSE + image blocks, attachment normalization, settings Service Definition, and headless plan-review — **closed** (P0 items 1–6).
 2. Record the loop finish-chunk gap; do not change `dsh-agent-loop` here (P0 item 7, report only).
 3. DeepSeek Files API upload — **closed** (file ids, all-inline fallback, `files-v3.json` index, one stale-id retry; [Agent Note](../../.agents/notes/implemented/feature/2026-09-12-rust-deepseek-files-api.md)).
-4. Session-query FTS opt-in, web fetch enablement, OTel flush, SDK helpers, external subagents. Skill watching is **closed** on the poll adapter ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)). Session-query exact list and lineage are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.md)).
+4. Session-query FTS opt-in, web fetch enablement, OTel flush, SDK helpers, external subagents. Skill watching is **closed** on the poll adapter ([Agent Note](../../.agents/notes/implemented/feature/2026-09-13-rust-skill-filesystem-watch.md)). Session-query exact list and lineage are **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-session-query-lineage.md)). Skill incomplete last-good is **closed** ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.md)).
 5. Platform sandbox and PTY/LSP only when those headless hosts are in scope.
 6. Rust-as-host for the existing TypeScript Web client only after the headless spine gaps above are closed.
 
@@ -359,7 +359,7 @@ All three packages **absent** / **P4**.
 | Package | Status | Gap | Pri |
 |---|---|---|---|
 | `skill` / `tool-skill` | aligned | Catalog messages + `<skill_content>` | — |
-| `skill-filesystem` | aligned for watch | Interval poll of catalog-relevant roots and missing-root ancestors; `write`/`edit` `fs/observed` fast path; no Chokidar. Incomplete last-good catalog still thinner (flat `ctx.skills` has no completeness bit) | remaining (incomplete snapshot) |
+| `skill-filesystem` | aligned for watch and incomplete last-good | Interval poll of catalog-relevant roots and missing-root ancestors; `write`/`edit` `fs/observed` fast path; no Chokidar. Unexpected I/O keeps last-good and marks `ctx.skills` incomplete so `tool-skill` does not publish ([Agent Note](../../.agents/notes/implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.md)) | remaining (provider-scoped invalidate) |
 | `skill-badge` | no-op | Disabled in base | P3 |
 
 ### spill

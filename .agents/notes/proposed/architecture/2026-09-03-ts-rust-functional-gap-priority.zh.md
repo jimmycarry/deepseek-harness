@@ -23,7 +23,7 @@ P0 是已交付 headless / ACP / JSON-RPC profile 在 Linux 上的正确性。P1
 | 档 | 覆盖 | 首批条目 |
 |---|---|---|
 | P0 | 已交付 profile 在 Linux 上的正确性 | 第 1–6 项已关闭（persistence 协调器、DeepSeek SSE + 图像块、附件归一化、ACP 图像、settings Service Definition、headless plan 评审）。剩余：报告 loop 的 finish-chunk 差距 |
-| P1 | 这些 profile 上的耐久性与运维 | projection cache；session-query FTS；启用 `web-fetch-http`；OTel flush 提示；SDK 客户端助手；外部子代理 provider；`tool-ask-user`。skill 文件系统监视已在轮询适配器上关闭（[Agent Note](../../implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。session-query 精确列表与谱系已关闭（[Agent Note](../../implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)） |
+| P1 | 这些 profile 上的耐久性与运维 | projection cache；session-query FTS；启用 `web-fetch-http`；OTel flush 提示；SDK 客户端助手；外部子代理 provider；`tool-ask-user`。skill 文件系统监视已在轮询适配器上关闭（[Agent Note](../../implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md)）。session-query 精确列表与谱系已关闭（[Agent Note](../../implemented/feature/2026-09-14-rust-session-query-lineage.zh.md)）。skill 不完整 last-good 已关闭（[Agent Note](../../implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.zh.md)） |
 | P2 | 平台与相邻产品 | 现有 TypeScript SPA 的 Rust 宿主；Typert/API；Seatbelt / `CreateRestrictedToken`；PTY / LSP；JS workflow worker；`llm-pi-ai`；Exa / Perplexity；storage / workspace / presets；Code Mode |
 | P3 | 可选能力 | `schedule`；额外 context；持久 shell；额外 title / query / feedback 包；`skill-badge` |
 | P4 | 实验 / 云 / hook | e2b；agent-team；Claude Code / Codex hook；MCP；动态 Cordis |
@@ -57,4 +57,4 @@ crate 落地后清单会漂移。要在同一个 PR 里更新这些文件，否�
 
 读者仍可能把「缺 crate」当成「必须移植」。skip 表与 Web UI 否决必须留在 P0 列表旁边。
 
-ACP 图像仅在挂了附件与 vision 默认模型时广告为 `true`。DeepSeek Files API 上传已在已交付的 vision 路径上关闭；剩余的请求版本工作见 [Files 对齐 Agent Note](../../implemented/feature/2026-09-12-rust-deepseek-files-api.zh.md)。skill 文件系统监视已在 [监视对齐 Agent Note](../../implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md) 的轮询适配器上关闭。session-query 精确列表与谱系已在 [谱系对齐 Agent Note](../../implemented/feature/2026-09-14-rust-session-query-lineage.zh.md) 关闭。清单一并记录已关闭的 P0、Files 上传、skill 监视与 session-query 谱系行，避免后续改动把它们重新打开。
+ACP 图像仅在挂了附件与 vision 默认模型时广告为 `true`。DeepSeek Files API 上传已在已交付的 vision 路径上关闭；剩余的请求版本工作见 [Files 对齐 Agent Note](../../implemented/feature/2026-09-12-rust-deepseek-files-api.zh.md)。skill 文件系统监视已在 [监视对齐 Agent Note](../../implemented/feature/2026-09-13-rust-skill-filesystem-watch.zh.md) 的轮询适配器上关闭。session-query 精确列表与谱系已在 [谱系对齐 Agent Note](../../implemented/feature/2026-09-14-rust-session-query-lineage.zh.md) 关闭。skill 不完整 last-good 已在 [不完整快照 Agent Note](../../implemented/feature/2026-09-14-rust-skill-incomplete-snapshot.zh.md) 关闭。清单一并记录已关闭的 P0、Files 上传、skill 监视、session-query 谱系与 skill 不完整行，避免后续改动把它们重新打开。

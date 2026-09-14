@@ -3,8 +3,31 @@
 use super::Config;
 use dsh_skill::Skill;
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// One filesystem scan: loaded skills plus whether discovery finished cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillScan {
+    /// Rank-first skills from readable roots.
+    pub skills: Vec<Skill>,
+    /// False when any root or skill file had unexpected I/O.
+    pub complete: bool,
+}
+
+impl IntoIterator for SkillScan {
+    type Item = Skill;
+    type IntoIter = std::vec::IntoIter<Skill>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.skills.into_iter()
+    }
+}
+
+fn is_absence(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+}
 
 /// One filesystem skill root in rank order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,24 +61,33 @@ pub(crate) fn parse_frontmatter(text: &str) -> Option<(String, String, bool, Str
 }
 
 /// Load one `SKILL.md` bundle directory into a skill with resource listing.
-fn load_bundle(dir: &Path) -> Option<Skill> {
+fn load_bundle(dir: &Path) -> Result<Option<Skill>, io::Error> {
     let manifest = dir.join("SKILL.md");
-    let text = std::fs::read_to_string(&manifest).ok()?;
-    let (name, description, model_invocable, body) = parse_frontmatter(&text)?;
-    let mut resources: Vec<String> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.file_name() != "SKILL.md")
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .collect();
+    let text = match std::fs::read_to_string(&manifest) {
+        Ok(text) => text,
+        Err(error) if is_absence(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some((name, description, model_invocable, body)) = parse_frontmatter(&text) else {
+        return Ok(None);
+    };
+    let mut resources: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|entry| entry.file_name() != "SKILL.md")
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(error) if is_absence(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     resources.sort();
-    Some(Skill {
+    Ok(Some(Skill {
         name,
         description,
         body,
         model_invocable,
         resources,
-    })
+    }))
 }
 
 /// Load every skill under one root: bundles first, then flat `*.md`.
@@ -79,8 +111,11 @@ fn load_dir_filtered(dir: &Path, skip_system: bool) -> std::io::Result<Vec<Skill
         }
         let path = entry.path();
         if path.is_dir() {
-            if let Some(skill) = load_bundle(&path) {
-                skills.push(skill);
+            match load_bundle(&path) {
+                Ok(Some(skill)) => skills.push(skill),
+                Ok(None) => {}
+                Err(error) if is_absence(&error) => {}
+                Err(error) => return Err(error),
             }
             continue;
         }
@@ -90,8 +125,10 @@ fn load_dir_filtered(dir: &Path, skip_system: bool) -> std::io::Result<Vec<Skill
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if is_absence(&error) => continue,
+            Err(error) => return Err(error),
         };
         match parse_frontmatter(&text) {
             Some((name, description, model_invocable, body)) => skills.push(Skill {
@@ -165,12 +202,18 @@ pub(crate) fn roots(config: &Config) -> Vec<SkillRoot> {
 }
 
 /// Scan `config` roots. The first (lowest-rank) registration of a name wins.
-pub fn scan(config: &Config) -> Vec<Skill> {
+pub fn scan(config: &Config) -> SkillScan {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut complete = true;
     for root in roots(config) {
-        let Ok(loaded) = load_dir_filtered(&root.path, root.skip_system) else {
-            continue;
+        let loaded = match load_dir_filtered(&root.path, root.skip_system) {
+            Ok(loaded) => loaded,
+            Err(error) if is_absence(&error) => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         for skill in loaded {
             if !seen.insert(skill.name.clone()) {
@@ -179,22 +222,33 @@ pub fn scan(config: &Config) -> Vec<Skill> {
             out.push(skill);
         }
     }
-    out
+    SkillScan {
+        skills: out,
+        complete,
+    }
 }
 
-/// Replace this provider's previous registrations with a fresh scan.
+/// Replace this provider's previous registrations with a fresh complete scan.
+///
+/// An incomplete observation keeps the last-good registry and sets
+/// `SkillRuntime` incomplete so `tool-skill` does not publish it.
 pub fn apply_scan(
     skills: &dsh_skill::SkillRuntime,
     config: &Config,
     owned: &Mutex<HashSet<String>>,
 ) {
     let loaded = scan(config);
+    if !loaded.complete {
+        skills.set_complete(false);
+        return;
+    }
+    skills.set_complete(true);
     let mut previous = owned.lock().expect("skill-filesystem owned");
     for name in previous.iter() {
         skills.unregister(name);
     }
     previous.clear();
-    for skill in loaded {
+    for skill in loaded.skills {
         previous.insert(skill.name.clone());
         skills.register(skill);
     }
